@@ -1,0 +1,25 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: llm-config
+  namespace: redis-cluster-system
+  labels:
+    app.kubernetes.io/name: llm-k8s-redis
+    app.kubernetes.io/component: llm-config
+data:
+  # provider selects the backend; "openai" and "anthropic" are recognized.
+  # The HTTP client is OpenAI chat-completions compatible.
+  provider: "openai"
+  # baseUrl is the API root without /chat/completions, e.g.
+  #   OpenAI:    https://api.openai.com/v1
+  #   Azure:     https://<resource>.openai.azure.com/openai/deployments/<deploy>
+  #   Ollama:    http://ollama:11434/v1
+  #   Anthropic: https://api.anthropic.com/v1
+  baseUrl: "https://api.openai.com/v1"
+  # apiKey is the secret token. For production, mount this from a Secret
+  # instead of storing it in plaintext here (see deployment.yaml note).
+  apiKey: "REPLACE_ME"
+  # model is the provider-specific model id, e.g. gpt-4o, claude-sonnet-4-5-20250929.
+  model: "gpt-4o"
+  maxTokens: "8192"
+  temperature: "0"

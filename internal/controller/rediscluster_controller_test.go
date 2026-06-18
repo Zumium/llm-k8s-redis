@@ -17,6 +17,7 @@ import (
 
 	api "github.com/example/llm-k8s-redis/api/v1alpha1"
 	"github.com/example/llm-k8s-redis/internal/plan"
+	"github.com/example/llm-k8s-redis/internal/planner"
 )
 
 func newScheme(t *testing.T) *runtime.Scheme {
@@ -46,7 +47,7 @@ func TestReconcile_EnsuresFinalizerNamespaceAndPlans(t *testing.T) {
 
 	r := &RedisClusterReconciler{
 		Client: cl, Scheme: scheme,
-		Planner: NoopPlanner{}, Executor: NoopExecutor{}, Validator: plan.NewValidator(),
+		Planner: planner.NoopPlanner{}, Executor: NoopExecutor{}, Validator: plan.NewValidator(),
 	}
 	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "example"}}
 

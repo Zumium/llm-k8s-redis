@@ -28,6 +28,7 @@ import (
 
 	v1alpha1 "github.com/example/llm-k8s-redis/api/v1alpha1"
 	"github.com/example/llm-k8s-redis/internal/plan"
+	"github.com/example/llm-k8s-redis/internal/planner"
 )
 
 const (
@@ -45,7 +46,7 @@ const (
 type RedisClusterReconciler struct {
 	client.Client
 	Scheme    *runtime.Scheme
-	Planner   Planner
+	Planner   planner.Planner
 	Executor  Executor
 	Validator Validator
 	Recorder  events.EventRecorder
@@ -61,20 +62,11 @@ type RedisClusterReconciler struct {
 //  5. Otherwise execute the next pending step and record its outcome.
 //
 // Each reconcile performs at most one mutating K8S write plus one status write.
-//
-// +kubebuilder:rbac:groups=redis.example.com,resources=redisclusters,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=redis.example.com,resources=redisclusters/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=redis.example.com,resources=redisclusters/finalizers,verbs=update
-// +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 func (r *RedisClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx).WithValues("rediscluster", req.NamespacedName)
 
 	if r.Planner == nil {
-		r.Planner = NoopPlanner{}
+		r.Planner = planner.NoopPlanner{}
 	}
 	if r.Executor == nil {
 		r.Executor = NoopExecutor{}
@@ -115,7 +107,7 @@ func (r *RedisClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 
 	// No active plan: produce, validate and persist one.
 	if cluster.Status.ActivePlan == nil {
-		newPlan, err := r.Planner.Plan(ctx, &cluster, spec)
+		newPlan, err := r.Planner.Plan(ctx, toPlannerRequest(&cluster, spec))
 		if err != nil {
 			logger.Error(err, "planner returned an error")
 			setCondition(&cluster, ConditionPlanned, metav1.ConditionFalse, "PlannerFailed", err.Error())
@@ -286,6 +278,27 @@ func toClusterSpec(c *v1alpha1.RedisCluster) plan.ClusterSpec {
 		ReplicasPerShard: c.Spec.ReplicasPerShard,
 		Image:            c.Spec.Image,
 		MemorySize:       c.Spec.MemorySize,
+	}
+}
+
+// toPlannerRequest builds a planner.Request from the current cluster state.
+// The Operation is derived from the cluster's observed state: if there is no
+// topology yet, the operation is Create; otherwise it would be a topology/
+// image/memory change. For now we default to Create since incremental
+// operations are not yet implemented.
+func toPlannerRequest(c *v1alpha1.RedisCluster, spec plan.ClusterSpec) planner.Request {
+	op := plan.OpCreate
+	if c.Status.Topology != nil && len(c.Status.Topology.Shards) > 0 {
+		op = plan.OpUpdateMemorySize // placeholder; refined when scale/upgrade executors land
+	}
+	return planner.Request{
+		Cluster:   c,
+		Spec:      spec,
+		Operation: op,
+		ObservedState: planner.ObservedState{
+			Topology:   c.Status.Topology,
+			ActivePlan: c.Status.ActivePlan,
+		},
 	}
 }
 
