@@ -122,6 +122,8 @@ type RedisClusterStatus struct {
 	Conditions []metav1.Condition `json:"conditions,omitempty" patchStrategy:"merge" patchMergeKey:"type"`
 	// Topology is the last observed Redis Cluster topology.
 	Topology *ClusterTopology `json:"topology,omitempty"`
+	// TopologyObservedAt is the last time Topology was refreshed from Redis.
+	TopologyObservedAt metav1.Time `json:"topologyObservedAt,omitempty"`
 	// ActivePlan is the plan currently being executed, if any.
 	ActivePlan *PlanStatus `json:"activePlan,omitempty"`
 }

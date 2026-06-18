@@ -12,6 +12,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -19,6 +20,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -45,11 +47,14 @@ const (
 // driving the Executor one pending step per reconcile.
 type RedisClusterReconciler struct {
 	client.Client
-	Scheme    *runtime.Scheme
-	Planner   planner.Planner
-	Executor  Executor
-	Validator Validator
-	Recorder  events.EventRecorder
+	Scheme                  *runtime.Scheme
+	Planner                 planner.Planner
+	Executor                Executor
+	Observer                Observer
+	Validator               Validator
+	Recorder                events.EventRecorder
+	TopologyRefreshInterval time.Duration
+	TopologyStaleThreshold  time.Duration
 }
 
 // Reconcile advances a RedisCluster by at most one plan step.
@@ -71,8 +76,17 @@ func (r *RedisClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	if r.Executor == nil {
 		r.Executor = NoopExecutor{}
 	}
+	if r.Observer == nil {
+		r.Observer = noopObserver{}
+	}
 	if r.Validator == nil {
 		r.Validator = plan.NewValidator()
+	}
+	if r.TopologyRefreshInterval <= 0 {
+		r.TopologyRefreshInterval = 60 * time.Second
+	}
+	if r.TopologyStaleThreshold <= 0 {
+		r.TopologyStaleThreshold = 10 * time.Second
 	}
 
 	var cluster v1alpha1.RedisCluster
@@ -97,6 +111,12 @@ func (r *RedisClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 
 	if err := r.ensureNamespace(ctx, &cluster); err != nil {
 		return ctrl.Result{}, fmt.Errorf("ensure namespace: %w", err)
+	}
+
+	if r.shouldRefreshTopology(ctx, &cluster) {
+		if err := r.Observer.ObserveTopology(ctx, &cluster); err != nil {
+			logger.Error(err, "lazy topology refresh failed")
+		}
 	}
 
 	spec := toClusterSpec(&cluster)
@@ -147,12 +167,12 @@ func (r *RedisClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		cluster.Status.Phase = v1alpha1.PhaseReady
 		cluster.Status.ObservedGeneration = cluster.Generation
 		setCondition(&cluster, ConditionReady, metav1.ConditionTrue, "ClusterReady", "plan completed")
-		return r.finish(ctx, &cluster, ctrl.Result{}, nil)
+		return r.finish(ctx, &cluster, ctrl.Result{RequeueAfter: r.TopologyRefreshInterval}, nil)
 	case plan.PlanStateFailed:
 		active.Status = string(plan.PlanStateFailed)
 		cluster.Status.Phase = v1alpha1.PhaseFailed
 		setCondition(&cluster, ConditionReady, metav1.ConditionFalse, "PlanFailed", "plan has failed steps")
-		return r.finish(ctx, &cluster, ctrl.Result{}, nil)
+		return r.finish(ctx, &cluster, ctrl.Result{RequeueAfter: r.TopologyRefreshInterval}, nil)
 	}
 
 	idx := nextPendingStep(active)
@@ -351,6 +371,89 @@ func nextPendingStep(ps *v1alpha1.PlanStatus) int {
 		}
 	}
 	return -1
+}
+
+// shouldRefreshTopology decides whether a lazy observe-only refresh of
+// status.topology is appropriate right now. It skips refresh when a plan is
+// actively executing, when the cluster has not yet bootstrapped a topology,
+// or when the last observation is still fresh enough.
+//
+// Pod-set drift bypasses the stale threshold: if the managed Pods (names or
+// Ready states) no longer match what status.topology recorded, the next
+// reconcile forces an immediate ObserveTopology so Pod deletion/status flips
+// are reflected without waiting for the stale gate or the slow requeue.
+func (r *RedisClusterReconciler) shouldRefreshTopology(ctx context.Context, c *v1alpha1.RedisCluster) bool {
+	if c.Status.Topology == nil {
+		return false
+	}
+	active := c.Status.ActivePlan
+	if active != nil && planState(active) == plan.PlanStateRunning {
+		return false
+	}
+	if r.podSetDrifted(ctx, c) {
+		return true
+	}
+	elapsed := time.Since(c.Status.TopologyObservedAt.Time)
+	return elapsed >= r.TopologyStaleThreshold
+}
+
+// podSetDrifted reports whether the live managed Pod set (names + Ready
+// states) differs from what status.topology last recorded. A List error is
+// treated as "no drift" so a transient cache failure does not force a Redis
+// observe on every reconcile. A nil topology is treated as "no drift" so the
+// caller can delegate the nil-guard to shouldRefreshTopology without
+// duplicating it here.
+func (r *RedisClusterReconciler) podSetDrifted(ctx context.Context, c *v1alpha1.RedisCluster) bool {
+	if c.Status.Topology == nil {
+		return false
+	}
+	selector, err := labels.Parse(labelCluster + "=" + c.Name)
+	if err != nil {
+		return false
+	}
+	var podList corev1.PodList
+	if err := r.List(ctx, &podList, &client.ListOptions{
+		Namespace:     c.Name,
+		LabelSelector: selector,
+	}); err != nil {
+		return false
+	}
+	live := livePodSignature(podList.Items)
+	want := topologyPodSignature(c.Status.Topology)
+	return !maps.Equal(live, want)
+}
+
+// livePodSignature builds a {podName -> ready} signature from the live Pods.
+func livePodSignature(pods []corev1.Pod) map[string]bool {
+	out := map[string]bool{}
+	for i := range pods {
+		out[pods[i].Name] = podReady(&pods[i])
+	}
+	return out
+}
+
+// topologyPodSignature builds a {podName -> ready} signature from the last
+// observed topology. Entries with an empty Pod name (e.g. a Redis node the
+// controller has not yet mapped to a K8S Pod) are skipped so they do not
+// mask a real drift.
+func topologyPodSignature(topo *v1alpha1.ClusterTopology) map[string]bool {
+	out := map[string]bool{}
+	if topo == nil {
+		return out
+	}
+	for i := range topo.Shards {
+		sh := &topo.Shards[i]
+		if sh.Master.Pod != "" {
+			out[sh.Master.Pod] = sh.Master.Ready
+		}
+		for j := range sh.Replicas {
+			r := &sh.Replicas[j]
+			if r.Pod != "" {
+				out[r.Pod] = r.Ready
+			}
+		}
+	}
+	return out
 }
 
 func planState(ps *v1alpha1.PlanStatus) plan.PlanState {

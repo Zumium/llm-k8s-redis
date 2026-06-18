@@ -3,14 +3,9 @@ package controller
 import (
 	"context"
 	"fmt"
-	"sort"
-	"strings"
 
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/labels"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1alpha1 "github.com/example/llm-k8s-redis/api/v1alpha1"
 	"github.com/example/llm-k8s-redis/internal/plan"
@@ -81,128 +76,47 @@ func (e *ActionExecutor) verifyCluster(ctx context.Context, cluster *v1alpha1.Re
 		return paramErr("expectedShards and expectedReplicasPerShard must be >= 1")
 	}
 
-	pods, outcome, ok := e.listManagedPods(ctx, cluster)
-	if !ok {
-		return outcome, nil
-	}
-	if len(pods) == 0 {
-		return running("no managed pods found for cluster %s", cluster.Name), nil
-	}
-
-	seed, ok := pickSeedPod(pods)
-	if !ok {
-		return running("no ready managed pod with IP yet for cluster %s", cluster.Name), nil
-	}
-
-	addr := podRedisAddr(&seed)
-	rc, err := e.RedisFactory(addr)
+	obs, err := e.observeTopology(ctx, cluster)
 	if err != nil {
-		return StepOutcome{Status: plan.StepStateFailed, Message: fmt.Sprintf("build redis client for seed %s: %v", addr, err)}, err
+		return StepOutcome{Status: plan.StepStateFailed, Message: err.Error()}, err
 	}
-	defer rc.Close()
-
-	if err := rc.Ping(ctx); err != nil {
-		return running("seed redis at %s not reachable: %v", addr, err), nil
+	if !obs.healthy {
+		return running("%s", obs.message), nil
 	}
 
-	infoRaw, err := rc.ClusterInfo(ctx)
-	if err != nil {
-		return running("seed redis at %s CLUSTER INFO failed: %v", addr, err), nil
-	}
-	info := parseClusterInfo(infoRaw)
-	if !clusterStateOk(info) {
-		return running("cluster_state is %q, expected ok", info["cluster_state"]), nil
-	}
-
-	nodesRaw, err := rc.ClusterNodes(ctx)
-	if err != nil {
-		return running("seed redis at %s CLUSTER NODES failed: %v", addr, err), nil
-	}
-	entries := parseClusterNodes(nodesRaw)
-	if len(entries) == 0 {
-		return running("seed redis at %s returned no CLUSTER NODES entries", addr), nil
-	}
-
-	if bad := firstUnhealthyManagedNode(entries); bad != "" {
+	if bad := firstUnhealthyManagedNode(obs.entries); bad != "" {
 		return paramErr("cluster node not healthy: %s", bad)
 	}
-	if migrating := migratingSlots(entries); len(migrating) > 0 {
+	if migrating := migratingSlots(obs.entries); len(migrating) > 0 {
 		return paramErr("cluster has %d slots in migrating/importing state", len(migrating))
 	}
 
-	owner, err := slotOwnership(entries)
+	owner, err := slotOwnership(obs.entries)
 	if err != nil {
 		return StepOutcome{Status: plan.StepStateFailed, Message: fmt.Sprintf("slot ownership inconsistent: %v", err)}, err
 	}
-	if viol := verifyFullSlotCoverage(owner, entries); viol != "" {
+	if viol := verifyFullSlotCoverage(owner, obs.entries); viol != "" {
 		return paramErr("slot coverage violation: %s", viol)
 	}
 
-	masters := healthyMasters(entries)
+	masters := healthyMasters(obs.entries)
 	if len(masters) != expectedShards {
 		return paramErr("expected %d masters, found %d", expectedShards, len(masters))
 	}
 	for _, m := range masters {
-		replicas := healthyReplicasOf(entries, m.ID)
+		replicas := healthyReplicasOf(obs.entries, m.ID)
 		if len(replicas) != expectedReplicas {
 			return paramErr("master %s has %d healthy replicas, expected %d", m.ID, len(replicas), expectedReplicas)
 		}
 	}
 
-	podsByIP := mapPodsByIP(pods)
-	if unmapped := firstUnmappedNode(entries, podsByIP); unmapped != "" {
+	if unmapped := firstUnmappedNode(obs.entries, obs.podsByIP); unmapped != "" {
 		return paramErr("redis node not mapped to any managed pod: %s", unmapped)
 	}
 
-	topology := rebuildTopology(entries, pods, podsByIP)
-	cluster.Status.Topology = topology
+	cluster.Status.Topology = obs.topology
 	setCondition(cluster, ConditionHealthy, metav1.ConditionTrue, "ClusterVerified", "cluster matches desired topology")
 	return completed("cluster verified: %d masters, %d replicas/master, full slot coverage", expectedShards, expectedReplicas), nil
-}
-
-// listManagedPods lists all Pods in the cluster's namespace labeled as
-// belonging to this RedisCluster. It returns a Failed outcome if the list
-// call errors for a non-transient reason.
-func (e *ActionExecutor) listManagedPods(ctx context.Context, cluster *v1alpha1.RedisCluster) ([]corev1.Pod, StepOutcome, bool) {
-	var podList corev1.PodList
-	selector, err := labels.Parse(labelCluster + "=" + cluster.Name)
-	if err != nil {
-		o, _ := paramErr("build pod label selector: %v", err)
-		return nil, o, false
-	}
-	if err := e.List(ctx, &podList, &client.ListOptions{
-		Namespace:     cluster.Name,
-		LabelSelector: selector,
-	}); err != nil {
-		if apierrors.IsNotFound(err) {
-			return nil, StepOutcome{Status: plan.StepStateRunning, Message: fmt.Sprintf("namespace %s not found yet", cluster.Name)}, true
-		}
-		o, _ := paramErr("list managed pods: %v", err)
-		return nil, o, false
-	}
-	return podList.Items, StepOutcome{}, true
-}
-
-// pickSeedPod returns the first managed Pod that is Ready and has a PodIP.
-func pickSeedPod(pods []corev1.Pod) (corev1.Pod, bool) {
-	for _, p := range pods {
-		if podReady(&p) && p.Status.PodIP != "" {
-			return p, true
-		}
-	}
-	return corev1.Pod{}, false
-}
-
-// mapPodsByIP indexes ready pods by their PodIP for Redis-node -> Pod lookup.
-func mapPodsByIP(pods []corev1.Pod) map[string]*corev1.Pod {
-	out := map[string]*corev1.Pod{}
-	for i := range pods {
-		if pods[i].Status.PodIP == "" {
-			continue
-		}
-		out[pods[i].Status.PodIP] = &pods[i]
-	}
-	return out
 }
 
 // firstUnhealthyManagedNode returns a short description of the first entry
@@ -247,32 +161,6 @@ func verifyFullSlotCoverage(owner map[int]string, entries []clusterNodeEntry) st
 	return ""
 }
 
-// healthyMasters returns the entries that are masters and healthy, sorted by
-// node id for deterministic shard numbering.
-func healthyMasters(entries []clusterNodeEntry) []clusterNodeEntry {
-	var out []clusterNodeEntry
-	for _, e := range entries {
-		if e.isMaster() && e.healthy() {
-			out = append(out, e)
-		}
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
-	return out
-}
-
-// healthyReplicasOf returns the entries that are healthy replicas of the
-// given master id, sorted by node id for deterministic ordering.
-func healthyReplicasOf(entries []clusterNodeEntry, masterID string) []clusterNodeEntry {
-	var out []clusterNodeEntry
-	for _, e := range entries {
-		if e.isReplica() && e.MasterID == masterID && e.healthy() {
-			out = append(out, e)
-		}
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
-	return out
-}
-
 // firstUnmappedNode returns a description of the first non-handshake cluster
 // node whose IP does not correspond to any managed Pod, or "" if all are
 // mapped. This guards against foreign nodes leaking into the cluster.
@@ -290,57 +178,4 @@ func firstUnmappedNode(entries []clusterNodeEntry, podsByIP map[string]*corev1.P
 		}
 	}
 	return ""
-}
-
-// ipFromAddr extracts the host portion of an "ip:port@cport" address.
-func ipFromAddr(addr string) string {
-	if i := strings.Index(addr, ":"); i >= 0 {
-		return addr[:i]
-	}
-	return addr
-}
-
-// rebuildTopology reconstructs ClusterTopology from live Redis CLUSTER NODES
-// plus the managed K8S Pods. Masters are sorted by node id to give stable
-// shard indexes; replicas are sorted by node id within each shard. Slot
-// tokens are joined with "," so the Slots field reads like "0-8191" or
-// "0-100,5000".
-func rebuildTopology(entries []clusterNodeEntry, pods []corev1.Pod, podsByIP map[string]*corev1.Pod) *v1alpha1.ClusterTopology {
-	masters := healthyMasters(entries)
-	shards := make([]v1alpha1.ShardTopology, 0, len(masters))
-	for idx, m := range masters {
-		shard := v1alpha1.ShardTopology{
-			ID: fmt.Sprintf("shard-%d", idx),
-			Master: v1alpha1.NodeTopology{
-				Pod:    podNameForIP(podsByIP, ipFromAddr(m.Addr)),
-				NodeID: m.ID,
-				Slots:  strings.Join(m.Slots, ","),
-				Ready:  podReadyForIP(podsByIP, ipFromAddr(m.Addr)),
-			},
-		}
-		for _, r := range healthyReplicasOf(entries, m.ID) {
-			ip := ipFromAddr(r.Addr)
-			shard.Replicas = append(shard.Replicas, v1alpha1.NodeTopology{
-				Pod:    podNameForIP(podsByIP, ip),
-				NodeID: r.ID,
-				Ready:  podReadyForIP(podsByIP, ip),
-			})
-		}
-		shards = append(shards, shard)
-	}
-	return &v1alpha1.ClusterTopology{Shards: shards}
-}
-
-func podNameForIP(podsByIP map[string]*corev1.Pod, ip string) string {
-	if p, ok := podsByIP[ip]; ok {
-		return p.Name
-	}
-	return ""
-}
-
-func podReadyForIP(podsByIP map[string]*corev1.Pod, ip string) bool {
-	if p, ok := podsByIP[ip]; ok {
-		return podReady(p)
-	}
-	return false
 }

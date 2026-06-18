@@ -289,6 +289,11 @@ spec:
                       type: object
                     type: array
                 type: object
+              topologyObservedAt:
+                description: TopologyObservedAt is the last time Topology was refreshed
+                  from Redis.
+                format: date-time
+                type: string
             type: object
         type: object
     served: true

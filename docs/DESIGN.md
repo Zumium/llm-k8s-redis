@@ -119,6 +119,34 @@ status:
 
 - LLM 生成的计划不应直接执行，而应固化为受限的 `activePlan`，由 Controller 进行确定性校验后，以幂等的小步骤逐步执行。这样可以避免每次 reconcile 都重新生成计划导致计划漂移，也方便在故障恢复时继续执行或重新规划。
 
+### Topology的刷新
+
+因为Redis Cluster的Topo结构可能会自己发生变化（例如因为发生了failover），Topology需要刷新，尽量及时反馈底层的状态。
+
+Controller 采用**低负载的 lazy refresh**策略：
+
+- **复用现有 reconcile 触发**：K8S Pod/Namespace/RedisCluster 事件已经会触发 reconcile，因此 K8S 侧变化（Pod Ready、IP 变更等）能免费触发一次 topology 观察。
+- **Pod 集合 drift 绕过 stale gate**：每次 reconcile 入口先 list 当前 managed Pods（名字 + Ready 状态），与 `status.topology` 记录的 Pod 集合比对；不一致则**立即**触发 `ObserveTopology`，不等 stale threshold。这样 Pod 删除/Ready 翻转能在事件触发的下一次 reconcile 就反映到 `status.topology`，而不是等 60s 慢 requeue。
+- **慢 requeue 兜底 Redis 侧静默漂移**：当 `activePlan` 处于 `Completed` 或 `Failed`（即没有正在执行的 plan step）时，reconcile 结束后会按 `--topology-refresh-interval`（默认 60s）重新入队，确保手动 failover、slot 迁移、节点掉线等 Redis 内部变化最多在 60s 内被反映到 `status.topology`。
+- **stale gate 防止 Redis 被打爆**：当 Pod 集合未 drift 时，检查距上次观察是否超过 `--topology-stale-threshold`（默认 10s），未超过则跳过 Redis 调用；Pod 风暴时不会被重复 observe。stale threshold 退化为 idle 集群的周期性兜底，不再是 Pod 删除的延迟来源。
+- **不覆盖历史状态**：观察失败（无 ready seed、PING 失败、`cluster_state` 非 ok 等）时，保留旧的 `status.topology` 不动，仅将 `Healthy` condition 置为 `False`，避免擦掉最后已知拓扑。
+- **与 plan 执行互不干扰**：只有当没有 plan 正在运行时才做 lazy refresh；plan 执行期间由 plan 自己的 `VerifyCluster` 等步骤负责维护 topology。
+- **K8s 视角优先**：`rebuildTopology` 以 Redis `CLUSTER NODES` 为准挑选 master/replica，但 `Pod` 名和 `Ready` 字段来自 `podsByIP` 映射。当某个 Redis 节点对应的 Pod 已从 K8s 删除（但 Redis 集群超时未到、仍认为节点 healthy）时，该节点在 topology 中 `Pod=""` `Ready=false`，`NodeID`/`Slots` 保留——topology 立刻反映 K8s 视角的 Pod 消失，不等 Redis 侧 fail。
+
+#### 状态陈旧 SLO
+
+`status.topology` 是 Controller 对 Redis Cluster 的最后一次观察结果，不是强实时状态。Controller 对状态陈旧度给出以下 SLO：
+
+- **K8S 侧变化**：由 Controller 管理的 Pod 创建、删除、Ready 状态变化、Pod IP 变化、Namespace 删除等，会通过 K8S watch 触发 reconcile。若这些变化导致 managed Pod 集合或 Ready 状态与 `status.topology` 不一致，下一次 reconcile 必须绕过 stale gate 并立即执行 `ObserveTopology`。目标是在 apiserver watch 正常投递后的一次 reconcile 内反映到 `status.topology` / `Healthy` condition。
+- **Redis 侧静默漂移**：Redis Cluster 内部发生但不会产生 K8S 事件的变化，例如自动 failover、手工 slot 迁移、手工 `CLUSTER MEET` / `CLUSTER REPLICATE`、Redis 节点 link 状态变化等，由周期性 lazy refresh 发现。目标是在 `--topology-refresh-interval` 内反映，默认 60s。
+- **Redis 观察防抖**：当没有 Pod drift 时，Controller 不应高频查询 Redis。两次 observe-only Redis 查询之间至少间隔 `--topology-stale-threshold`，默认 10s。Pod drift 可以绕过该阈值，因为它是 K8S watch 已确认的外部变化。
+- **执行安全检查**：任何会改变 Redis 或 K8S 状态的 plan step 不依赖 `status.topology` 的新鲜度做安全判断。Executor 必须在每次执行 step 时重新读取 live K8S / Redis 状态，并以实时读取结果校验幂等性和安全不变量。
+- **观察失败语义**：如果 `ObserveTopology` 因无 ready seed、Redis 不可达、`CLUSTER INFO` / `CLUSTER NODES` 失败、`cluster_state` 非 `ok` 等原因失败，旧的 `status.topology` 可以继续保留，但 `Healthy` condition 必须更新为 `False`，并通过 `topologyObservedAt` 表达最近一次观察尝试时间。
+
+因此，本系统不承诺毫秒级实时感知；承诺的是 K8S 事件驱动的快速刷新、Redis 内部漂移的有界陈旧，以及执行路径上的 live-state 安全校验。
+
+实现上新增 `Observer` interface（由 `ActionExecutor` 实现），把 `CLUSTER INFO` / `CLUSTER NODES` / Pod 映射的观察逻辑抽取为 `observeTopology`，供 `VerifyCluster` 和 lazy refresh 共用。`status.topologyObservedAt` 记录最后一次成功发起观察的时间戳，用于 stale gate。
+
 ## DSL设计
 
 LLM 不直接控制底层的各个对象，而是以 DSL 的方式生成变更计划，随后 Controller 按照计划对 Redis Cluster 执行动作，最终达到目标状态。

@@ -171,6 +171,7 @@ func (in *RedisClusterStatus) DeepCopyInto(out *RedisClusterStatus) {
 		*out = new(ClusterTopology)
 		(*in).DeepCopyInto(*out)
 	}
+	in.TopologyObservedAt.DeepCopyInto(&out.TopologyObservedAt)
 	if in.ActivePlan != nil {
 		in, out := &in.ActivePlan, &out.ActivePlan
 		*out = new(PlanStatus)

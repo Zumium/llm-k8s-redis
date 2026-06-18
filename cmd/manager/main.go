@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"os"
+	"time"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -34,13 +35,15 @@ func init() {
 
 func main() {
 	var (
-		zapOpts           zap.Options
-		metricsAddr       string
-		probeAddr         string
-		enableLeaderElec  bool
-		llmConfigMapName  string
-		llmConfigMapNS    string
-		disableLLMPlanner bool
+		zapOpts                 zap.Options
+		metricsAddr             string
+		probeAddr               string
+		enableLeaderElec        bool
+		llmConfigMapName        string
+		llmConfigMapNS          string
+		disableLLMPlanner       bool
+		topologyRefreshInterval time.Duration
+		topologyStaleThreshold  time.Duration
 	)
 	zapOpts.Development = true
 	zapOpts.BindFlags(flag.CommandLine)
@@ -50,6 +53,8 @@ func main() {
 	flag.StringVar(&llmConfigMapName, "llm-configmap-name", "llm-config", "Name of the ConfigMap holding LLM connection config.")
 	flag.StringVar(&llmConfigMapNS, "llm-configmap-namespace", "redis-cluster-system", "Namespace of the LLM ConfigMap.")
 	flag.BoolVar(&disableLLMPlanner, "disable-llm-planner", false, "Use NoopPlanner instead of the ConfigMap-driven LLM planner (for testing).")
+	flag.DurationVar(&topologyRefreshInterval, "topology-refresh-interval", 60*time.Second, "Interval between lazy topology refreshes for idle clusters.")
+	flag.DurationVar(&topologyStaleThreshold, "topology-stale-threshold", 10*time.Second, "Minimum time between observeTopology calls to avoid Redis load spikes during Pod storms.")
 	flag.Parse()
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&zapOpts)))
 
@@ -78,13 +83,17 @@ func main() {
 		setupLog.Info("llm planner disabled; using NoopPlanner")
 	}
 
+	executor := &controller.ActionExecutor{Client: mgr.GetClient(), Scheme: scheme, RedisFactory: redis.DefaultFactory}
 	if err = (&controller.RedisClusterReconciler{
-		Client:    mgr.GetClient(),
-		Scheme:    scheme,
-		Planner:   p,
-		Executor:  &controller.ActionExecutor{Client: mgr.GetClient(), Scheme: scheme, RedisFactory: redis.DefaultFactory},
-		Validator: plan.NewValidator(),
-		Recorder:  mgr.GetEventRecorder("rediscluster-controller"),
+		Client:                  mgr.GetClient(),
+		Scheme:                  scheme,
+		Planner:                 p,
+		Executor:                executor,
+		Observer:                executor,
+		Validator:               plan.NewValidator(),
+		Recorder:                mgr.GetEventRecorder("rediscluster-controller"),
+		TopologyRefreshInterval: topologyRefreshInterval,
+		TopologyStaleThreshold:  topologyStaleThreshold,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "RedisCluster")
 		os.Exit(1)
