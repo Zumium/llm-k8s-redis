@@ -19,6 +19,7 @@ import (
 	"github.com/example/llm-k8s-redis/internal/llm"
 	"github.com/example/llm-k8s-redis/internal/plan"
 	"github.com/example/llm-k8s-redis/internal/planner"
+	"github.com/example/llm-k8s-redis/internal/redis"
 )
 
 var (
@@ -81,7 +82,7 @@ func main() {
 		Client:    mgr.GetClient(),
 		Scheme:    scheme,
 		Planner:   p,
-		Executor:  controller.NoopExecutor{},
+		Executor:  &controller.ActionExecutor{Client: mgr.GetClient(), Scheme: scheme, RedisFactory: redis.DefaultFactory},
 		Validator: plan.NewValidator(),
 		Recorder:  mgr.GetEventRecorder("rediscluster-controller"),
 	}).SetupWithManager(mgr); err != nil {
