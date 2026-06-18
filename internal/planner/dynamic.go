@@ -20,9 +20,10 @@ type PlannerSource interface {
 // ConfigMap changes, the next Plan() call uses the new client/model without
 // restarting the controller.
 type DynamicPlanner struct {
-	Source      PlannerSource
-	MaxTokens   int
-	Temperature float32
+	Source          PlannerSource
+	MaxTokens       int
+	Temperature     float32
+	ReasoningEffort string
 }
 
 // NewDynamicPlanner returns a DynamicPlanner backed by the given source.
@@ -47,10 +48,11 @@ func (p *DynamicPlanner) Plan(ctx context.Context, req Request) (*plan.Plan, err
 		return nil, fmt.Errorf("dynamic planner: llm client is nil")
 	}
 	lp := LLMPlanner{
-		Client:      client,
-		Model:       cfg.Model,
-		MaxTokens:   orInt(p.MaxTokens, cfg.MaxTokens),
-		Temperature: orFloat(p.Temperature, cfg.Temperature),
+		Client:          client,
+		Model:           cfg.Model,
+		MaxTokens:       orInt(p.MaxTokens, cfg.MaxTokens),
+		Temperature:     orFloat(p.Temperature, cfg.Temperature),
+		ReasoningEffort: orString(p.ReasoningEffort, cfg.ReasoningEffort),
 	}
 	return lp.Plan(ctx, req)
 }
@@ -69,10 +71,17 @@ func orFloat(a, b float32) float32 {
 	return b
 }
 
+func orString(a, b string) string {
+	if a != "" {
+		return a
+	}
+	return b
+}
+
 // planWithClient contains the shared prompt-build → call → parse → fixup logic
 // used by both the static LLMPlanner and any future planner that injects a
 // client per call.
-func planWithClient(ctx context.Context, client llm.Client, model string, maxTokens int, temperature float32, req Request) (*plan.Plan, error) {
+func planWithClient(ctx context.Context, client llm.Client, model string, maxTokens int, temperature float32, reasoningEffort string, req Request) (*plan.Plan, error) {
 	if client == nil {
 		return nil, fmt.Errorf("llm planner: client is nil")
 	}
@@ -91,8 +100,9 @@ func planWithClient(ctx context.Context, client llm.Client, model string, maxTok
 		ResponseFormat: llm.ResponseFormat{
 			Type: llm.ResponseFormatJSONObject,
 		},
-		MaxTokens:   maxTokens,
-		Temperature: temperature,
+		MaxTokens:       maxTokens,
+		Temperature:     temperature,
+		ReasoningEffort: reasoningEffort,
 	}
 
 	resp, err := client.Complete(ctx, llmReq)

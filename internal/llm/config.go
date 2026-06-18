@@ -20,12 +20,13 @@ const (
 // Config holds the LLM connection settings. It is loaded from a ConfigMap and
 // used to build an llm.Client.
 type Config struct {
-	Provider    Provider
-	BaseURL     string
-	APIKey      string
-	Model       string
-	MaxTokens   int
-	Temperature float32
+	Provider        Provider
+	BaseURL         string
+	APIKey          string
+	Model           string
+	MaxTokens       int
+	Temperature     float32
+	ReasoningEffort string
 }
 
 // DefaultConfig returns a Config with sensible defaults for unset numeric fields.
@@ -53,12 +54,15 @@ func (c Config) Validate() error {
 	default:
 		return fmt.Errorf("llm config: unknown provider %q", c.Provider)
 	}
+	if !validReasoningEffort(c.ReasoningEffort) {
+		return fmt.Errorf("llm config: invalid reasoningEffort %q", c.ReasoningEffort)
+	}
 	return nil
 }
 
 // ParseConfig builds a Config from ConfigMap string data. Recognized keys:
-// provider, baseUrl, apiKey, model, maxTokens, temperature. Unknown keys are
-// ignored so the ConfigMap can carry extra metadata.
+// provider, baseUrl, apiKey, model, maxTokens, temperature, reasoningEffort.
+// Unknown keys are ignored so the ConfigMap can carry extra metadata.
 func ParseConfig(data map[string]string) (Config, error) {
 	cfg := DefaultConfig()
 	if v, ok := data["provider"]; ok && v != "" {
@@ -87,8 +91,20 @@ func ParseConfig(data map[string]string) (Config, error) {
 		}
 		cfg.Temperature = float32(f)
 	}
+	if v, ok := data["reasoningEffort"]; ok {
+		cfg.ReasoningEffort = strings.TrimSpace(v)
+	}
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
 	}
 	return cfg, nil
+}
+
+func validReasoningEffort(v string) bool {
+	switch v {
+	case "", "high", "max", "low", "medium", "xhigh":
+		return true
+	default:
+		return false
+	}
 }

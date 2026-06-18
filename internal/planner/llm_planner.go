@@ -18,10 +18,11 @@ import (
 //     with the controller's expectations, regardless of what the LLM emitted.
 //  5. Return the plan. The controller's Validator is the final safety gate.
 type LLMPlanner struct {
-	Client      llm.Client
-	Model       string
-	MaxTokens   int
-	Temperature float32
+	Client          llm.Client
+	Model           string
+	MaxTokens       int
+	Temperature     float32
+	ReasoningEffort string
 }
 
 // NewLLMPlanner returns an LLMPlanner with sensible defaults.
@@ -36,7 +37,7 @@ func NewLLMPlanner(client llm.Client, model string) *LLMPlanner {
 
 // Plan implements Planner.
 func (p *LLMPlanner) Plan(ctx context.Context, req Request) (*plan.Plan, error) {
-	return planWithClient(ctx, p.Client, p.Model, p.MaxTokens, p.Temperature, req)
+	return planWithClient(ctx, p.Client, p.Model, p.MaxTokens, p.Temperature, p.ReasoningEffort, req)
 }
 
 func truncate(s string, n int) string {

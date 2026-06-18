@@ -6,12 +6,13 @@ import (
 
 func TestParseConfig_Valid(t *testing.T) {
 	cfg, err := ParseConfig(map[string]string{
-		"provider":    "openai",
-		"baseUrl":     "https://api.openai.com/v1",
-		"apiKey":      "sk-test",
-		"model":       "gpt-4o",
-		"maxTokens":   "4096",
-		"temperature": "0.2",
+		"provider":        "openai",
+		"baseUrl":         "https://api.openai.com/v1",
+		"apiKey":          "sk-test",
+		"model":           "gpt-4o",
+		"maxTokens":       "4096",
+		"temperature":     "0.2",
+		"reasoningEffort": "max",
 	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -31,6 +32,9 @@ func TestParseConfig_Valid(t *testing.T) {
 	if cfg.Temperature != 0.2 {
 		t.Errorf("temperature = %v", cfg.Temperature)
 	}
+	if cfg.ReasoningEffort != "max" {
+		t.Errorf("reasoningEffort = %q", cfg.ReasoningEffort)
+	}
 }
 
 func TestParseConfig_UsesDefaults(t *testing.T) {
@@ -47,6 +51,9 @@ func TestParseConfig_UsesDefaults(t *testing.T) {
 	}
 	if cfg.MaxTokens != 8192 {
 		t.Errorf("default maxTokens = %d, want 8192", cfg.MaxTokens)
+	}
+	if cfg.ReasoningEffort != "" {
+		t.Errorf("default reasoningEffort = %q, want empty", cfg.ReasoningEffort)
 	}
 }
 
@@ -65,6 +72,34 @@ func TestParseConfig_MissingFields(t *testing.T) {
 				t.Fatal("expected error for missing field")
 			}
 		})
+	}
+}
+
+func TestParseConfig_ReasoningEffortValues(t *testing.T) {
+	for _, effort := range []string{"high", "max", "low", "medium", "xhigh", ""} {
+		t.Run(effort, func(t *testing.T) {
+			_, err := ParseConfig(map[string]string{
+				"baseUrl":         "u",
+				"apiKey":          "k",
+				"model":           "m",
+				"reasoningEffort": effort,
+			})
+			if err != nil {
+				t.Fatalf("unexpected error for %q: %v", effort, err)
+			}
+		})
+	}
+}
+
+func TestParseConfig_BadReasoningEffort(t *testing.T) {
+	_, err := ParseConfig(map[string]string{
+		"baseUrl":         "u",
+		"apiKey":          "k",
+		"model":           "m",
+		"reasoningEffort": "minimal",
+	})
+	if err == nil {
+		t.Fatal("expected error for invalid reasoningEffort")
 	}
 }
 

@@ -43,6 +43,9 @@ type Request struct {
 	// Temperature controls randomness. Zero means provider default.
 	Temperature float32
 
+	// ReasoningEffort controls reasoning depth for compatible providers.
+	ReasoningEffort string
+
 	// Metadata is an opaque bag for provider-specific extras (e.g. request
 	// IDs, custom headers). The core interface does not interpret it.
 	Metadata map[string]string

@@ -56,6 +56,9 @@ func TestOpenAIClient_Success(t *testing.T) {
 		if rf["type"] != "json_schema" {
 			t.Errorf("response_format type = %v, want json_schema", rf["type"])
 		}
+		if _, ok := req["reasoning_effort"]; ok {
+			t.Errorf("reasoning_effort should be omitted by default")
+		}
 	})
 	defer srv.Close()
 
@@ -87,6 +90,43 @@ func TestOpenAIClient_Success(t *testing.T) {
 	}
 	if resp.Usage.InputTokens != 10 || resp.Usage.OutputTokens != 5 {
 		t.Errorf("usage = %+v", resp.Usage)
+	}
+}
+
+func TestOpenAIClient_SendsReasoningEffort(t *testing.T) {
+	srv := newOpenAITestServer(t, 200, `{"id":"x","object":"chat.completion","created":1,"model":"deepseek-v4-pro","choices":[{"index":0,"message":{"role":"assistant","content":"{}"},"finish_reason":"stop"}],"usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}`, func(body []byte, _ *http.Request) {
+		var req map[string]any
+		_ = json.Unmarshal(body, &req)
+		if req["reasoning_effort"] != "max" {
+			t.Errorf("reasoning_effort = %v, want max", req["reasoning_effort"])
+		}
+	})
+	defer srv.Close()
+
+	c, _ := NewOpenAIClient(Config{Provider: ProviderOpenAI, BaseURL: srv.URL, APIKey: "sk-test", Model: "deepseek-v4-pro"})
+	_, err := c.Complete(context.Background(), Request{
+		Messages:        []Message{{Role: RoleUser, Content: []ContentPart{{Type: "text", Text: "x"}}}},
+		ReasoningEffort: "max",
+	})
+	if err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+}
+
+func TestOpenAIClient_UsesConfigReasoningEffort(t *testing.T) {
+	srv := newOpenAITestServer(t, 200, `{"id":"x","object":"chat.completion","created":1,"model":"deepseek-v4-pro","choices":[{"index":0,"message":{"role":"assistant","content":"{}"},"finish_reason":"stop"}],"usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}`, func(body []byte, _ *http.Request) {
+		var req map[string]any
+		_ = json.Unmarshal(body, &req)
+		if req["reasoning_effort"] != "high" {
+			t.Errorf("reasoning_effort = %v, want high", req["reasoning_effort"])
+		}
+	})
+	defer srv.Close()
+
+	c, _ := NewOpenAIClient(Config{Provider: ProviderOpenAI, BaseURL: srv.URL, APIKey: "sk-test", Model: "deepseek-v4-pro", ReasoningEffort: "high"})
+	_, err := c.Complete(context.Background(), Request{Messages: []Message{{Role: RoleUser, Content: []ContentPart{{Type: "text", Text: "x"}}}}})
+	if err != nil {
+		t.Fatalf("complete: %v", err)
 	}
 }
 

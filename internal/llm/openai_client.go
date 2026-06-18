@@ -56,6 +56,11 @@ func (c *OpenAIClient) Complete(ctx context.Context, req Request) (*Response, er
 	} else if c.cfg.Temperature > 0 {
 		params.Temperature = openai.Float(float64(c.cfg.Temperature))
 	}
+	if req.ReasoningEffort != "" {
+		params.ReasoningEffort = shared.ReasoningEffort(req.ReasoningEffort)
+	} else if c.cfg.ReasoningEffort != "" {
+		params.ReasoningEffort = shared.ReasoningEffort(c.cfg.ReasoningEffort)
+	}
 	if rf := c.buildResponseFormat(req.ResponseFormat); rf != nil {
 		params.ResponseFormat = *rf
 	}

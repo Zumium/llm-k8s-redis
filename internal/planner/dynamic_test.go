@@ -25,7 +25,7 @@ func (s *stubSource) Get() (llm.Config, llm.Client, error) {
 func TestDynamicPlanner_UsesSource(t *testing.T) {
 	fakeClient := &fakeLLMClient{resp: &llm.Response{Text: validCreatePlanJSON()}}
 	src := &stubSource{
-		cfg:    llm.Config{Model: "gpt-4o", MaxTokens: 2048, Temperature: 0.1, Provider: llm.ProviderOpenAI, BaseURL: "u", APIKey: "k"},
+		cfg:    llm.Config{Model: "gpt-4o", MaxTokens: 2048, Temperature: 0.1, ReasoningEffort: "max", Provider: llm.ProviderOpenAI, BaseURL: "u", APIKey: "k"},
 		client: fakeClient,
 	}
 	dp := NewDynamicPlanner(src)
@@ -43,6 +43,9 @@ func TestDynamicPlanner_UsesSource(t *testing.T) {
 	}
 	if fakeClient.lastReq.Model != "gpt-4o" {
 		t.Errorf("model passed to client = %q, want gpt-4o", fakeClient.lastReq.Model)
+	}
+	if fakeClient.lastReq.ReasoningEffort != "max" {
+		t.Errorf("reasoningEffort passed to client = %q, want max", fakeClient.lastReq.ReasoningEffort)
 	}
 }
 
@@ -125,7 +128,7 @@ func TestPlanWithClient_FixesFields(t *testing.T) {
 	fixed, _ := json.Marshal(m)
 
 	fc := &fakeLLMClient{resp: &llm.Response{Text: string(fixed)}}
-	got, err := planWithClient(context.Background(), fc, "m", 0, 0, Request{
+	got, err := planWithClient(context.Background(), fc, "m", 0, 0, "", Request{
 		Cluster:   sampleCluster(),
 		Spec:      sampleSpec(),
 		Operation: plan.OpCreate,

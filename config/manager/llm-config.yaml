@@ -23,3 +23,7 @@ data:
   model: "gpt-4o"
   maxTokens: "8192"
   temperature: "0"
+  # reasoningEffort maps to DeepSeek's top-level reasoning_effort parameter.
+  # DeepSeek documents high|max; low/medium map to high, xhigh maps to max.
+  # Leave unset for providers/models that do not support this parameter.
+  # reasoningEffort: "max"
