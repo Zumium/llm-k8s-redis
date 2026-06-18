@@ -120,6 +120,35 @@ func TestParseConfig_BadNumbers(t *testing.T) {
 	}
 }
 
+func TestParseConfig_TLSInsecureSkipVerify(t *testing.T) {
+	cfg, err := ParseConfig(map[string]string{
+		"baseUrl":               "u",
+		"apiKey":                "k",
+		"model":                 "m",
+		"tlsInsecureSkipVerify": "true",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !cfg.TLSInsecureSkipVerify {
+		t.Error("expected TLSInsecureSkipVerify=true")
+	}
+}
+
+func TestParseConfig_TLSInsecureSkipVerifyDefaultFalse(t *testing.T) {
+	cfg, err := ParseConfig(map[string]string{
+		"baseUrl": "u",
+		"apiKey":  "k",
+		"model":   "m",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.TLSInsecureSkipVerify {
+		t.Error("expected TLSInsecureSkipVerify=false by default")
+	}
+}
+
 func TestParseConfig_UnknownProvider(t *testing.T) {
 	_, err := ParseConfig(map[string]string{
 		"provider": "acme",

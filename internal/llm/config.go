@@ -20,13 +20,14 @@ const (
 // Config holds the LLM connection settings. It is loaded from a ConfigMap and
 // used to build an llm.Client.
 type Config struct {
-	Provider        Provider
-	BaseURL         string
-	APIKey          string
-	Model           string
-	MaxTokens       int
-	Temperature     float32
-	ReasoningEffort string
+	Provider              Provider
+	BaseURL               string
+	APIKey                string
+	Model                 string
+	MaxTokens             int
+	Temperature           float32
+	ReasoningEffort       string
+	TLSInsecureSkipVerify bool
 }
 
 // DefaultConfig returns a Config with sensible defaults for unset numeric fields.
@@ -93,6 +94,9 @@ func ParseConfig(data map[string]string) (Config, error) {
 	}
 	if v, ok := data["reasoningEffort"]; ok {
 		cfg.ReasoningEffort = strings.TrimSpace(v)
+	}
+	if v, ok := data["tlsInsecureSkipVerify"]; ok && v != "" {
+		cfg.TLSInsecureSkipVerify = strings.TrimSpace(v) == "true"
 	}
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err

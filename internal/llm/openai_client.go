@@ -2,7 +2,9 @@ package llm
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
+	"net/http"
 	"strings"
 
 	"github.com/openai/openai-go/v3"
@@ -28,10 +30,17 @@ func NewOpenAIClient(cfg Config) (*OpenAIClient, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
-	client := openai.NewClient(
+	opts := []option.RequestOption{
 		option.WithAPIKey(cfg.APIKey),
 		option.WithBaseURL(cfg.BaseURL),
-	)
+	}
+	if cfg.TLSInsecureSkipVerify {
+		tr := &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		}
+		opts = append(opts, option.WithHTTPClient(&http.Client{Transport: tr}))
+	}
+	client := openai.NewClient(opts...)
 	return &OpenAIClient{client: client, cfg: cfg}, nil
 }
 
