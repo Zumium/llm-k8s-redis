@@ -39,6 +39,12 @@ test: generate fmt vet ## Run tests.
 build: generate fmt vet ## Build manager binary.
 	$(GO) build -o bin/manager ./cmd/manager
 
+.PHONY: build-image
+build-image: ## Build controller Docker image (set IMG to override tag).
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) build -o manager ./cmd/manager
+	docker build -t $(IMG) .
+	rm -f manager
+
 .PHONY: run
 run: manifests generate fmt vet ## Run a controller from your host.
 	$(GO) run ./cmd/manager
