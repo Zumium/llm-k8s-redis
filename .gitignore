@@ -1,0 +1,8 @@
+# Binary directory
+/bin/
+# Test coverage
+cover.out
+*.test
+# Editor
+.vscode/
+.idea/

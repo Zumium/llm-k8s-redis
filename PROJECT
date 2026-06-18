@@ -1,0 +1,10 @@
+domain: example.com
+layout:
+- go.kubebuilder.io/v4
+projectName: llm-k8s-redis
+repo: github.com/example/llm-k8s-redis
+resources:
+- group: redis
+  kind: RedisCluster
+  version: v1alpha1
+version: "4"

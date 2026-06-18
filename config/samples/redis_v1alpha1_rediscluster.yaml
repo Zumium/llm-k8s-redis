@@ -1,0 +1,9 @@
+apiVersion: redis.example.com/v1alpha1
+kind: RedisCluster
+metadata:
+  name: example
+spec:
+  shards: 2
+  replicasPerShard: 1
+  image: redis:7.2
+  memorySize: 2Gi
