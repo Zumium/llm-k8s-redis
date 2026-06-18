@@ -223,7 +223,7 @@ func TestAddSlots_TargetIsReplicaFails(t *testing.T) {
 	}
 }
 
-func TestAddSlots_MasterWithoutHealthyReplicaFails(t *testing.T) {
+func TestAddSlots_MasterWithoutHealthyReplicaReturnsRunning(t *testing.T) {
 	ctx := context.Background()
 	cluster := testCluster()
 	master := readyPodWithIP(cluster, "redis-0", "10.0.0.1")
@@ -236,11 +236,11 @@ func TestAddSlots_MasterWithoutHealthyReplicaFails(t *testing.T) {
 	exec := addSlotsExec(t, cluster, []*corev1.Pod{master, replica}, fc)
 
 	outcome, err := exec.ExecuteStep(ctx, cluster, addSlotsPlan(), 6)
-	if err == nil {
-		t.Fatal("expected error when master has no replica")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
-	if outcome.Status != plan.StepStateFailed {
-		t.Fatalf("expected Failed, got %q: %s", outcome.Status, outcome.Message)
+	if outcome.Status != plan.StepStateRunning {
+		t.Fatalf("expected Running, got %q: %s", outcome.Status, outcome.Message)
 	}
 }
 
@@ -258,11 +258,11 @@ func TestAddSlots_MasterReplicaFailedFails(t *testing.T) {
 	exec := addSlotsExec(t, cluster, []*corev1.Pod{master, replica}, fc)
 
 	outcome, err := exec.ExecuteStep(ctx, cluster, addSlotsPlan(), 6)
-	if err == nil {
-		t.Fatal("expected error when replica is failed")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
-	if outcome.Status != plan.StepStateFailed {
-		t.Fatalf("expected Failed, got %q: %s", outcome.Status, outcome.Message)
+	if outcome.Status != plan.StepStateRunning {
+		t.Fatalf("expected Running, got %q: %s", outcome.Status, outcome.Message)
 	}
 }
 

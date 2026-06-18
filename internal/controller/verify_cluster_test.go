@@ -304,7 +304,7 @@ func TestVerifyCluster_ClusterInfoFailsReturnsRunning(t *testing.T) {
 	}
 }
 
-func TestVerifyCluster_ClusterStateNotOkFails(t *testing.T) {
+func TestVerifyCluster_ClusterStateNotOkReturnsRunning(t *testing.T) {
 	ctx := context.Background()
 	cluster := testCluster()
 	pods := vcFourReadyPods()
@@ -314,11 +314,11 @@ func TestVerifyCluster_ClusterStateNotOkFails(t *testing.T) {
 	exec := vcExec(t, cluster, pods, fc)
 
 	outcome, err := exec.ExecuteStep(ctx, cluster, &plan.Plan{Steps: []plan.Step{verifyStep()}}, 0)
-	if err == nil {
-		t.Fatal("expected error when cluster_state != ok")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
-	if outcome.Status != plan.StepStateFailed {
-		t.Fatalf("expected Failed, got %q: %s", outcome.Status, outcome.Message)
+	if outcome.Status != plan.StepStateRunning {
+		t.Fatalf("expected Running, got %q: %s", outcome.Status, outcome.Message)
 	}
 }
 

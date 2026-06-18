@@ -37,8 +37,9 @@ import (
 //
 // On success the executor rebuilds status.topology from the live Redis state
 // and sets the Healthy condition to True. Any transient observation failure
-// (no seed, PING fail, CLUSTER INFO/NODES error) keeps the step Running so
-// the reconciler retries; any structural invariant violation fails the step.
+// (no seed, PING fail, CLUSTER INFO/NODES error, non-ok cluster_state) keeps
+// the step Running so the reconciler retries; any structural invariant
+// violation fails the step.
 func (e *ActionExecutor) verifyCluster(ctx context.Context, cluster *v1alpha1.RedisCluster, step plan.Step) (StepOutcome, error) {
 	expectedShards, outcome, err, ok := paramInt(step.Params, "expectedShards")
 	if !ok {
@@ -110,7 +111,7 @@ func (e *ActionExecutor) verifyCluster(ctx context.Context, cluster *v1alpha1.Re
 	}
 	info := parseClusterInfo(infoRaw)
 	if !clusterStateOk(info) {
-		return paramErr("cluster_state is %q, expected ok", info["cluster_state"])
+		return running("cluster_state is %q, expected ok", info["cluster_state"]), nil
 	}
 
 	nodesRaw, err := rc.ClusterNodes(ctx)

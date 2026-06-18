@@ -117,7 +117,7 @@ func (e *ActionExecutor) addSlots(ctx context.Context, cluster *v1alpha1.RedisCl
 		return paramErr("target master %s/%s is not healthy (flags=%v link=%q)", ns, podName, target.Flags, target.LinkState)
 	}
 	if !masterHasHealthyReplica(entries, target.ID) {
-		return paramErr("master %s/%s has no healthy replica; AddSlots requires at least one", ns, podName)
+		return running("master %s/%s has no healthy replica yet; waiting before AddSlots", ns, podName), nil
 	}
 
 	migrating := migratingSlots(entries)
