@@ -122,8 +122,5 @@ func planWithClient(ctx context.Context, client llm.Client, model string, maxTok
 	// still checks them, but fixing them here avoids spurious rejections.
 	p2.DSLVersion = plan.DSLVersion
 	p2.TargetGeneration = req.Spec.Generation
-	if string(p2.Operation) == "" {
-		p2.Operation = req.Operation
-	}
 	return &p2, nil
 }

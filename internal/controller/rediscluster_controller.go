@@ -37,6 +37,8 @@ const (
 	// finalizer gates cluster deletion until the owned namespace is gone.
 	finalizer = "redis.example.com/redis-cluster-finalizer"
 
+	statusConflictRequeueAfter = time.Second
+
 	ConditionReady   = "Ready"
 	ConditionPlanned = "Planned"
 	ConditionHealthy = "Healthy"
@@ -121,17 +123,12 @@ func (r *RedisClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 
 	spec := toClusterSpec(&cluster)
 
-	if cluster.Status.Phase == "" {
-		cluster.Status.Phase = v1alpha1.PhaseCreating
-	}
-
 	// No active plan: produce, validate and persist one.
 	if cluster.Status.ActivePlan == nil {
 		newPlan, err := r.Planner.Plan(ctx, toPlannerRequest(&cluster, spec))
 		if err != nil {
 			logger.Error(err, "planner returned an error")
 			setCondition(&cluster, ConditionPlanned, metav1.ConditionFalse, "PlannerFailed", err.Error())
-			cluster.Status.Phase = v1alpha1.PhaseFailed
 			cluster.Status.ObservedGeneration = cluster.Generation
 			return r.finish(ctx, &cluster, ctrl.Result{}, nil)
 		}
@@ -139,9 +136,15 @@ func (r *RedisClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 			setCondition(&cluster, ConditionPlanned, metav1.ConditionFalse, "PlannerEmpty", "planner returned no plan")
 			return r.finish(ctx, &cluster, ctrl.Result{RequeueAfter: 10 * time.Second}, nil)
 		}
-		if err := r.Validator.Validate(newPlan, spec); err != nil {
+		if err := r.Validator.Validate(newPlan, validationContext(&cluster, spec)); err != nil {
+			if topologyMatchesSpec(cluster.Status.Topology, spec) {
+				logger.Info("plan rejected but topology already matches spec, marking ready")
+				cluster.Status.ObservedGeneration = cluster.Generation
+				setCondition(&cluster, ConditionPlanned, metav1.ConditionFalse, "NoPlanNeeded", "topology already matches spec")
+				setCondition(&cluster, ConditionReady, metav1.ConditionTrue, "ClusterReady", "cluster matches desired topology")
+				return r.finish(ctx, &cluster, ctrl.Result{RequeueAfter: r.TopologyRefreshInterval}, nil)
+			}
 			setCondition(&cluster, ConditionPlanned, metav1.ConditionFalse, "PlanRejected", err.Error())
-			cluster.Status.Phase = v1alpha1.PhaseFailed
 			cluster.Status.ObservedGeneration = cluster.Generation
 			r.event(&cluster, "PlanRejected", err.Error())
 			return r.finish(ctx, &cluster, ctrl.Result{}, nil)
@@ -149,11 +152,9 @@ func (r *RedisClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		cluster.Status.ActivePlan, err = planToStatus(newPlan)
 		if err != nil {
 			setCondition(&cluster, ConditionPlanned, metav1.ConditionFalse, "PlanPersistFailed", err.Error())
-			cluster.Status.Phase = v1alpha1.PhaseFailed
 			cluster.Status.ObservedGeneration = cluster.Generation
 			return r.finish(ctx, &cluster, ctrl.Result{}, nil)
 		}
-		cluster.Status.Phase = derivePhase(newPlan.Operation)
 		cluster.Status.ObservedGeneration = cluster.Generation
 		setCondition(&cluster, ConditionPlanned, metav1.ConditionTrue, "PlanAccepted", "plan passed validation")
 		return r.finish(ctx, &cluster, ctrl.Result{Requeue: true}, nil)
@@ -161,16 +162,20 @@ func (r *RedisClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 
 	// Active plan present: evaluate aggregate state, then drive one step.
 	active := cluster.Status.ActivePlan
+	if active.TargetGeneration != cluster.Generation {
+		cluster.Status.ActivePlan = nil
+		setCondition(&cluster, ConditionReady, metav1.ConditionFalse, "Replanning", "active plan targets an older generation")
+		setCondition(&cluster, ConditionPlanned, metav1.ConditionFalse, "PlanSuperseded", "active plan targets an older generation")
+		return r.finish(ctx, &cluster, ctrl.Result{Requeue: true}, nil)
+	}
 	switch planState(active) {
 	case plan.PlanStateCompleted:
 		active.Status = string(plan.PlanStateCompleted)
-		cluster.Status.Phase = v1alpha1.PhaseReady
 		cluster.Status.ObservedGeneration = cluster.Generation
 		setCondition(&cluster, ConditionReady, metav1.ConditionTrue, "ClusterReady", "plan completed")
 		return r.finish(ctx, &cluster, ctrl.Result{RequeueAfter: r.TopologyRefreshInterval}, nil)
 	case plan.PlanStateFailed:
 		active.Status = string(plan.PlanStateFailed)
-		cluster.Status.Phase = v1alpha1.PhaseFailed
 		setCondition(&cluster, ConditionReady, metav1.ConditionFalse, "PlanFailed", "plan has failed steps")
 		return r.finish(ctx, &cluster, ctrl.Result{RequeueAfter: r.TopologyRefreshInterval}, nil)
 	}
@@ -185,7 +190,6 @@ func (r *RedisClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	if err != nil {
 		setStep(active, idx, string(plan.StepStateFailed), err.Error())
 		active.CurrentStep = step.ID
-		cluster.Status.Phase = v1alpha1.PhaseFailed
 		setCondition(&cluster, ConditionReady, metav1.ConditionFalse, "PlanRestoreFailed", err.Error())
 		return r.finish(ctx, &cluster, ctrl.Result{}, nil)
 	}
@@ -193,7 +197,6 @@ func (r *RedisClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	if err != nil {
 		setStep(active, idx, string(plan.StepStateFailed), err.Error())
 		active.CurrentStep = step.ID
-		cluster.Status.Phase = v1alpha1.PhaseFailed
 		setCondition(&cluster, ConditionReady, metav1.ConditionFalse, "StepFailed", err.Error())
 		return r.finish(ctx, &cluster, ctrl.Result{}, nil)
 	}
@@ -204,7 +207,6 @@ func (r *RedisClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	case plan.StepStateCompleted:
 		return r.finish(ctx, &cluster, ctrl.Result{Requeue: true}, nil)
 	case plan.StepStateFailed:
-		cluster.Status.Phase = v1alpha1.PhaseFailed
 		setCondition(&cluster, ConditionReady, metav1.ConditionFalse, "StepFailed", outcome.Message)
 		return r.finish(ctx, &cluster, ctrl.Result{}, nil)
 	case plan.StepStateRunning:
@@ -269,6 +271,9 @@ func (r *RedisClusterReconciler) reconcileDelete(ctx context.Context, cluster *v
 // finish persists status when dirty and returns the reconcile result.
 func (r *RedisClusterReconciler) finish(ctx context.Context, cluster *v1alpha1.RedisCluster, res ctrl.Result, err error) (ctrl.Result, error) {
 	if uerr := r.Status().Update(ctx, cluster); uerr != nil && err == nil {
+		if apierrors.IsConflict(uerr) {
+			return ctrl.Result{RequeueAfter: statusConflictRequeueAfter}, nil
+		}
 		return res, uerr
 	}
 	return res, err
@@ -301,39 +306,48 @@ func toClusterSpec(c *v1alpha1.RedisCluster) plan.ClusterSpec {
 	}
 }
 
-// toPlannerRequest builds a planner.Request from the current cluster state.
-// The Operation is derived from the cluster's observed state: if there is no
-// topology yet, the operation is Create; otherwise it would be a topology/
-// image/memory change. For now we default to Create since incremental
-// operations are not yet implemented.
-func toPlannerRequest(c *v1alpha1.RedisCluster, spec plan.ClusterSpec) planner.Request {
-	op := plan.OpCreate
-	if c.Status.Topology != nil && len(c.Status.Topology.Shards) > 0 {
-		op = plan.OpUpdateMemorySize // placeholder; refined when scale/upgrade executors land
+func validationContext(c *v1alpha1.RedisCluster, spec plan.ClusterSpec) plan.ValidationContext {
+	return plan.ValidationContext{
+		Spec:     spec,
+		Topology: toPlanTopology(c.Status.Topology),
 	}
+}
+
+func toPlanTopology(t *v1alpha1.ClusterTopology) *plan.ClusterTopology {
+	if t == nil {
+		return nil
+	}
+	out := &plan.ClusterTopology{Shards: make([]plan.ShardTopology, 0, len(t.Shards))}
+	for _, sh := range t.Shards {
+		ps := plan.ShardTopology{
+			ID:     sh.ID,
+			Master: toPlanNode(sh.Master),
+		}
+		for _, r := range sh.Replicas {
+			ps.Replicas = append(ps.Replicas, toPlanNode(r))
+		}
+		out.Shards = append(out.Shards, ps)
+	}
+	return out
+}
+
+func toPlanNode(n v1alpha1.NodeTopology) plan.NodeTopology {
+	return plan.NodeTopology{
+		Pod:    n.Pod,
+		NodeID: n.NodeID,
+		Slots:  n.Slots,
+		Ready:  n.Ready,
+	}
+}
+
+func toPlannerRequest(c *v1alpha1.RedisCluster, spec plan.ClusterSpec) planner.Request {
 	return planner.Request{
-		Cluster:   c,
-		Spec:      spec,
-		Operation: op,
+		Cluster: c,
+		Spec:    spec,
 		ObservedState: planner.ObservedState{
 			Topology:   c.Status.Topology,
 			ActivePlan: c.Status.ActivePlan,
 		},
-	}
-}
-
-func derivePhase(op plan.Operation) v1alpha1.RedisClusterPhase {
-	switch op {
-	case plan.OpCreate:
-		return v1alpha1.PhaseCreating
-	case plan.OpDelete:
-		return v1alpha1.PhaseDeleting
-	case plan.OpScaleOut, plan.OpScaleIn:
-		return v1alpha1.PhaseScaling
-	case plan.OpUpdateMemorySize:
-		return v1alpha1.PhaseUpgrading
-	default:
-		return v1alpha1.PhaseCreating
 	}
 }
 
@@ -493,7 +507,6 @@ func planToStatus(p *plan.Plan) (*v1alpha1.PlanStatus, error) {
 	}
 	return &v1alpha1.PlanStatus{
 		ID:               p.PlanID,
-		Operation:        string(p.Operation),
 		Status:           string(plan.PlanStateRunning),
 		TargetGeneration: p.TargetGeneration,
 		Summary:          p.Summary,
@@ -520,7 +533,6 @@ func statusToPlan(ps *v1alpha1.PlanStatus) (*plan.Plan, error) {
 	return &plan.Plan{
 		DSLVersion:       plan.DSLVersion,
 		PlanID:           ps.ID,
-		Operation:        plan.Operation(ps.Operation),
 		TargetGeneration: ps.TargetGeneration,
 		Summary:          ps.Summary,
 		Steps:            steps,
@@ -534,4 +546,30 @@ func firstPendingID(steps []v1alpha1.StepStatus) string {
 		}
 	}
 	return ""
+}
+
+func topologyMatchesSpec(topology *v1alpha1.ClusterTopology, spec plan.ClusterSpec) bool {
+	if topology == nil || len(topology.Shards) == 0 {
+		return false
+	}
+	if len(topology.Shards) != int(spec.Shards) {
+		return false
+	}
+	for _, sh := range topology.Shards {
+		if len(sh.Replicas) != int(spec.ReplicasPerShard) {
+			return false
+		}
+		if sh.Master.Slots == "" {
+			return false
+		}
+		if !sh.Master.Ready {
+			return false
+		}
+		for _, r := range sh.Replicas {
+			if !r.Ready {
+				return false
+			}
+		}
+	}
+	return true
 }

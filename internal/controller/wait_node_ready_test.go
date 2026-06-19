@@ -43,7 +43,6 @@ func buildCreatePlan() *plan.Plan {
 	return &plan.Plan{
 		DSLVersion:       plan.DSLVersion,
 		PlanID:           "p1",
-		Operation:        plan.OpCreate,
 		TargetGeneration: 1,
 		Steps: []plan.Step{
 			{ID: "ensure-redis-0", Action: plan.ActionEnsureNode, Params: map[string]any{"namespace": "example", "pod": "redis-0", "image": "redis:7.2", "memorySize": "2Gi"}},
@@ -222,7 +221,6 @@ func TestWaitNodeReady_NoPrecedingEnsureNodeFails(t *testing.T) {
 	p := &plan.Plan{
 		DSLVersion:       plan.DSLVersion,
 		PlanID:           "p2",
-		Operation:        plan.OpCreate,
 		TargetGeneration: 1,
 		Steps: []plan.Step{
 			{ID: "wait-redis-0", Action: plan.ActionWaitNodeReady, Params: map[string]any{"namespace": "example", "pod": "redis-0"}},
@@ -248,7 +246,6 @@ func TestWaitNodeReady_NamespaceMismatchFails(t *testing.T) {
 	p := &plan.Plan{
 		DSLVersion:       plan.DSLVersion,
 		PlanID:           "p3",
-		Operation:        plan.OpCreate,
 		TargetGeneration: 1,
 		Steps: []plan.Step{
 			{ID: "ensure-wrong", Action: plan.ActionEnsureNode, Params: map[string]any{"namespace": "wrong", "pod": "redis-0", "image": "redis:7.2", "memorySize": "2Gi"}},
@@ -273,7 +270,6 @@ func TestWaitNodeReady_MissingPodParamFails(t *testing.T) {
 	p := &plan.Plan{
 		DSLVersion:       plan.DSLVersion,
 		PlanID:           "p4",
-		Operation:        plan.OpCreate,
 		TargetGeneration: 1,
 		Steps: []plan.Step{
 			{ID: "ensure-redis-0", Action: plan.ActionEnsureNode, Params: map[string]any{"namespace": "example", "pod": "redis-0", "image": "redis:7.2", "memorySize": "2Gi"}},

@@ -17,7 +17,7 @@ type Executor interface {
 
 // Validator is the safety gate between planner and executor.
 type Validator interface {
-	Validate(p *plan.Plan, spec plan.ClusterSpec) error
+	Validate(p *plan.Plan, ctx any) error
 }
 
 // StepOutcome is the result of executing one step.

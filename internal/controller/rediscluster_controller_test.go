@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -9,6 +10,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -31,6 +33,35 @@ func newScheme(t *testing.T) *runtime.Scheme {
 		t.Fatalf("add api scheme: %v", err)
 	}
 	return s
+}
+
+type statusUpdateErrorClient struct {
+	client.Client
+	err error
+}
+
+func (c statusUpdateErrorClient) Status() client.SubResourceWriter {
+	return statusUpdateErrorWriter{err: c.err}
+}
+
+type statusUpdateErrorWriter struct {
+	err error
+}
+
+func (w statusUpdateErrorWriter) Create(_ context.Context, _ client.Object, _ client.Object, _ ...client.SubResourceCreateOption) error {
+	return w.err
+}
+
+func (w statusUpdateErrorWriter) Update(_ context.Context, _ client.Object, _ ...client.SubResourceUpdateOption) error {
+	return w.err
+}
+
+func (w statusUpdateErrorWriter) Patch(_ context.Context, _ client.Object, _ client.Patch, _ ...client.SubResourcePatchOption) error {
+	return w.err
+}
+
+func (w statusUpdateErrorWriter) Apply(_ context.Context, _ runtime.ApplyConfiguration, _ ...client.SubResourceApplyOption) error {
+	return w.err
 }
 
 func TestReconcile_EnsuresFinalizerNamespaceAndPlans(t *testing.T) {
@@ -61,7 +92,7 @@ func TestReconcile_EnsuresFinalizerNamespaceAndPlans(t *testing.T) {
 		t.Fatal("expected requeue after adding finalizer")
 	}
 
-	// 2nd reconcile: creates namespace, then planner fails -> phase Failed.
+	// 2nd reconcile: creates namespace, then planner fails.
 	if _, err := r.Reconcile(ctx, req); err != nil {
 		t.Fatalf("reconcile 2: %v", err)
 	}
@@ -78,8 +109,67 @@ func TestReconcile_EnsuresFinalizerNamespaceAndPlans(t *testing.T) {
 	if !controllerutil.ContainsFinalizer(&got, finalizer) {
 		t.Error("expected finalizer to be present")
 	}
-	if got.Status.Phase != api.PhaseFailed {
-		t.Errorf("expected phase Failed, got %q", got.Status.Phase)
+	if !hasCondition(got.Status.Conditions, ConditionPlanned, metav1.ConditionFalse, "PlannerFailed") {
+		t.Errorf("expected Planned=False/PlannerFailed condition, got %#v", got.Status.Conditions)
+	}
+}
+
+func hasCondition(conditions []metav1.Condition, typ string, status metav1.ConditionStatus, reason string) bool {
+	for _, c := range conditions {
+		if c.Type == typ && c.Status == status && c.Reason == reason {
+			return true
+		}
+	}
+	return false
+}
+
+func TestFinish_StatusConflictRequeuesWithoutError(t *testing.T) {
+	ctx := context.Background()
+	scheme := newScheme(t)
+	base := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&api.RedisCluster{}).Build()
+	conflict := apierrors.NewConflict(schema.GroupResource{Group: "redis.example.com", Resource: "redisclusters"}, "example", errors.New("stale resourceVersion"))
+	r := &RedisClusterReconciler{Client: statusUpdateErrorClient{Client: base, err: conflict}}
+
+	res, err := r.finish(ctx, &api.RedisCluster{ObjectMeta: metav1.ObjectMeta{Name: "example"}}, ctrl.Result{Requeue: true}, nil)
+	if err != nil {
+		t.Fatalf("expected no error for status conflict, got %v", err)
+	}
+	if res.Requeue {
+		t.Fatal("expected conflict path to use RequeueAfter instead of immediate requeue")
+	}
+	if res.RequeueAfter != statusConflictRequeueAfter {
+		t.Fatalf("expected RequeueAfter=%v, got %v", statusConflictRequeueAfter, res.RequeueAfter)
+	}
+}
+
+func TestFinish_StatusNonConflictErrorIsReturned(t *testing.T) {
+	ctx := context.Background()
+	scheme := newScheme(t)
+	base := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&api.RedisCluster{}).Build()
+	updateErr := errors.New("status store unavailable")
+	r := &RedisClusterReconciler{Client: statusUpdateErrorClient{Client: base, err: updateErr}}
+
+	_, err := r.finish(ctx, &api.RedisCluster{ObjectMeta: metav1.ObjectMeta{Name: "example"}}, ctrl.Result{}, nil)
+	if !errors.Is(err, updateErr) {
+		t.Fatalf("expected status update error, got %v", err)
+	}
+}
+
+func TestFinish_PreservesOriginalErrorWhenStatusConflicts(t *testing.T) {
+	ctx := context.Background()
+	scheme := newScheme(t)
+	base := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&api.RedisCluster{}).Build()
+	conflict := apierrors.NewConflict(schema.GroupResource{Group: "redis.example.com", Resource: "redisclusters"}, "example", errors.New("stale resourceVersion"))
+	originalErr := errors.New("executor failed")
+	r := &RedisClusterReconciler{Client: statusUpdateErrorClient{Client: base, err: conflict}}
+
+	want := ctrl.Result{RequeueAfter: 7 * time.Second}
+	res, err := r.finish(ctx, &api.RedisCluster{ObjectMeta: metav1.ObjectMeta{Name: "example"}}, want, originalErr)
+	if !errors.Is(err, originalErr) {
+		t.Fatalf("expected original error, got %v", err)
+	}
+	if res != want {
+		t.Fatalf("expected result %+v, got %+v", want, res)
 	}
 }
 
@@ -136,6 +226,17 @@ func (o *recordingObserver) ObserveTopology(_ context.Context, _ *api.RedisClust
 	return nil
 }
 
+type recordingPlanner struct {
+	called int
+	plan   *plan.Plan
+	err    error
+}
+
+func (p *recordingPlanner) Plan(_ context.Context, _ planner.Request) (*plan.Plan, error) {
+	p.called++
+	return p.plan, p.err
+}
+
 func clusterWithTopology() *api.RedisCluster {
 	return &api.RedisCluster{
 		ObjectMeta: metav1.ObjectMeta{Name: "example", Generation: 1},
@@ -148,22 +249,25 @@ func clusterWithTopology() *api.RedisCluster {
 
 func runningPlan() *api.PlanStatus {
 	return &api.PlanStatus{
-		ID:    "plan",
-		Steps: []api.StepStatus{{ID: "s1", Action: string(plan.ActionEnsureNode), Status: string(plan.StepStateRunning)}},
+		ID:               "plan",
+		TargetGeneration: 1,
+		Steps:            []api.StepStatus{{ID: "s1", Action: string(plan.ActionEnsureNode), Status: string(plan.StepStateRunning)}},
 	}
 }
 
 func completedPlan() *api.PlanStatus {
 	return &api.PlanStatus{
-		ID:    "plan",
-		Steps: []api.StepStatus{{ID: "s1", Action: string(plan.ActionVerifyCluster), Status: string(plan.StepStateCompleted)}},
+		ID:               "plan",
+		TargetGeneration: 1,
+		Steps:            []api.StepStatus{{ID: "s1", Action: string(plan.ActionVerifyCluster), Status: string(plan.StepStateCompleted)}},
 	}
 }
 
 func failedPlan() *api.PlanStatus {
 	return &api.PlanStatus{
-		ID:    "plan",
-		Steps: []api.StepStatus{{ID: "s1", Action: string(plan.ActionVerifyCluster), Status: string(plan.StepStateFailed)}},
+		ID:               "plan",
+		TargetGeneration: 1,
+		Steps:            []api.StepStatus{{ID: "s1", Action: string(plan.ActionVerifyCluster), Status: string(plan.StepStateFailed)}},
 	}
 }
 
@@ -305,6 +409,111 @@ func TestReconcile_FailedPlanRequeuesForRefresh(t *testing.T) {
 	}
 	if res.RequeueAfter != 88*time.Second {
 		t.Fatalf("expected RequeueAfter=88s, got %v", res.RequeueAfter)
+	}
+}
+
+func TestReconcile_StaleCompletedPlanIsSuperseded(t *testing.T) {
+	ctx := context.Background()
+	scheme := newScheme(t)
+	cluster := clusterWithTopology()
+	cluster.Generation = 2
+	cluster.Spec.ReplicasPerShard = 2
+	cluster.Finalizers = []string{finalizer}
+	cluster.Status.ObservedGeneration = 1
+	cluster.Status.ActivePlan = completedPlan()
+	cluster.Status.TopologyObservedAt = metav1.Now()
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "example"}}).WithStatusSubresource(&api.RedisCluster{}).Build()
+	r := &RedisClusterReconciler{
+		Client: cl, Scheme: scheme, Planner: planner.NoopPlanner{}, Executor: NoopExecutor{},
+		Validator: plan.NewValidator(), Observer: &recordingObserver{},
+		TopologyRefreshInterval: time.Minute, TopologyStaleThreshold: time.Hour,
+	}
+
+	res, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "example"}})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if !res.Requeue {
+		t.Fatal("expected immediate requeue after superseding stale plan")
+	}
+	var got api.RedisCluster
+	if err := cl.Get(ctx, client.ObjectKey{Name: "example"}, &got); err != nil {
+		t.Fatalf("get cluster: %v", err)
+	}
+	if got.Status.ActivePlan != nil {
+		t.Fatalf("expected activePlan to be cleared, got %#v", got.Status.ActivePlan)
+	}
+	if got.Status.ObservedGeneration != 1 {
+		t.Fatalf("expected observedGeneration to remain 1, got %d", got.Status.ObservedGeneration)
+	}
+	if !hasCondition(got.Status.Conditions, ConditionReady, metav1.ConditionFalse, "Replanning") {
+		t.Fatalf("expected Ready=False/Replanning, got %#v", got.Status.Conditions)
+	}
+	if !hasCondition(got.Status.Conditions, ConditionPlanned, metav1.ConditionFalse, "PlanSuperseded") {
+		t.Fatalf("expected Planned=False/PlanSuperseded, got %#v", got.Status.Conditions)
+	}
+}
+
+func TestReconcile_ReplansAfterStalePlanCleared(t *testing.T) {
+	ctx := context.Background()
+	scheme := newScheme(t)
+	cluster := clusterWithTopology()
+	cluster.Generation = 2
+	cluster.Spec.ReplicasPerShard = 2
+	cluster.Finalizers = []string{finalizer}
+	cluster.Status.ObservedGeneration = 1
+	cluster.Status.Topology = &api.ClusterTopology{Shards: []api.ShardTopology{
+		{ID: "shard-0", Master: api.NodeTopology{Pod: "redis-0", Slots: "0-8191", Ready: true}, Replicas: []api.NodeTopology{{Pod: "redis-1", Ready: true}}},
+		{ID: "shard-1", Master: api.NodeTopology{Pod: "redis-2", Slots: "8192-16383", Ready: true}, Replicas: []api.NodeTopology{{Pod: "redis-3", Ready: true}}},
+	}}
+	cluster.Status.TopologyObservedAt = metav1.Now()
+	p := &plan.Plan{
+		DSLVersion:       plan.DSLVersion,
+		PlanID:           "scaleout-2",
+		TargetGeneration: 2,
+		Steps: []plan.Step{
+			{ID: "ensure-redis-0", Action: plan.ActionEnsureNode, Params: map[string]any{"namespace": "example", "pod": "redis-0", "image": "redis:7.2", "memorySize": "2Gi"}},
+			{ID: "wait-redis-0", Action: plan.ActionWaitNodeReady, Params: map[string]any{"namespace": "example", "pod": "redis-0"}},
+			{ID: "ensure-redis-2", Action: plan.ActionEnsureNode, Params: map[string]any{"namespace": "example", "pod": "redis-2", "image": "redis:7.2", "memorySize": "2Gi"}},
+			{ID: "wait-redis-2", Action: plan.ActionWaitNodeReady, Params: map[string]any{"namespace": "example", "pod": "redis-2"}},
+			{ID: "ensure-redis-4", Action: plan.ActionEnsureNode, Params: map[string]any{"namespace": "example", "pod": "redis-4", "image": "redis:7.2", "memorySize": "2Gi"}},
+			{ID: "ensure-redis-5", Action: plan.ActionEnsureNode, Params: map[string]any{"namespace": "example", "pod": "redis-5", "image": "redis:7.2", "memorySize": "2Gi"}},
+			{ID: "wait-redis-4", Action: plan.ActionWaitNodeReady, Params: map[string]any{"namespace": "example", "pod": "redis-4"}},
+			{ID: "wait-redis-5", Action: plan.ActionWaitNodeReady, Params: map[string]any{"namespace": "example", "pod": "redis-5"}},
+			{ID: "meet-redis-4", Action: plan.ActionMeetNode, Params: map[string]any{"namespace": "example", "sourcePod": "redis-0", "targetPod": "redis-4"}},
+			{ID: "meet-redis-5", Action: plan.ActionMeetNode, Params: map[string]any{"namespace": "example", "sourcePod": "redis-2", "targetPod": "redis-5"}},
+			{ID: "replicate-redis-4", Action: plan.ActionReplicateNode, Params: map[string]any{"namespace": "example", "masterPod": "redis-0", "replicaPod": "redis-4"}},
+			{ID: "replicate-redis-5", Action: plan.ActionReplicateNode, Params: map[string]any{"namespace": "example", "masterPod": "redis-2", "replicaPod": "redis-5"}},
+			{ID: "verify", Action: plan.ActionVerifyCluster, Params: map[string]any{"expectedShards": 2, "expectedReplicasPerShard": 2, "requireClusterStateOk": true, "requireFullSlotCoverage": true, "requireAllSlotOwnersHaveReplicas": true}},
+		},
+	}
+	fp := &recordingPlanner{plan: p}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "example"}}).WithStatusSubresource(&api.RedisCluster{}).Build()
+	r := &RedisClusterReconciler{
+		Client: cl, Scheme: scheme, Planner: fp, Executor: NoopExecutor{},
+		Validator: plan.NewValidator(), Observer: &recordingObserver{},
+		TopologyRefreshInterval: time.Minute, TopologyStaleThreshold: time.Hour,
+	}
+
+	res, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "example"}})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if !res.Requeue {
+		t.Fatal("expected requeue after accepting new plan")
+	}
+	if fp.called != 1 {
+		t.Fatalf("expected planner to be called once, got %d", fp.called)
+	}
+	var got api.RedisCluster
+	if err := cl.Get(ctx, client.ObjectKey{Name: "example"}, &got); err != nil {
+		t.Fatalf("get cluster: %v", err)
+	}
+	if got.Status.ActivePlan == nil || got.Status.ActivePlan.TargetGeneration != 2 {
+		t.Fatalf("expected generation 2 activePlan, got %#v", got.Status.ActivePlan)
+	}
+	if got.Status.ObservedGeneration != 2 {
+		t.Fatalf("expected observedGeneration 2, got %d", got.Status.ObservedGeneration)
 	}
 }
 

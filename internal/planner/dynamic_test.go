@@ -31,9 +31,8 @@ func TestDynamicPlanner_UsesSource(t *testing.T) {
 	dp := NewDynamicPlanner(src)
 
 	got, err := dp.Plan(context.Background(), Request{
-		Cluster:   sampleCluster(),
-		Spec:      sampleSpec(),
-		Operation: plan.OpCreate,
+		Cluster: sampleCluster(),
+		Spec:    sampleSpec(),
 	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -54,9 +53,8 @@ func TestDynamicPlanner_NotLoaded(t *testing.T) {
 	dp := NewDynamicPlanner(src)
 
 	_, err := dp.Plan(context.Background(), Request{
-		Cluster:   sampleCluster(),
-		Spec:      sampleSpec(),
-		Operation: plan.OpCreate,
+		Cluster: sampleCluster(),
+		Spec:    sampleSpec(),
 	})
 	if err == nil {
 		t.Fatal("expected error when source not loaded")
@@ -71,9 +69,8 @@ func TestDynamicPlanner_NilClient(t *testing.T) {
 	dp := NewDynamicPlanner(src)
 
 	_, err := dp.Plan(context.Background(), Request{
-		Cluster:   sampleCluster(),
-		Spec:      sampleSpec(),
-		Operation: plan.OpCreate,
+		Cluster: sampleCluster(),
+		Spec:    sampleSpec(),
 	})
 	if err == nil {
 		t.Fatal("expected error for nil client")
@@ -83,9 +80,8 @@ func TestDynamicPlanner_NilClient(t *testing.T) {
 func TestDynamicPlanner_NilSource(t *testing.T) {
 	dp := &DynamicPlanner{}
 	_, err := dp.Plan(context.Background(), Request{
-		Cluster:   sampleCluster(),
-		Spec:      sampleSpec(),
-		Operation: plan.OpCreate,
+		Cluster: sampleCluster(),
+		Spec:    sampleSpec(),
 	})
 	if err == nil {
 		t.Fatal("expected error for nil source")
@@ -100,7 +96,7 @@ func TestDynamicPlanner_HotReload(t *testing.T) {
 	}
 	dp := NewDynamicPlanner(src)
 
-	if _, err := dp.Plan(context.Background(), Request{Cluster: sampleCluster(), Spec: sampleSpec(), Operation: plan.OpCreate}); err != nil {
+	if _, err := dp.Plan(context.Background(), Request{Cluster: sampleCluster(), Spec: sampleSpec()}); err != nil {
 		t.Fatalf("plan 1: %v", err)
 	}
 	if client1.lastReq.Model != "gpt-4o" {
@@ -111,7 +107,7 @@ func TestDynamicPlanner_HotReload(t *testing.T) {
 	src.cfg = llm.Config{Model: "gpt-4o-mini"}
 	src.client = client2
 
-	if _, err := dp.Plan(context.Background(), Request{Cluster: sampleCluster(), Spec: sampleSpec(), Operation: plan.OpCreate}); err != nil {
+	if _, err := dp.Plan(context.Background(), Request{Cluster: sampleCluster(), Spec: sampleSpec()}); err != nil {
 		t.Fatalf("plan 2: %v", err)
 	}
 	if client2.lastReq.Model != "gpt-4o-mini" {
@@ -129,9 +125,8 @@ func TestPlanWithClient_FixesFields(t *testing.T) {
 
 	fc := &fakeLLMClient{resp: &llm.Response{Text: string(fixed)}}
 	got, err := planWithClient(context.Background(), fc, "m", 0, 0, "", Request{
-		Cluster:   sampleCluster(),
-		Spec:      sampleSpec(),
-		Operation: plan.OpCreate,
+		Cluster: sampleCluster(),
+		Spec:    sampleSpec(),
 	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)

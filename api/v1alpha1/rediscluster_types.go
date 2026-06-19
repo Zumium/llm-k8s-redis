@@ -5,25 +5,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// RedisClusterPhase is the lifecycle phase of a RedisCluster.
-// +kubebuilder:validation:Enum=Creating;Ready;Scaling;Upgrading;Deleting;Failed
-type RedisClusterPhase string
-
-const (
-	// PhaseCreating indicates the cluster is being provisioned.
-	PhaseCreating RedisClusterPhase = "Creating"
-	// PhaseReady indicates the cluster is healthy and matches spec.
-	PhaseReady RedisClusterPhase = "Ready"
-	// PhaseScaling indicates a shard/replica topology change is in progress.
-	PhaseScaling RedisClusterPhase = "Scaling"
-	// PhaseUpgrading indicates an image/memory change is in progress.
-	PhaseUpgrading RedisClusterPhase = "Upgrading"
-	// PhaseDeleting indicates the cluster is being torn down.
-	PhaseDeleting RedisClusterPhase = "Deleting"
-	// PhaseFailed indicates the current plan could not make progress.
-	PhaseFailed RedisClusterPhase = "Failed"
-)
-
 // RedisClusterSpec defines the desired state of a Redis Cluster.
 type RedisClusterSpec struct {
 	// Shards is the number of shards (masters). Minimum 1.
@@ -94,8 +75,6 @@ type StepStatus struct {
 type PlanStatus struct {
 	// ID is the plan identifier.
 	ID string `json:"id,omitempty"`
-	// Operation is the high-level operation, e.g. Create, ScaleOut.
-	Operation string `json:"operation,omitempty"`
 	// +kubebuilder:validation:Enum=Pending;Running;Completed;Failed
 	Status string `json:"status,omitempty"`
 	// TargetGeneration is the RedisCluster generation this plan targets.
@@ -112,8 +91,6 @@ type PlanStatus struct {
 type RedisClusterStatus struct {
 	// ObservedGeneration is the most recent RedisCluster generation handled.
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
-	// Phase is the current lifecycle phase.
-	Phase RedisClusterPhase `json:"phase,omitempty"`
 	// Conditions summarize the cluster's readiness and plan acceptance.
 	// +listType=map
 	// +listMapKey=type
@@ -135,7 +112,6 @@ type RedisClusterStatus struct {
 // +kubebuilder:printcolumn:name="Shards",type=integer,JSONPath=`.spec.shards`
 // +kubebuilder:printcolumn:name="Replicas",type=integer,JSONPath=`.spec.replicasPerShard`
 // +kubebuilder:printcolumn:name="Image",type=string,JSONPath=`.spec.image`
-// +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
 
 // RedisCluster is the Schema for the redisclusters API. It is cluster-scoped:
 // each RedisCluster owns a dedicated namespace whose name equals the cluster name.

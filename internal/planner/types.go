@@ -23,8 +23,7 @@ type Planner interface {
 }
 
 // Request carries everything the planner needs to generate a plan: the desired
-// spec, the observed cluster state, and a hint about which lifecycle operation
-// to perform.
+// spec and the observed cluster state.
 type Request struct {
 	// Cluster is the full RedisCluster CR being reconciled.
 	Cluster *v1alpha1.RedisCluster
@@ -32,12 +31,6 @@ type Request struct {
 	// Spec is the projection of the cluster's spec used for plan generation
 	// and validation.
 	Spec plan.ClusterSpec
-
-	// Operation is a hint telling the planner which lifecycle operation to
-	// plan for (Create, ScaleOut, etc.). The controller derives this from
-	// the cluster's current state; the LLM still generates the concrete
-	// steps.
-	Operation plan.Operation
 
 	// ObservedState is the last-known Redis/K8S state, used by the planner
 	// to generate incremental (non-Create) plans.

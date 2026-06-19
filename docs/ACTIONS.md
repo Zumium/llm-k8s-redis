@@ -222,8 +222,10 @@ Params：
 实现简述：
 
 - Controller 解析 `slots` 范围，并查询每个 slot 当前归属
+- 如果某个目标 slot 已经归属于目标 Master，则该 slot 视为已完成
 - 对每个需要迁移的 slot，将目标 Master 标记为 `IMPORTING`，源 Master 标记为 `MIGRATING`
 - 从源 Master 扫描属于该 slot 的 keys，并使用受控 Redis 迁移流程迁移到目标 Master
+- 每次 reconcile 只迁移有界数量的 slots / keys，未完成时返回 `Running`，下一轮 reconcile 从 live Redis 状态继续
 - key 迁移完成后，将该 slot 的 owner 切换为目标 Master
 - 每迁移一批 slots 后重新观察 cluster 状态，确保可以从中断处继续执行
 - 所有 slots 迁移完成后，清理临时迁移状态并确认 slot owner 已变为 `target`
@@ -234,6 +236,9 @@ Params：
 - source Pod 和 target Pod 必须是 Master
 - source Pod 必须当前持有 `slots`
 - target Pod 必须已经至少有一个 Replica
+- source Pod 和 target Pod 不能是同一个 Pod
+- 如果目标 slot 归属于第三个 Master，`MigrateSlots` 必须失败
+- 如果目标 slot 已处于与当前 source/target 不一致的 migrating/importing 状态，`MigrateSlots` 必须失败
 - `slots` 必须在 `0-16383` 范围内
 - `namespace` 必须等于 Redis Cluster 集群名
 

@@ -46,8 +46,7 @@ func TestDeepSeekIntegration(t *testing.T) {
 	p := NewLLMPlanner(client, cfg.Model)
 
 	got, err := p.Plan(context.Background(), Request{
-		Spec:      spec,
-		Operation: plan.OpCreate,
+		Spec: spec,
 	})
 	if err != nil {
 		t.Fatalf("planner error: %v", err)
@@ -59,5 +58,5 @@ func TestDeepSeekIntegration(t *testing.T) {
 	if err := plan.NewValidator().Validate(got, spec); err != nil {
 		t.Fatalf("validator rejected the LLM-generated plan: %v", err)
 	}
-	t.Logf("plan passed deterministic validation: operation=%s, steps=%d", got.Operation, len(got.Steps))
+	t.Logf("plan passed deterministic validation: steps=%d", len(got.Steps))
 }

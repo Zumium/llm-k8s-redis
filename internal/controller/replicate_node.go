@@ -53,16 +53,18 @@ func (e *ActionExecutor) replicateNode(ctx context.Context, cluster *v1alpha1.Re
 	if masterPod == replicaPod {
 		return paramErr("masterPod %q and replicaPod must differ", masterPod)
 	}
-	if !precededEnsureNode(p, stepIndex, ns, masterPod) {
+	masterExists := podInExistingTopology(cluster, masterPod)
+	replicaExists := podInExistingTopology(cluster, replicaPod)
+	if !masterExists && !precededEnsureNode(p, stepIndex, ns, masterPod) {
 		return paramErr("master pod %s/%s was not declared by a preceding EnsureNode", ns, masterPod)
 	}
-	if !precededEnsureNode(p, stepIndex, ns, replicaPod) {
+	if !replicaExists && !precededEnsureNode(p, stepIndex, ns, replicaPod) {
 		return paramErr("replica pod %s/%s was not declared by a preceding EnsureNode", ns, replicaPod)
 	}
-	if !precededWaitNodeReady(p, stepIndex, ns, masterPod) {
+	if !masterExists && !precededWaitNodeReady(p, stepIndex, ns, masterPod) {
 		return paramErr("master pod %s/%s has not completed a preceding WaitNodeReady", ns, masterPod)
 	}
-	if !precededWaitNodeReady(p, stepIndex, ns, replicaPod) {
+	if !replicaExists && !precededWaitNodeReady(p, stepIndex, ns, replicaPod) {
 		return paramErr("replica pod %s/%s has not completed a preceding WaitNodeReady", ns, replicaPod)
 	}
 

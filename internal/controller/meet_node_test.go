@@ -19,7 +19,6 @@ func meetPlan() *plan.Plan {
 	return &plan.Plan{
 		DSLVersion:       plan.DSLVersion,
 		PlanID:           "meet",
-		Operation:        plan.OpCreate,
 		TargetGeneration: 1,
 		Steps: []plan.Step{
 			{ID: "ensure-redis-0", Action: plan.ActionEnsureNode, Params: map[string]any{"namespace": "example", "pod": "redis-0", "image": "redis:7.2", "memorySize": "2Gi"}},
@@ -263,7 +262,6 @@ func TestMeetNode_NoPrecedingEnsureNodeForTargetFails(t *testing.T) {
 	p := &plan.Plan{
 		DSLVersion:       plan.DSLVersion,
 		PlanID:           "meet-bad",
-		Operation:        plan.OpCreate,
 		TargetGeneration: 1,
 		Steps: []plan.Step{
 			{ID: "ensure-redis-0", Action: plan.ActionEnsureNode, Params: map[string]any{"namespace": "example", "pod": "redis-0", "image": "redis:7.2", "memorySize": "2Gi"}},
@@ -291,7 +289,6 @@ func TestMeetNode_NoPrecedingWaitNodeReadyFails(t *testing.T) {
 	p := &plan.Plan{
 		DSLVersion:       plan.DSLVersion,
 		PlanID:           "meet-nowait",
-		Operation:        plan.OpCreate,
 		TargetGeneration: 1,
 		Steps: []plan.Step{
 			{ID: "ensure-redis-0", Action: plan.ActionEnsureNode, Params: map[string]any{"namespace": "example", "pod": "redis-0", "image": "redis:7.2", "memorySize": "2Gi"}},

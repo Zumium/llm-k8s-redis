@@ -11,17 +11,6 @@ package plan
 // DSLVersion is the version tag carried by every plan.
 const DSLVersion = "redis.ops/v1alpha1"
 
-// Operation is the high-level lifecycle operation a plan performs.
-type Operation string
-
-const (
-	OpCreate           Operation = "Create"
-	OpDelete           Operation = "Delete"
-	OpScaleOut         Operation = "ScaleOut"
-	OpScaleIn          Operation = "ScaleIn"
-	OpUpdateMemorySize Operation = "UpdateMemorySize"
-)
-
 // ActionType is the kind of a single step. Only whitelisted actions are
 // permitted; the controller exposes no generic command execution action.
 type ActionType string
@@ -60,12 +49,11 @@ const (
 
 // Plan is the LLM-generated, JSON-encoded reconciliation plan.
 type Plan struct {
-	DSLVersion       string    `json:"dslVersion"`
-	PlanID           string    `json:"planId"`
-	Operation        Operation `json:"operation"`
-	TargetGeneration int64     `json:"targetGeneration"`
-	Summary          string    `json:"summary,omitempty"`
-	Steps            []Step    `json:"steps"`
+	DSLVersion       string `json:"dslVersion"`
+	PlanID           string `json:"planId"`
+	TargetGeneration int64  `json:"targetGeneration"`
+	Summary          string `json:"summary,omitempty"`
+	Steps            []Step `json:"steps"`
 }
 
 // Step is a single ordered action within a plan.
@@ -84,4 +72,26 @@ type ClusterSpec struct {
 	ReplicasPerShard int32
 	Image            string
 	MemorySize       string
+}
+
+type ValidationContext struct {
+	Spec     ClusterSpec
+	Topology *ClusterTopology
+}
+
+type ClusterTopology struct {
+	Shards []ShardTopology
+}
+
+type ShardTopology struct {
+	ID       string
+	Master   NodeTopology
+	Replicas []NodeTopology
+}
+
+type NodeTopology struct {
+	Pod    string
+	NodeID string
+	Slots  string
+	Ready  bool
 }

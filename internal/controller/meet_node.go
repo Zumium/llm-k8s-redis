@@ -54,16 +54,18 @@ func (e *ActionExecutor) meetNode(ctx context.Context, cluster *v1alpha1.RedisCl
 	if sourcePod == targetPod {
 		return paramErr("sourcePod %q and targetPod must differ", sourcePod)
 	}
-	if !precededEnsureNode(p, stepIndex, ns, sourcePod) {
+	sourceExists := podInExistingTopology(cluster, sourcePod)
+	targetExists := podInExistingTopology(cluster, targetPod)
+	if !sourceExists && !precededEnsureNode(p, stepIndex, ns, sourcePod) {
 		return paramErr("source pod %s/%s was not declared by a preceding EnsureNode", ns, sourcePod)
 	}
-	if !precededEnsureNode(p, stepIndex, ns, targetPod) {
+	if !targetExists && !precededEnsureNode(p, stepIndex, ns, targetPod) {
 		return paramErr("target pod %s/%s was not declared by a preceding EnsureNode", ns, targetPod)
 	}
-	if !precededWaitNodeReady(p, stepIndex, ns, sourcePod) {
+	if !sourceExists && !precededWaitNodeReady(p, stepIndex, ns, sourcePod) {
 		return paramErr("source pod %s/%s has not completed a preceding WaitNodeReady", ns, sourcePod)
 	}
-	if !precededWaitNodeReady(p, stepIndex, ns, targetPod) {
+	if !targetExists && !precededWaitNodeReady(p, stepIndex, ns, targetPod) {
 		return paramErr("target pod %s/%s has not completed a preceding WaitNodeReady", ns, targetPod)
 	}
 
@@ -141,6 +143,28 @@ func precededWaitNodeReady(p *plan.Plan, stepIndex int, ns, podName string) bool
 		ep, ok2 := paramString(s.Params, "pod")
 		if ok1 && ok2 && ens == ns && ep == podName {
 			return true
+		}
+	}
+	return false
+}
+
+// podInExistingTopology reports whether podName is already recorded in the
+// cluster's status.topology. Existing nodes do not need preceding EnsureNode or
+// WaitNodeReady steps in the current plan (e.g. when a scale-out plan uses an
+// existing master as the MeetNode source).
+func podInExistingTopology(cluster *v1alpha1.RedisCluster, podName string) bool {
+	topo := cluster.Status.Topology
+	if topo == nil {
+		return false
+	}
+	for _, sh := range topo.Shards {
+		if sh.Master.Pod == podName {
+			return true
+		}
+		for _, r := range sh.Replicas {
+			if r.Pod == podName {
+				return true
+			}
 		}
 	}
 	return false

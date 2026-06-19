@@ -31,7 +31,6 @@ func addSlotsPlan() *plan.Plan {
 	return &plan.Plan{
 		DSLVersion:       plan.DSLVersion,
 		PlanID:           "addslots",
-		Operation:        plan.OpCreate,
 		TargetGeneration: 1,
 		Steps: []plan.Step{
 			{ID: "ensure-redis-0", Action: plan.ActionEnsureNode, Params: map[string]any{"namespace": "example", "pod": "redis-0", "image": "redis:7.2", "memorySize": "2Gi"}},
@@ -405,7 +404,6 @@ func TestAddSlots_NoPrecedingWaitNodeReadyFails(t *testing.T) {
 	p := &plan.Plan{
 		DSLVersion:       plan.DSLVersion,
 		PlanID:           "addslots-nowait",
-		Operation:        plan.OpCreate,
 		TargetGeneration: 1,
 		Steps: []plan.Step{
 			{ID: "ensure-redis-0", Action: plan.ActionEnsureNode, Params: map[string]any{"namespace": "example", "pod": "redis-0", "image": "redis:7.2", "memorySize": "2Gi"}},
@@ -435,7 +433,6 @@ func TestAddSlots_OverlapWithPreviousAddSlotsFails(t *testing.T) {
 	p := &plan.Plan{
 		DSLVersion:       plan.DSLVersion,
 		PlanID:           "addslots-overlap",
-		Operation:        plan.OpCreate,
 		TargetGeneration: 1,
 		Steps: []plan.Step{
 			{ID: "ensure-redis-0", Action: plan.ActionEnsureNode, Params: map[string]any{"namespace": "example", "pod": "redis-0", "image": "redis:7.2", "memorySize": "2Gi"}},

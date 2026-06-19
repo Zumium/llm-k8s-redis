@@ -59,7 +59,6 @@ func validCreatePlanJSON() string {
 	p := plan.Plan{
 		DSLVersion:       plan.DSLVersion,
 		PlanID:           "create-001",
-		Operation:        plan.OpCreate,
 		TargetGeneration: 3,
 		Summary:          "Create Redis Cluster with 2 shards and 1 replica per shard",
 		Steps: []plan.Step{
@@ -90,18 +89,14 @@ func TestLLMPlanner_ValidPlan(t *testing.T) {
 	p := NewLLMPlanner(fake, "test-model")
 
 	got, err := p.Plan(context.Background(), Request{
-		Cluster:   sampleCluster(),
-		Spec:      sampleSpec(),
-		Operation: plan.OpCreate,
+		Cluster: sampleCluster(),
+		Spec:    sampleSpec(),
 	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if got == nil {
 		t.Fatal("expected non-nil plan")
-	}
-	if got.Operation != plan.OpCreate {
-		t.Errorf("operation = %q, want Create", got.Operation)
 	}
 	if got.TargetGeneration != 3 {
 		t.Errorf("targetGeneration = %d, want 3", got.TargetGeneration)
@@ -119,9 +114,8 @@ func TestLLMPlanner_InvalidJSON(t *testing.T) {
 	p := NewLLMPlanner(fake, "test-model")
 
 	_, err := p.Plan(context.Background(), Request{
-		Cluster:   sampleCluster(),
-		Spec:      sampleSpec(),
-		Operation: plan.OpCreate,
+		Cluster: sampleCluster(),
+		Spec:    sampleSpec(),
 	})
 	if err == nil {
 		t.Fatal("expected error for invalid JSON")
@@ -133,9 +127,8 @@ func TestLLMPlanner_EmptyResponse(t *testing.T) {
 	p := NewLLMPlanner(fake, "test-model")
 
 	_, err := p.Plan(context.Background(), Request{
-		Cluster:   sampleCluster(),
-		Spec:      sampleSpec(),
-		Operation: plan.OpCreate,
+		Cluster: sampleCluster(),
+		Spec:    sampleSpec(),
 	})
 	if err == nil {
 		t.Fatal("expected error for empty response")
@@ -147,9 +140,8 @@ func TestLLMPlanner_ClientError(t *testing.T) {
 	p := NewLLMPlanner(fake, "test-model")
 
 	_, err := p.Plan(context.Background(), Request{
-		Cluster:   sampleCluster(),
-		Spec:      sampleSpec(),
-		Operation: plan.OpCreate,
+		Cluster: sampleCluster(),
+		Spec:    sampleSpec(),
 	})
 	if err == nil {
 		t.Fatal("expected error from client")
@@ -169,9 +161,8 @@ func TestLLMPlanner_FixesDSLVersionAndGeneration(t *testing.T) {
 	p := NewLLMPlanner(fake, "test-model")
 
 	got, err := p.Plan(context.Background(), Request{
-		Cluster:   sampleCluster(),
-		Spec:      sampleSpec(),
-		Operation: plan.OpCreate,
+		Cluster: sampleCluster(),
+		Spec:    sampleSpec(),
 	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -187,9 +178,8 @@ func TestLLMPlanner_FixesDSLVersionAndGeneration(t *testing.T) {
 func TestLLMPlanner_NilClient(t *testing.T) {
 	p := &LLMPlanner{}
 	_, err := p.Plan(context.Background(), Request{
-		Cluster:   sampleCluster(),
-		Spec:      sampleSpec(),
-		Operation: plan.OpCreate,
+		Cluster: sampleCluster(),
+		Spec:    sampleSpec(),
 	})
 	if err == nil {
 		t.Fatal("expected error for nil client")
@@ -201,9 +191,8 @@ func TestLLMPlanner_PromptContainsSpec(t *testing.T) {
 	p := NewLLMPlanner(fake, "test-model")
 
 	_, _ = p.Plan(context.Background(), Request{
-		Cluster:   sampleCluster(),
-		Spec:      sampleSpec(),
-		Operation: plan.OpCreate,
+		Cluster: sampleCluster(),
+		Spec:    sampleSpec(),
 	})
 
 	if fake.lastReq.System == "" {

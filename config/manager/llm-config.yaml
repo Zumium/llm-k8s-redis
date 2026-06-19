@@ -15,18 +15,23 @@ data:
   #   Azure:     https://<resource>.openai.azure.com/openai/deployments/<deploy>
   #   Ollama:    http://ollama:11434/v1
   #   Anthropic: https://api.anthropic.com/v1
-  baseUrl: "https://api.openai.com/v1"
+  #   DeepSeek:  https://api.deepseek.com/v1
+  baseUrl: "https://api.deepseek.com/v1"
   # apiKey is the secret token. For production, mount this from a Secret
   # instead of storing it in plaintext here (see deployment.yaml note).
-  apiKey: "REPLACE_ME"
+  # The test-environment value lives only in the live cluster ConfigMap:
+  #   kubectl -n redis-cluster-system edit cm llm-config
+  apiKey: "sk-..."
   # model is the provider-specific model id, e.g. gpt-4o, claude-sonnet-4-5-20250929.
-  model: "gpt-4o"
+  # Test env uses DeepSeek v4 flash; see AGENTS.md "Test environment".
+  model: "deepseek-v4-flash"
   maxTokens: "384000"
   temperature: "0"
   # reasoningEffort maps to DeepSeek's top-level reasoning_effort parameter.
   # DeepSeek documents high|max; low/medium map to high, xhigh maps to max.
   # Leave unset for providers/models that do not support this parameter.
-  # reasoningEffort: "max"
+  # Test env uses max 思考力度.
+  reasoningEffort: "max"
   # tlsInsecureSkipVerify skips TLS certificate verification. Only for testing
   # environments (e.g. KIND clusters with network restrictions).
   # tlsInsecureSkipVerify: "true"

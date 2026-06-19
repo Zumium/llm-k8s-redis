@@ -27,9 +27,6 @@ spec:
     - jsonPath: .spec.image
       name: Image
       type: string
-    - jsonPath: .status.phase
-      name: Phase
-      type: string
     name: v1alpha1
     schema:
       openAPIV3Schema:
@@ -94,10 +91,6 @@ spec:
                     type: string
                   id:
                     description: ID is the plan identifier.
-                    type: string
-                  operation:
-                    description: Operation is the high-level operation, e.g. Create,
-                      ScaleOut.
                     type: string
                   status:
                     enum:
@@ -221,16 +214,6 @@ spec:
                   handled.
                 format: int64
                 type: integer
-              phase:
-                description: Phase is the current lifecycle phase.
-                enum:
-                - Creating
-                - Ready
-                - Scaling
-                - Upgrading
-                - Deleting
-                - Failed
-                type: string
               topology:
                 description: Topology is the last observed Redis Cluster topology.
                 properties:

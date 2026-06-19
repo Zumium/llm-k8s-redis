@@ -6,7 +6,6 @@ func validCreatePlan() *Plan {
 	return &Plan{
 		DSLVersion:       DSLVersion,
 		PlanID:           "create-001",
-		Operation:        OpCreate,
 		TargetGeneration: 1,
 		Summary:          "Create Redis Cluster with 2 shards and 1 replica per shard",
 		Steps: []Step{
@@ -34,9 +33,149 @@ func spec() ClusterSpec {
 	return ClusterSpec{Name: "example", Generation: 1, Shards: 2, ReplicasPerShard: 1, Image: "redis:7.2", MemorySize: "2Gi"}
 }
 
+func replicaScaleOutSpec() ClusterSpec {
+	s := spec()
+	s.ReplicasPerShard = 2
+	return s
+}
+
+func topology() *ClusterTopology {
+	return &ClusterTopology{Shards: []ShardTopology{
+		{ID: "shard-0", Master: NodeTopology{Pod: "redis-0", Slots: "0-8191", Ready: true}, Replicas: []NodeTopology{{Pod: "redis-1", Ready: true}}},
+		{ID: "shard-1", Master: NodeTopology{Pod: "redis-2", Slots: "8192-16383", Ready: true}, Replicas: []NodeTopology{{Pod: "redis-3", Ready: true}}},
+	}}
+}
+
+func validReplicaScaleOutPlan() *Plan {
+	return &Plan{
+		DSLVersion:       DSLVersion,
+		PlanID:           "replica-scaleout-001",
+		TargetGeneration: 1,
+		Steps: []Step{
+			{ID: "ensure-redis-0", Action: ActionEnsureNode, Params: map[string]any{"namespace": "example", "pod": "redis-0", "image": "redis:7.2", "memorySize": "2Gi"}},
+			{ID: "wait-redis-0", Action: ActionWaitNodeReady, Params: map[string]any{"namespace": "example", "pod": "redis-0"}},
+			{ID: "ensure-redis-2", Action: ActionEnsureNode, Params: map[string]any{"namespace": "example", "pod": "redis-2", "image": "redis:7.2", "memorySize": "2Gi"}},
+			{ID: "wait-redis-2", Action: ActionWaitNodeReady, Params: map[string]any{"namespace": "example", "pod": "redis-2"}},
+			{ID: "ensure-redis-4", Action: ActionEnsureNode, Params: map[string]any{"namespace": "example", "pod": "redis-4", "image": "redis:7.2", "memorySize": "2Gi"}},
+			{ID: "ensure-redis-5", Action: ActionEnsureNode, Params: map[string]any{"namespace": "example", "pod": "redis-5", "image": "redis:7.2", "memorySize": "2Gi"}},
+			{ID: "wait-redis-4", Action: ActionWaitNodeReady, Params: map[string]any{"namespace": "example", "pod": "redis-4"}},
+			{ID: "wait-redis-5", Action: ActionWaitNodeReady, Params: map[string]any{"namespace": "example", "pod": "redis-5"}},
+			{ID: "meet-redis-4", Action: ActionMeetNode, Params: map[string]any{"namespace": "example", "sourcePod": "redis-0", "targetPod": "redis-4"}},
+			{ID: "meet-redis-5", Action: ActionMeetNode, Params: map[string]any{"namespace": "example", "sourcePod": "redis-2", "targetPod": "redis-5"}},
+			{ID: "replicate-redis-4", Action: ActionReplicateNode, Params: map[string]any{"namespace": "example", "masterPod": "redis-0", "replicaPod": "redis-4"}},
+			{ID: "replicate-redis-5", Action: ActionReplicateNode, Params: map[string]any{"namespace": "example", "masterPod": "redis-2", "replicaPod": "redis-5"}},
+			{ID: "verify", Action: ActionVerifyCluster, Params: map[string]any{"expectedShards": 2, "expectedReplicasPerShard": 2, "requireClusterStateOk": true, "requireFullSlotCoverage": true, "requireAllSlotOwnersHaveReplicas": true}},
+		},
+	}
+}
+
+func stepIndex(t *testing.T, p *Plan, id string) int {
+	t.Helper()
+	for i, s := range p.Steps {
+		if s.ID == id {
+			return i
+		}
+	}
+	t.Fatalf("step %q not found", id)
+	return -1
+}
+
 func TestValidate_ValidCreate(t *testing.T) {
 	if err := NewValidator().Validate(validCreatePlan(), spec()); err != nil {
 		t.Fatalf("expected no error, got %v", err)
+	}
+}
+
+func TestValidate_CreateRejectsNonRedisPrefixedPods(t *testing.T) {
+	p := validCreatePlan()
+	p.Steps[0].Params["pod"] = "example-0"
+	if err := NewValidator().Validate(p, spec()); err == nil {
+		t.Fatal("expected error for non-redis-prefixed pod name")
+	}
+}
+
+func TestValidate_CreateRejectsNonContiguousPods(t *testing.T) {
+	p := validCreatePlan()
+	p.Steps[3].Params["pod"] = "redis-4"
+	if err := NewValidator().Validate(p, spec()); err == nil {
+		t.Fatal("expected error for non-contiguous pod names")
+	}
+}
+
+func TestValidate_CreateRejectsPodsNotStartingFromZero(t *testing.T) {
+	p := validCreatePlan()
+	p.Steps[0].Params["pod"] = "redis-1"
+	p.Steps[1].Params["pod"] = "redis-2"
+	p.Steps[2].Params["pod"] = "redis-3"
+	p.Steps[3].Params["pod"] = "redis-4"
+	if err := NewValidator().Validate(p, spec()); err == nil {
+		t.Fatal("expected error for pod names not starting from redis-0")
+	}
+}
+
+func TestValidate_CreateRejectsNegativeOrdinal(t *testing.T) {
+	p := validCreatePlan()
+	p.Steps[0].Params["pod"] = "redis--1"
+	if err := NewValidator().Validate(p, spec()); err == nil {
+		t.Fatal("expected error for negative ordinal")
+	}
+}
+
+func TestValidate_ValidReplicaScaleOut(t *testing.T) {
+	ctx := ValidationContext{Spec: replicaScaleOutSpec(), Topology: topology()}
+	if err := NewValidator().Validate(validReplicaScaleOutPlan(), ctx); err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+}
+
+func TestValidate_ReplicaScaleOutRejectsSlotActions(t *testing.T) {
+	p := validReplicaScaleOutPlan()
+	p.Steps = append(p.Steps[:len(p.Steps)-1], Step{ID: "bad-add-slots", Action: ActionAddSlots, Params: map[string]any{"namespace": "example", "pod": "redis-0", "slots": "0-1"}}, p.Steps[len(p.Steps)-1])
+	ctx := ValidationContext{Spec: replicaScaleOutSpec(), Topology: topology()}
+	if err := NewValidator().Validate(p, ctx); err == nil {
+		t.Fatal("expected error for AddSlots in replica scaleout")
+	}
+}
+
+func TestValidate_ReplicaScaleOutRejectsShardChange(t *testing.T) {
+	s := replicaScaleOutSpec()
+	s.Shards = 3
+	ctx := ValidationContext{Spec: s, Topology: topology()}
+	if err := NewValidator().Validate(validReplicaScaleOutPlan(), ctx); err == nil {
+		t.Fatal("expected error when shards changes")
+	}
+}
+
+func TestValidate_ReplicaScaleOutRejectsNonContiguousNewPods(t *testing.T) {
+	p := validReplicaScaleOutPlan()
+	p.Steps[5].Params["pod"] = "redis-6"
+	ctx := ValidationContext{Spec: replicaScaleOutSpec(), Topology: topology()}
+	if err := NewValidator().Validate(p, ctx); err == nil {
+		t.Fatal("expected error for non-contiguous new pod names")
+	}
+}
+
+func TestValidate_ReplicaScaleOutRejectsNonRedisPrefixedExistingPods(t *testing.T) {
+	topo := topology()
+	topo.Shards[1].Master.Pod = "redis-example-2"
+	ctx := ValidationContext{Spec: replicaScaleOutSpec(), Topology: topo}
+	if err := NewValidator().Validate(validReplicaScaleOutPlan(), ctx); err == nil {
+		t.Fatal("expected error for non-redis-prefixed existing pod")
+	}
+}
+
+func TestValidate_ReplicaScaleOutRejectsNonContiguousNewPodsDirect(t *testing.T) {
+	existing := map[string]bool{
+		"redis-0": true,
+		"redis-1": true,
+		"redis-2": true,
+	}
+	newPods := map[string]bool{
+		"redis-3": true,
+		"redis-5": true,
+	}
+	if err := validateSequentialNewPods(existing, newPods); err == nil {
+		t.Fatal("expected error for non-contiguous new pods")
 	}
 }
 
@@ -122,6 +261,42 @@ func TestValidate_AddSlotsUndeclaredPod(t *testing.T) {
 	}
 }
 
+func TestValidate_CreateRejectsAddSlotsBeforeReplica(t *testing.T) {
+	p := validCreatePlan()
+	addSlots := p.Steps[stepIndex(t, p, "add-slots-redis-0")]
+	p.Steps = append(p.Steps[:11], append([]Step{addSlots}, p.Steps[11:13]...)...)
+	p.Steps = append(p.Steps, validCreatePlan().Steps[14:]...)
+	if err := NewValidator().Validate(p, spec()); err == nil {
+		t.Fatal("expected error for AddSlots before ReplicateNode")
+	}
+}
+
+func TestValidate_CreateRejectsReplicatingSlotOwner(t *testing.T) {
+	p := validCreatePlan()
+	verify := p.Steps[len(p.Steps)-1]
+	p.Steps = append(p.Steps[:len(p.Steps)-1], Step{ID: "bad-replicate-slot-owner", Action: ActionReplicateNode, Params: map[string]any{"namespace": "example", "masterPod": "redis-2", "replicaPod": "redis-0"}}, verify)
+	if err := NewValidator().Validate(p, spec()); err == nil {
+		t.Fatal("expected error for ReplicateNode targeting a slot owner")
+	}
+}
+
+func TestValidate_CreateRejectsAddSlotsToReplica(t *testing.T) {
+	p := validCreatePlan()
+	p.Steps[stepIndex(t, p, "add-slots-redis-0")].Params["pod"] = "redis-1"
+	if err := NewValidator().Validate(p, spec()); err == nil {
+		t.Fatal("expected error for AddSlots targeting a replica")
+	}
+}
+
+func TestValidate_CreateRejectsMeetBeforeReady(t *testing.T) {
+	p := validCreatePlan()
+	wait := stepIndex(t, p, "wait-redis-1")
+	p.Steps = append(p.Steps[:wait], p.Steps[wait+1:]...)
+	if err := NewValidator().Validate(p, spec()); err == nil {
+		t.Fatal("expected error for MeetNode before WaitNodeReady")
+	}
+}
+
 func TestValidate_LastStepNotVerify(t *testing.T) {
 	p := validCreatePlan()
 	p.Steps = append(p.Steps, Step{ID: "wait-again", Action: ActionWaitNodeReady, Params: map[string]any{"namespace": "example", "pod": "redis-0"}})
@@ -151,5 +326,45 @@ func TestParseSlots(t *testing.T) {
 	}
 	if _, err := parseSlots("0-99999"); err == nil {
 		t.Fatal("expected error for out-of-bounds slot")
+	}
+}
+
+func TestValidate_ReplicaScaleOutRejectsReplicateBeforeReady(t *testing.T) {
+	p := validReplicaScaleOutPlan()
+	replicate := stepIndex(t, p, "replicate-redis-4")
+	wait := stepIndex(t, p, "wait-redis-4")
+	step := p.Steps[replicate]
+	p.Steps = append(p.Steps[:replicate], p.Steps[replicate+1:]...)
+	p.Steps = append(p.Steps[:wait], append([]Step{step}, p.Steps[wait:]...)...)
+	ctx := ValidationContext{Spec: replicaScaleOutSpec(), Topology: topology()}
+	if err := NewValidator().Validate(p, ctx); err == nil {
+		t.Fatal("expected error for ReplicateNode before WaitNodeReady")
+	}
+}
+
+func TestValidate_ReplicaScaleOutRejectsReplicaAssignedToReplica(t *testing.T) {
+	p := validReplicaScaleOutPlan()
+	p.Steps[stepIndex(t, p, "replicate-redis-4")].Params["masterPod"] = "redis-1"
+	ctx := ValidationContext{Spec: replicaScaleOutSpec(), Topology: topology()}
+	if err := NewValidator().Validate(p, ctx); err == nil {
+		t.Fatal("expected error for assigning replica to non-master")
+	}
+}
+
+func TestValidate_ReplicaScaleOutRejectsUnknownMaster(t *testing.T) {
+	p := validReplicaScaleOutPlan()
+	p.Steps[stepIndex(t, p, "replicate-redis-4")].Params["masterPod"] = "redis-9"
+	ctx := ValidationContext{Spec: replicaScaleOutSpec(), Topology: topology()}
+	if err := NewValidator().Validate(p, ctx); err == nil {
+		t.Fatal("expected error for assigning replica to unknown master")
+	}
+}
+
+func TestValidate_ReplicaScaleOutRejectsVerifyMismatch(t *testing.T) {
+	p := validReplicaScaleOutPlan()
+	p.Steps[stepIndex(t, p, "verify")].Params["expectedReplicasPerShard"] = 1
+	ctx := ValidationContext{Spec: replicaScaleOutSpec(), Topology: topology()}
+	if err := NewValidator().Validate(p, ctx); err == nil {
+		t.Fatal("expected error for VerifyCluster replica mismatch")
 	}
 }

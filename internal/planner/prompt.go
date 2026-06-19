@@ -25,7 +25,6 @@ func buildSystemPrompt() string {
 	b.WriteString(`{
   "dslVersion": "redis.ops/v1alpha1",
   "planId": "<unique short id, e.g. create-001>",
-  "operation": "<Create|Delete|ScaleOut|ScaleIn|UpdateMemorySize>",
   "targetGeneration": <integer, the cluster generation you are planning for>,
   "summary": "<one-line human-readable description>",
   "steps": [
@@ -50,9 +49,9 @@ func buildSystemPrompt() string {
 	b.WriteString("1. Output ONLY the JSON plan. No markdown fences, no commentary.\n")
 	b.WriteString("2. Every pod-targeting action must include a \"namespace\" param equal to the cluster name.\n")
 	b.WriteString("3. Do NOT invent Redis nodeIds; the controller discovers them at runtime.\n")
-	b.WriteString("4. The last step of a Create plan must be VerifyCluster.\n")
-	b.WriteString("5. EnsureNode pod count must equal shards * (1 + replicasPerShard).\n")
-	b.WriteString("6. AddSlots across all steps must cover exactly slots 0-16383 with no overlaps.\n")
+	b.WriteString("4. If there is no existing topology, create the full cluster from scratch and end with VerifyCluster.\n")
+	b.WriteString("5. If topology exists, transition from observed state to desired spec with the smallest safe action sequence.\n")
+	b.WriteString("6. AddSlots across all Create steps must cover exactly slots 0-16383 with no overlaps.\n")
 	return b.String()
 }
 
@@ -88,6 +87,7 @@ func safetyInvariants() string {
 - Slots 0-16383 must be fully covered exactly once across all AddSlots steps.
 - Every namespace param must equal the RedisCluster name.
 - Every pod referenced by an action must be declared by a preceding EnsureNode.
+- All Redis pods must be named "redis-<N>" where <N> is a single non-negative integer starting from 0. Do NOT embed the cluster name or any other prefix. Correct examples: redis-0, redis-1, redis-2. Wrong examples: redis-3s1r-0, redis-cluster-0, redis-example-0. Pod names must be contiguous within each plan; for ScaleOut, new pods must continue from the highest existing ordinal plus one.
 - sourcePod and targetPod (or masterPod and replicaPod) must not be the same pod.`)
 }
 
@@ -96,8 +96,7 @@ func safetyInvariants() string {
 func buildUserPrompt(req Request) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "RedisCluster name: %s\n", req.Spec.Name)
-	fmt.Fprintf(&b, "metadata.generation: %d\n", req.Spec.Generation)
-	fmt.Fprintf(&b, "operation: %s\n\n", req.Operation)
+	fmt.Fprintf(&b, "metadata.generation: %d\n\n", req.Spec.Generation)
 
 	b.WriteString("## Desired spec\n")
 	fmt.Fprintf(&b, "shards: %d\n", req.Spec.Shards)
@@ -115,12 +114,12 @@ func buildUserPrompt(req Request) string {
 	}
 
 	b.WriteString("## Task\n")
-	switch req.Operation {
-	case plan.OpCreate:
+	if req.ObservedState.Topology == nil || len(req.ObservedState.Topology.Shards) == 0 {
 		b.WriteString("Generate a Create plan that provisions the full Redis Cluster matching the desired spec.\n")
 		b.WriteString("Distribute slots evenly across all masters. Ensure every master has replicas before assigning slots.\n")
-	default:
-		fmt.Fprintf(&b, "Generate a %s plan that transitions the observed state to the desired spec.\n", req.Operation)
+	} else {
+		b.WriteString("Generate a plan that safely transitions the observed state to the desired spec.\n")
+		b.WriteString("Infer the required path from the current topology and desired spec; do not include an operation field.\n")
 	}
 	b.WriteString("Return only the JSON plan.\n")
 	return b.String()
@@ -156,7 +155,6 @@ func planJSONSchema() map[string]any {
 		"properties": map[string]any{
 			"dslVersion":       map[string]any{"type": "string"},
 			"planId":           map[string]any{"type": "string"},
-			"operation":        map[string]any{"type": "string"},
 			"targetGeneration": map[string]any{"type": "integer"},
 			"summary":          map[string]any{"type": "string"},
 			"steps": map[string]any{
@@ -164,7 +162,7 @@ func planJSONSchema() map[string]any {
 				"items": stepSchema,
 			},
 		},
-		"required":             []string{"dslVersion", "planId", "operation", "targetGeneration", "steps"},
+		"required":             []string{"dslVersion", "planId", "targetGeneration", "steps"},
 		"additionalProperties": false,
 	}
 }

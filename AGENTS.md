@@ -82,6 +82,54 @@ plan.Validator                (deterministic safety gate, internal/plan/validato
   `docs/ACTIONS.md` (9 whitelisted actions + params + safety invariants). When
   adding an action or operation, update the doc and the Validator together.
 
+## Test environment
+
+A known-good test environment used for development. Keep this section in sync
+with `cluster-configs/` and the live `llm-config` ConfigMap.
+
+- **Host**: <ip> (user <user>, SSH key-based, sudo passwordless)
+- **KIND cluster**: `kind`, 1 control-plane + 5 workers, K8s v1.36.1
+  - Provisioned from `cluster-configs/kind-1-control-plane-5-workers.yaml`
+  - Managed with `<home-path>go/bin/kind` (v0.32.0)
+- **Working tree on remote**: `~/projects/llm-k8s-redis` (not a git checkout;
+  it's a tarball-synced copy of this repo). Re-sync from WSL with:
+  ```bash
+  tar --exclude='.git' --exclude='bin' --exclude='cover.out' -czf - . \
+    | ssh <user>@<ip> 'tar -xzf - -C ~/projects/llm-k8s-redis'
+  ```
+- **Fast controller image deployment**: when only the controller binary changed,
+  build the Linux binary locally, copy just `Dockerfile` + `manager`, build on
+  the remote Docker daemon, load into KIND, then restart the manager:
+  ```bash
+  mkdir -p /tmp/llm-k8s-redis-image
+  env GOCACHE=/tmp/llm-k8s-redis-go-build \
+    CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+    go build -o /tmp/llm-k8s-redis-image/manager ./cmd/manager
+
+  ssh <user>@<ip> \
+    'rm -rf /tmp/llm-k8s-redis-image && mkdir -p /tmp/llm-k8s-redis-image'
+  scp Dockerfile /tmp/llm-k8s-redis-image/manager \
+    <user>@<ip>:/tmp/llm-k8s-redis-image/
+
+  ssh <user>@<ip> \
+    'cd /tmp/llm-k8s-redis-image && docker build -t controller:latest .'
+  ssh <user>@<ip> \
+    '<home-path>go/bin/kind load docker-image controller:latest --name kind'
+  ssh <user>@<ip> \
+    'kubectl -n redis-cluster-system rollout restart deployment/controller-manager &&
+     kubectl -n redis-cluster-system rollout status deployment/controller-manager --timeout=120s &&
+     kubectl -n redis-cluster-system get deploy,pods -o wide'
+  ```
+  This path does not touch the live `llm-config` ConfigMap.
+- **LLM** (live ConfigMap `llm-config` in namespace `redis-cluster-system`):
+  - `provider: openai`
+  - `baseUrl: https://api.deepseek.com/v1`
+  - `model: deepseek-v4-flash`
+  - `reasoningEffort: max`  (DeepSeek's "max 思考力度"; controller maps to top-level `reasoning_effort=max`)
+  - `apiKey`: **not committed**. Stored only in the live cluster ConfigMap;
+    the controller hot-reloads it every 15s, so no restart is needed when rotated.
+    Inspect/rotate with `kubectl -n redis-cluster-system edit cm llm-config`.
+
 ## Module path caveat
 
 `go.mod` declares `module github.com/example/llm-k8s-redis` — a placeholder,
@@ -93,11 +141,17 @@ rewrite imports to a different path without user instruction.
 - Anthropic-native `llm.Client` adapter (the OpenAI SDK `OpenAIClient` works
   with Anthropic's OpenAI-compatible endpoint via `provider: anthropic`; a
   native Messages API adapter is not yet built).
-- Redis action executors (`EnsureNode`, `AddSlots`, etc.) — `NoopExecutor`
-  returns `ErrExecutorNotConfigured`, so active plans currently fail at first
-  step.
-- Validators for `Delete` / `ScaleOut` / `ScaleIn` / `UpdateMemorySize` — only
-  `Create` has operation-specific safety checks today.
+- Executor actions for `MigrateSlots`, `ForgetNode`, and `DeleteNode`.
+  `ActionExecutor` dispatches six of the nine whitelisted actions (EnsureNode,
+  WaitNodeReady, MeetNode, ReplicateNode, AddSlots, VerifyCluster). The
+  remaining three are whitelisted by the Validator but lack executor
+  implementations — files `migrate_slots.go`, `forget_node.go`, and
+  `delete_node.go` do not yet exist in `internal/controller/`.
+- Validators for shard `ScaleOut` / `ScaleIn` / `UpdateMemorySize` / `Delete`.
+  Only `Create` and `ReplicaScaleOut` (increasing `replicasPerShard` on an
+  existing cluster) have operation-specific safety checks today. Shard-level
+  ScaleOut, any ScaleIn, UpdateMemorySize, and cluster Delete have no
+  validator path.
 - `envtest`-based integration tests; all tests use `fake.Client`.
 
 ## Verification before declaring done
