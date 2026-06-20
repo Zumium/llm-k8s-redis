@@ -53,6 +53,7 @@ func buildSystemPrompt() string {
 	b.WriteString("5. If topology exists, transition from observed state to desired spec with the smallest safe action sequence.\n")
 	b.WriteString("6. AddSlots across all Create steps must cover exactly slots 0-16383 with no overlaps.\n")
 	b.WriteString("7. For shard ScaleOut, do not use AddSlots. Use MigrateSlots for every source/target pair required by the deterministic balanced slot distribution, including existing-master to existing-master moves when needed.\n")
+	b.WriteString("8. If observed drift is present, use the exact replacementPod from the observed state, do not use AddSlots or MigrateSlots for a single missing node, and include ForgetNode only when lastKnownNodeId is non-empty.\n")
 	return b.String()
 }
 
@@ -70,7 +71,7 @@ func actionReference() string {
 		{plan.ActionReplicateNode, `{"namespace":"<cluster>","masterPod":"<name>","replicaPod":"<name>"}`},
 		{plan.ActionAddSlots, `{"namespace":"<cluster>","pod":"<name>","slots":"<start-end>"}`},
 		{plan.ActionMigrateSlots, `{"namespace":"<cluster>","sourcePod":"<name>","targetPod":"<name>","slots":"<start-end>"}`},
-		{plan.ActionForgetNode, `{"namespace":"<cluster>","pod":"<name>"}`},
+		{plan.ActionForgetNode, `{"namespace":"<cluster>","pod":"<last-known-name>","lastKnownNodeId":"<node-id-for-deleted-pod>"}`},
 		{plan.ActionDeleteNode, `{"namespace":"<cluster>","pod":"<name>"}`},
 		{plan.ActionVerifyCluster, `{"expectedShards":<n>,"expectedReplicasPerShard":<n>,"requireClusterStateOk":true,"requireFullSlotCoverage":true,"requireAllSlotOwnersHaveReplicas":true}`},
 	}
@@ -88,8 +89,9 @@ func safetyInvariants() string {
 - Slots 0-16383 must be fully covered exactly once across all AddSlots steps.
 - For shard ScaleOut, MigrateSlots must exactly rebalance slots to the controller rule: existing masters in observed topology order, then new masters in EnsureNode order, with slots 0-16383 split as evenly as possible.
 - Every namespace param must equal the RedisCluster name.
-- Every pod referenced by an action must be declared by a preceding EnsureNode.
-- All Redis pods must be named "redis-<N>" where <N> is a single non-negative integer starting from 0. Do NOT embed the cluster name or any other prefix. Correct examples: redis-0, redis-1, redis-2. Wrong examples: redis-3s1r-0, redis-cluster-0, redis-example-0. Pod names must be contiguous within each plan; for ScaleOut, new pods must continue from the highest existing ordinal plus one.
+- Every new pod referenced by WaitNodeReady/MeetNode/ReplicateNode/AddSlots must be declared by a preceding EnsureNode.
+- All Redis pods must be named "redis-<N>" where <N> is a single non-negative integer. Do NOT embed the cluster name or any other prefix. Correct examples: redis-0, redis-1, redis-2. Wrong examples: redis-3s1r-0, redis-cluster-0, redis-example-0. Pod names are globally non-reusable. Create uses redis-0 upward; all later new pods must start at the provided nextPodOrdinal and must not fill historical gaps.
+- Plans for single-node drift must not use AddSlots or MigrateSlots, must use replacementPod for EnsureNode, and must use lastKnownNodeId when forgetting a deleted pod. If lastKnownNodeId is empty, do not include ForgetNode.
 - sourcePod and targetPod (or masterPod and replicaPod) must not be the same pod.`)
 }
 
@@ -105,6 +107,7 @@ func buildUserPrompt(req Request) string {
 	fmt.Fprintf(&b, "replicasPerShard: %d\n", req.Spec.ReplicasPerShard)
 	fmt.Fprintf(&b, "image: %s\n", req.Spec.Image)
 	fmt.Fprintf(&b, "memorySize: %s\n\n", req.Spec.MemorySize)
+	fmt.Fprintf(&b, "nextPodOrdinal: %d\n\n", req.ObservedState.NextPodOrdinal)
 
 	b.WriteString("## Observed state\n")
 	if req.ObservedState.Topology == nil || len(req.ObservedState.Topology.Shards) == 0 {
@@ -114,9 +117,24 @@ func buildUserPrompt(req Request) string {
 		writeTopology(&b, req.ObservedState.Topology)
 		b.WriteString("\n")
 	}
+	if req.ObservedState.Drift != nil {
+		d := req.ObservedState.Drift
+		b.WriteString("Observed drift:\n")
+		fmt.Fprintf(&b, "- missingPod: %s\n", d.MissingPod)
+		fmt.Fprintf(&b, "- lastKnownNodeId: %s\n", d.LastKnownNodeID)
+		fmt.Fprintf(&b, "- role: %s\n", d.Role)
+		fmt.Fprintf(&b, "- replacementPod: %s\n", d.ReplacementPod)
+		fmt.Fprintf(&b, "- targetMasterPod: %s\n", d.TargetMasterPod)
+		fmt.Fprintf(&b, "- observedShards: %d\n", d.BaselineShards)
+		fmt.Fprintf(&b, "- observedReplicasPerShard: %d\n\n", d.BaselineReplicas)
+	}
 
 	b.WriteString("## Task\n")
-	if req.ObservedState.Topology == nil || len(req.ObservedState.Topology.Shards) == 0 {
+	if req.ObservedState.Drift != nil {
+		b.WriteString("Generate a plan that safely converges the observed drift to the desired spec.\n")
+		b.WriteString("Use only EnsureNode, WaitNodeReady, MeetNode, ReplicateNode, ForgetNode, and VerifyCluster.\n")
+		b.WriteString("Use replacementPod for the new node. Include ForgetNode only if lastKnownNodeId is non-empty. Verify against the desired spec counts.\n")
+	} else if req.ObservedState.Topology == nil || len(req.ObservedState.Topology.Shards) == 0 {
 		b.WriteString("Generate a Create plan that provisions the full Redis Cluster matching the desired spec.\n")
 		b.WriteString("Distribute slots evenly across all masters. Ensure every master has replicas before assigning slots.\n")
 	} else {

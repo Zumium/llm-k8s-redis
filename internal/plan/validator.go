@@ -47,7 +47,6 @@ func (v *Validator) Validate(p *Plan, input any) error {
 	if len(p.Steps) == 0 {
 		return fmt.Errorf("plan has no steps")
 	}
-
 	seen := map[string]bool{}
 	ensurePods := map[string]bool{}
 	for i, s := range p.Steps {
@@ -73,13 +72,16 @@ func (v *Validator) Validate(p *Plan, input any) error {
 		}
 	}
 
+	if ctx.Drift != nil {
+		return validateDrift(p, spec, ctx, ensurePods)
+	}
 	if ctx.Topology == nil || len(ctx.Topology.Shards) == 0 {
 		if err := validateCreate(p, spec, ensurePods); err != nil {
 			return err
 		}
 		return simulatePlan(p, ctx)
 	}
-	if err := validateExistingTopologyPlan(p, spec, ctx.Topology, ensurePods); err != nil {
+	if err := validateExistingTopologyPlan(p, spec, ctx, ensurePods); err != nil {
 		return err
 	}
 	return simulatePlan(p, ctx)
@@ -199,17 +201,111 @@ func validateCreatePodNames(ensurePods map[string]bool) error {
 	return nil
 }
 
-func validateExistingTopologyPlan(p *Plan, spec ClusterSpec, topology *ClusterTopology, ensurePods map[string]bool) error {
+func validateDrift(p *Plan, spec ClusterSpec, ctx ValidationContext, ensurePods map[string]bool) error {
+	d := ctx.Drift
+	if d == nil {
+		return fmt.Errorf("drift plan requires observed drift context")
+	}
+	if d.ReplacementPod == "" || d.TargetMasterPod == "" {
+		return fmt.Errorf("observed drift context is incomplete")
+	}
+	if d.BaselineShards < 1 || d.BaselineReplicas < 0 {
+		return fmt.Errorf("observed drift counts must have positive shards and non-negative replicas")
+	}
+	for _, s := range p.Steps {
+		switch s.Action {
+		case ActionEnsureNode, ActionWaitNodeReady, ActionMeetNode, ActionReplicateNode, ActionForgetNode, ActionVerifyCluster:
+		default:
+			return fmt.Errorf("step %q: action %q is not allowed for observed drift convergence", s.ID, s.Action)
+		}
+	}
+	last := p.Steps[len(p.Steps)-1]
+	if last.Action != ActionVerifyCluster {
+		return fmt.Errorf("last step must be VerifyCluster, got %q", last.Action)
+	}
+	if len(ensurePods) != 1 || !ensurePods[d.ReplacementPod] {
+		return fmt.Errorf("drift convergence EnsureNode must declare only replacement pod %q", d.ReplacementPod)
+	}
+	if err := validateDriftReplacementOrdinal(ctx, d.ReplacementPod); err != nil {
+		return err
+	}
+	for i, s := range p.Steps {
+		switch s.Action {
+		case ActionEnsureNode:
+			pod, _ := paramString(s.Params, "pod")
+			if pod != d.ReplacementPod {
+				return fmt.Errorf("step %q: EnsureNode pod %q must equal replacement pod %q", s.ID, pod, d.ReplacementPod)
+			}
+			if img, _ := paramString(s.Params, "image"); img != spec.Image {
+				return fmt.Errorf("step %q: image %q must equal spec.image %q", s.ID, img, spec.Image)
+			}
+			if mem, _ := paramString(s.Params, "memorySize"); mem != spec.MemorySize {
+				return fmt.Errorf("step %q: memorySize %q must equal spec.memorySize %q", s.ID, mem, spec.MemorySize)
+			}
+		case ActionWaitNodeReady:
+			pod, _ := paramString(s.Params, "pod")
+			if pod != d.ReplacementPod {
+				return fmt.Errorf("step %q: WaitNodeReady pod %q must equal replacement pod %q", s.ID, pod, d.ReplacementPod)
+			}
+			if !precededAction(p, i, ActionEnsureNode, "pod", d.ReplacementPod) {
+				return fmt.Errorf("step %q: replacement pod missing preceding EnsureNode", s.ID)
+			}
+		case ActionMeetNode:
+			target, _ := paramString(s.Params, "targetPod")
+			if target != d.ReplacementPod {
+				return fmt.Errorf("step %q: MeetNode targetPod %q must equal replacement pod %q", s.ID, target, d.ReplacementPod)
+			}
+			source, _ := paramString(s.Params, "sourcePod")
+			if source == d.ReplacementPod {
+				return fmt.Errorf("step %q: MeetNode sourcePod must not be replacement pod", s.ID)
+			}
+			if !precededAction(p, i, ActionWaitNodeReady, "pod", d.ReplacementPod) {
+				return fmt.Errorf("step %q: replacement pod missing preceding WaitNodeReady", s.ID)
+			}
+		case ActionReplicateNode:
+			master, _ := paramString(s.Params, "masterPod")
+			replica, _ := paramString(s.Params, "replicaPod")
+			if master != d.TargetMasterPod || replica != d.ReplacementPod {
+				return fmt.Errorf("step %q: ReplicateNode must replicate replacement pod %q from target master %q", s.ID, d.ReplacementPod, d.TargetMasterPod)
+			}
+			if !precededAction(p, i, ActionMeetNode, "targetPod", d.ReplacementPod) {
+				return fmt.Errorf("step %q: replacement pod missing preceding MeetNode", s.ID)
+			}
+		case ActionForgetNode:
+			if d.MissingPod == "" || d.LastKnownNodeID == "" {
+				return fmt.Errorf("step %q: ForgetNode is not allowed without missing pod and lastKnownNodeId in observed drift context", s.ID)
+			}
+			pod, _ := paramString(s.Params, "pod")
+			nodeID, _ := paramString(s.Params, "lastKnownNodeId")
+			if pod != d.MissingPod || nodeID != d.LastKnownNodeID {
+				return fmt.Errorf("step %q: ForgetNode must target missing pod %q with lastKnownNodeId %q", s.ID, d.MissingPod, d.LastKnownNodeID)
+			}
+		case ActionVerifyCluster:
+			expectedShards, ok := paramInt(s.Params, "expectedShards")
+			if !ok || expectedShards != int(spec.Shards) {
+				return fmt.Errorf("step %q: expectedShards must equal spec.shards %d", s.ID, spec.Shards)
+			}
+			expectedReplicas, ok := paramInt(s.Params, "expectedReplicasPerShard")
+			if !ok || expectedReplicas != int(spec.ReplicasPerShard) {
+				return fmt.Errorf("step %q: expectedReplicasPerShard must equal spec.replicasPerShard %d", s.ID, spec.ReplicasPerShard)
+			}
+		}
+	}
+	return nil
+}
+
+func validateExistingTopologyPlan(p *Plan, spec ClusterSpec, ctx ValidationContext, ensurePods map[string]bool) error {
+	topology := ctx.Topology
 	currentShards := len(topology.Shards)
 	currentReplicas, err := uniformReplicaCount(topology)
 	if err != nil {
 		return err
 	}
 	if int(spec.Shards) == currentShards && int(spec.ReplicasPerShard) > currentReplicas {
-		return validateReplicaScaleOut(p, spec, topology, ensurePods)
+		return validateReplicaScaleOut(p, spec, ctx, ensurePods)
 	}
 	if int(spec.Shards) > currentShards && int(spec.ReplicasPerShard) == currentReplicas {
-		return validateShardScaleOut(p, spec, topology, ensurePods)
+		return validateShardScaleOut(p, spec, ctx, ensurePods)
 	}
 	if int(spec.Shards) > currentShards && int(spec.ReplicasPerShard) > currentReplicas {
 		return fmt.Errorf("shards and replicasPerShard cannot both change in one scaleout")
@@ -217,7 +313,8 @@ func validateExistingTopologyPlan(p *Plan, spec ClusterSpec, topology *ClusterTo
 	return fmt.Errorf("unsupported existing-topology change: spec.shards=%d current=%d spec.replicasPerShard=%d current=%d", spec.Shards, currentShards, spec.ReplicasPerShard, currentReplicas)
 }
 
-func validateReplicaScaleOut(p *Plan, spec ClusterSpec, topology *ClusterTopology, ensurePods map[string]bool) error {
+func validateReplicaScaleOut(p *Plan, spec ClusterSpec, ctx ValidationContext, ensurePods map[string]bool) error {
+	topology := ctx.Topology
 	currentShards := len(topology.Shards)
 	if int(spec.Shards) != currentShards {
 		return fmt.Errorf("only replica scaleout is supported for existing topology: spec.shards=%d current masters=%d", spec.Shards, currentShards)
@@ -253,7 +350,7 @@ func validateReplicaScaleOut(p *Plan, spec ClusterSpec, topology *ClusterTopolog
 	if len(newPods) != wantNewPods {
 		return fmt.Errorf("EnsureNode declared %d new pods, expected %d new replicas", len(newPods), wantNewPods)
 	}
-	if err := validateSequentialNewPods(existingPods, newPods); err != nil {
+	if err := validateSequentialNewPods(existingPods, newPods, effectiveNextPodOrdinal(ctx)); err != nil {
 		return err
 	}
 
@@ -307,7 +404,8 @@ func validateReplicaScaleOut(p *Plan, spec ClusterSpec, topology *ClusterTopolog
 	return nil
 }
 
-func validateShardScaleOut(p *Plan, spec ClusterSpec, topology *ClusterTopology, ensurePods map[string]bool) error {
+func validateShardScaleOut(p *Plan, spec ClusterSpec, ctx ValidationContext, ensurePods map[string]bool) error {
+	topology := ctx.Topology
 	currentShards := len(topology.Shards)
 	currentReplicas, err := uniformReplicaCount(topology)
 	if err != nil {
@@ -353,7 +451,7 @@ func validateShardScaleOut(p *Plan, spec ClusterSpec, topology *ClusterTopology,
 	if len(newPods) != wantNewPods {
 		return fmt.Errorf("EnsureNode declared %d new pods, expected %d new shard nodes", len(newPods), wantNewPods)
 	}
-	if err := validateSequentialNewPods(existingPods, newPods); err != nil {
+	if err := validateSequentialNewPods(existingPods, newPods, effectiveNextPodOrdinal(ctx)); err != nil {
 		return err
 	}
 	for _, s := range p.Steps {
@@ -657,22 +755,42 @@ func masterPodInTopology(topology *ClusterTopology, pod string) bool {
 	return false
 }
 
-func validateSequentialNewPods(existing, newPods map[string]bool) error {
-	max := -1
+func validateSequentialNewPods(existing, newPods map[string]bool, next int) error {
 	for pod := range existing {
-		n, ok := redisPodOrdinal(pod)
-		if !ok {
+		if _, ok := redisPodOrdinal(pod); !ok {
 			return fmt.Errorf("existing pod %q does not match supported sequential pod naming", pod)
 		}
-		if n > max {
-			max = n
+	}
+	for i := 0; i < len(newPods); i++ {
+		pod := fmt.Sprintf("redis-%d", next+i)
+		if !newPods[pod] {
+			return fmt.Errorf("new pods must be contiguous from ordinal %d; missing %q", next, pod)
 		}
 	}
-	for i := 1; i <= len(newPods); i++ {
-		pod := fmt.Sprintf("redis-%d", max+i)
-		if !newPods[pod] {
-			return fmt.Errorf("new pods must be contiguous from ordinal %d; missing %q", max+1, pod)
+	return nil
+}
+
+func effectiveNextPodOrdinal(ctx ValidationContext) int {
+	next := ctx.NextPodOrdinal
+	if ctx.Topology != nil {
+		for pod := range topologyPods(ctx.Topology) {
+			n, ok := redisPodOrdinal(pod)
+			if ok && n >= next {
+				next = n + 1
+			}
 		}
+	}
+	return next
+}
+
+func validateDriftReplacementOrdinal(ctx ValidationContext, pod string) error {
+	n, ok := redisPodOrdinal(pod)
+	if !ok {
+		return fmt.Errorf("replacement pod %q does not match required naming redis-<N>", pod)
+	}
+	next := effectiveNextPodOrdinal(ctx)
+	if n != next {
+		return fmt.Errorf("replacement pod must be redis-%d, got %q", next, pod)
 	}
 	return nil
 }

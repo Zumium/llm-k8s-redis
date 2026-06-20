@@ -101,6 +101,8 @@ type RedisClusterStatus struct {
 	Topology *ClusterTopology `json:"topology,omitempty"`
 	// TopologyObservedAt is the last time Topology was refreshed from Redis.
 	TopologyObservedAt metav1.Time `json:"topologyObservedAt,omitempty"`
+	// NextPodOrdinal is the next redis-N ordinal that may be allocated.
+	NextPodOrdinal int32 `json:"nextPodOrdinal,omitempty"`
 	// ActivePlan is the plan currently being executed, if any.
 	ActivePlan *PlanStatus `json:"activePlan,omitempty"`
 }

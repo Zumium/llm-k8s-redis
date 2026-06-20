@@ -43,7 +43,9 @@ type ObservedState struct {
 	Topology *v1alpha1.ClusterTopology
 	// ActivePlan is the previously executed plan, if any. Useful for
 	// re-planning after a failure.
-	ActivePlan *v1alpha1.PlanStatus
+	ActivePlan     *v1alpha1.PlanStatus
+	NextPodOrdinal int
+	Drift          *plan.DriftContext
 }
 
 // ErrNotConfigured is returned by NoopPlanner.

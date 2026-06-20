@@ -234,8 +234,97 @@ func TestValidate_ReplicaScaleOutRejectsNonContiguousNewPodsDirect(t *testing.T)
 		"redis-3": true,
 		"redis-5": true,
 	}
-	if err := validateSequentialNewPods(existing, newPods); err == nil {
+	if err := validateSequentialNewPods(existing, newPods, 3); err == nil {
 		t.Fatal("expected error for non-contiguous new pods")
+	}
+}
+
+func TestValidate_ReplicaScaleOutUsesNextPodOrdinal(t *testing.T) {
+	topo := topology()
+	topo.Shards[0].Replicas[0].Pod = "redis-4"
+	ctx := ValidationContext{Spec: replicaScaleOutSpec(), Topology: topo, NextPodOrdinal: 5}
+	p := validReplicaScaleOutPlan()
+	p.Steps[4].Params["pod"] = "redis-5"
+	p.Steps[5].Params["pod"] = "redis-6"
+	p.Steps[6].Params["pod"] = "redis-5"
+	p.Steps[7].Params["pod"] = "redis-6"
+	p.Steps[8].Params["targetPod"] = "redis-5"
+	p.Steps[9].Params["targetPod"] = "redis-6"
+	p.Steps[10].Params["replicaPod"] = "redis-5"
+	p.Steps[11].Params["replicaPod"] = "redis-6"
+	if err := NewValidator().Validate(p, ctx); err != nil {
+		t.Fatalf("expected next ordinal pods to pass, got %v", err)
+	}
+	p.Steps[4].Params["pod"] = "redis-1"
+	if err := NewValidator().Validate(p, ctx); err == nil {
+		t.Fatal("expected reused ordinal to fail")
+	}
+}
+
+func TestValidate_DriftPlanRequiresReplacementAndLastKnownNodeID(t *testing.T) {
+	ctx := ValidationContext{
+		Spec:           spec(),
+		Topology:       topology(),
+		NextPodOrdinal: 4,
+		Drift: &DriftContext{
+			MissingPod:       "redis-1",
+			LastKnownNodeID:  "node-1",
+			Role:             "replica",
+			ReplacementPod:   "redis-4",
+			TargetMasterPod:  "redis-0",
+			BaselineShards:   2,
+			BaselineReplicas: 1,
+		},
+	}
+	p := &Plan{
+		DSLVersion:       DSLVersion,
+		PlanID:           "repair-1",
+		TargetGeneration: 1,
+		Steps: []Step{
+			{ID: "ensure", Action: ActionEnsureNode, Params: map[string]any{"namespace": "example", "pod": "redis-4", "image": "redis:7.2", "memorySize": "2Gi"}},
+			{ID: "wait", Action: ActionWaitNodeReady, Params: map[string]any{"namespace": "example", "pod": "redis-4"}},
+			{ID: "meet", Action: ActionMeetNode, Params: map[string]any{"namespace": "example", "sourcePod": "redis-0", "targetPod": "redis-4"}},
+			{ID: "replicate", Action: ActionReplicateNode, Params: map[string]any{"namespace": "example", "masterPod": "redis-0", "replicaPod": "redis-4"}},
+			{ID: "forget", Action: ActionForgetNode, Params: map[string]any{"namespace": "example", "pod": "redis-1", "lastKnownNodeId": "node-1"}},
+			{ID: "verify", Action: ActionVerifyCluster, Params: map[string]any{"expectedShards": 2, "expectedReplicasPerShard": 1, "requireClusterStateOk": true, "requireFullSlotCoverage": true, "requireAllSlotOwnersHaveReplicas": true}},
+		},
+	}
+	if err := NewValidator().Validate(p, ctx); err != nil {
+		t.Fatalf("expected drift plan to pass, got %v", err)
+	}
+	delete(p.Steps[4].Params, "lastKnownNodeId")
+	if err := NewValidator().Validate(p, ctx); err == nil {
+		t.Fatal("expected drift plan without lastKnownNodeId to fail")
+	}
+}
+
+func TestValidate_DriftPlanAllowsMissingNodeIDWhenNoForgetNode(t *testing.T) {
+	ctx := ValidationContext{
+		Spec:           spec(),
+		Topology:       topology(),
+		NextPodOrdinal: 4,
+		Drift: &DriftContext{
+			Role:             "replica",
+			ReplacementPod:   "redis-4",
+			TargetMasterPod:  "redis-0",
+			BaselineShards:   2,
+			BaselineReplicas: 1,
+		},
+	}
+	p := &Plan{
+		DSLVersion:       DSLVersion,
+		PlanID:           "repair-1",
+		TargetGeneration: 1,
+		Steps: []Step{
+			{ID: "ensure", Action: ActionEnsureNode, Params: map[string]any{"namespace": "example", "pod": "redis-4", "image": "redis:7.2", "memorySize": "2Gi"}},
+			{ID: "wait", Action: ActionWaitNodeReady, Params: map[string]any{"namespace": "example", "pod": "redis-4"}},
+			{ID: "meet", Action: ActionMeetNode, Params: map[string]any{"namespace": "example", "sourcePod": "redis-0", "targetPod": "redis-4"}},
+			{ID: "replicate", Action: ActionReplicateNode, Params: map[string]any{"namespace": "example", "masterPod": "redis-0", "replicaPod": "redis-4"}},
+			{ID: "verify", Action: ActionVerifyCluster, Params: map[string]any{"expectedShards": 2, "expectedReplicasPerShard": 1, "requireClusterStateOk": true, "requireFullSlotCoverage": true, "requireAllSlotOwnersHaveReplicas": true}},
+		},
+	}
+	if err := NewValidator().Validate(p, ctx); err != nil {
+		t.Fatalf("expected drift plan without ForgetNode to pass, got %v", err)
 	}
 }
 

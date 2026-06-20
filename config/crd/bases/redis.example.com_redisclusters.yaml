@@ -209,6 +209,11 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              nextPodOrdinal:
+                description: NextPodOrdinal is the next redis-N ordinal that may be
+                  allocated.
+                format: int32
+                type: integer
               observedGeneration:
                 description: ObservedGeneration is the most recent RedisCluster generation
                   handled.

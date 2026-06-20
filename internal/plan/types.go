@@ -75,8 +75,20 @@ type ClusterSpec struct {
 }
 
 type ValidationContext struct {
-	Spec     ClusterSpec
-	Topology *ClusterTopology
+	Spec           ClusterSpec
+	Topology       *ClusterTopology
+	NextPodOrdinal int
+	Drift          *DriftContext
+}
+
+type DriftContext struct {
+	MissingPod       string
+	LastKnownNodeID  string
+	Role             string
+	ReplacementPod   string
+	TargetMasterPod  string
+	BaselineShards   int
+	BaselineReplicas int
 }
 
 type ClusterTopology struct {

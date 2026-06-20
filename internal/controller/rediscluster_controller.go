@@ -13,6 +13,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"maps"
+	"strconv"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -115,6 +117,20 @@ func (r *RedisClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, fmt.Errorf("ensure namespace: %w", err)
 	}
 
+	bumpNextPodOrdinal(&cluster)
+
+	drift, blocked := r.observedDriftContext(ctx, &cluster)
+	if blocked != "" {
+		setCondition(&cluster, ConditionReady, metav1.ConditionFalse, "DriftBlocked", blocked)
+		setCondition(&cluster, ConditionPlanned, metav1.ConditionFalse, "DriftBlocked", blocked)
+		return r.finish(ctx, &cluster, ctrl.Result{RequeueAfter: r.TopologyRefreshInterval}, nil)
+	}
+	if drift != nil && cluster.Status.ActivePlan != nil {
+		cluster.Status.ActivePlan = nil
+		setCondition(&cluster, ConditionReady, metav1.ConditionFalse, "Replanning", "observed state drifted from active plan")
+		setCondition(&cluster, ConditionPlanned, metav1.ConditionFalse, "PlanSuperseded", "observed state drifted from active plan")
+	}
+
 	if r.shouldRefreshTopology(ctx, &cluster) {
 		if err := r.Observer.ObserveTopology(ctx, &cluster); err != nil {
 			logger.Error(err, "lazy topology refresh failed")
@@ -125,7 +141,9 @@ func (r *RedisClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 
 	// No active plan: produce, validate and persist one.
 	if cluster.Status.ActivePlan == nil {
-		newPlan, err := r.Planner.Plan(ctx, toPlannerRequest(&cluster, spec))
+		req := toPlannerRequest(&cluster, spec)
+		req.ObservedState.Drift = drift
+		newPlan, err := r.Planner.Plan(ctx, req)
 		if err != nil {
 			logger.Error(err, "planner returned an error")
 			setCondition(&cluster, ConditionPlanned, metav1.ConditionFalse, "PlannerFailed", err.Error())
@@ -136,7 +154,9 @@ func (r *RedisClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 			setCondition(&cluster, ConditionPlanned, metav1.ConditionFalse, "PlannerEmpty", "planner returned no plan")
 			return r.finish(ctx, &cluster, ctrl.Result{RequeueAfter: 10 * time.Second}, nil)
 		}
-		if err := r.Validator.Validate(newPlan, validationContext(&cluster, spec)); err != nil {
+		vctx := validationContext(&cluster, spec)
+		vctx.Drift = drift
+		if err := r.Validator.Validate(newPlan, vctx); err != nil {
 			if topologyMatchesSpec(cluster.Status.Topology, spec) {
 				logger.Info("plan rejected but topology already matches spec, marking ready")
 				cluster.Status.ObservedGeneration = cluster.Generation
@@ -149,6 +169,7 @@ func (r *RedisClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 			r.event(&cluster, "PlanRejected", err.Error())
 			return r.finish(ctx, &cluster, ctrl.Result{}, nil)
 		}
+		advanceNextPodOrdinalFromPlan(&cluster, newPlan)
 		cluster.Status.ActivePlan, err = planToStatus(newPlan)
 		if err != nil {
 			setCondition(&cluster, ConditionPlanned, metav1.ConditionFalse, "PlanPersistFailed", err.Error())
@@ -175,6 +196,13 @@ func (r *RedisClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		setCondition(&cluster, ConditionReady, metav1.ConditionTrue, "ClusterReady", "plan completed")
 		return r.finish(ctx, &cluster, ctrl.Result{RequeueAfter: r.TopologyRefreshInterval}, nil)
 	case plan.PlanStateFailed:
+		if topologyMatchesSpec(cluster.Status.Topology, spec) {
+			cluster.Status.ActivePlan = nil
+			cluster.Status.ObservedGeneration = cluster.Generation
+			setCondition(&cluster, ConditionPlanned, metav1.ConditionFalse, "NoPlanNeeded", "current topology already matches spec")
+			setCondition(&cluster, ConditionReady, metav1.ConditionTrue, "ClusterReady", "cluster matches desired topology")
+			return r.finish(ctx, &cluster, ctrl.Result{RequeueAfter: r.TopologyRefreshInterval}, nil)
+		}
 		active.Status = string(plan.PlanStateFailed)
 		setCondition(&cluster, ConditionReady, metav1.ConditionFalse, "PlanFailed", "plan has failed steps")
 		return r.finish(ctx, &cluster, ctrl.Result{RequeueAfter: r.TopologyRefreshInterval}, nil)
@@ -308,8 +336,9 @@ func toClusterSpec(c *v1alpha1.RedisCluster) plan.ClusterSpec {
 
 func validationContext(c *v1alpha1.RedisCluster, spec plan.ClusterSpec) plan.ValidationContext {
 	return plan.ValidationContext{
-		Spec:     spec,
-		Topology: toPlanTopology(c.Status.Topology),
+		Spec:           spec,
+		Topology:       toPlanTopology(c.Status.Topology),
+		NextPodOrdinal: int(c.Status.NextPodOrdinal),
 	}
 }
 
@@ -345,8 +374,9 @@ func toPlannerRequest(c *v1alpha1.RedisCluster, spec plan.ClusterSpec) planner.R
 		Cluster: c,
 		Spec:    spec,
 		ObservedState: planner.ObservedState{
-			Topology:   c.Status.Topology,
-			ActivePlan: c.Status.ActivePlan,
+			Topology:       c.Status.Topology,
+			ActivePlan:     c.Status.ActivePlan,
+			NextPodOrdinal: int(c.Status.NextPodOrdinal),
 		},
 	}
 }
@@ -572,4 +602,248 @@ func topologyMatchesSpec(topology *v1alpha1.ClusterTopology, spec plan.ClusterSp
 		}
 	}
 	return true
+}
+
+func bumpNextPodOrdinal(c *v1alpha1.RedisCluster) bool {
+	before := c.Status.NextPodOrdinal
+	max := int(before) - 1
+	for _, pod := range statusTopologyPods(c.Status.Topology) {
+		if n, ok := controllerRedisPodOrdinal(pod); ok && n > max {
+			max = n
+		}
+	}
+	if c.Status.ActivePlan != nil {
+		p, err := statusToPlan(c.Status.ActivePlan)
+		if err == nil {
+			for _, s := range p.Steps {
+				if s.Action != plan.ActionEnsureNode {
+					continue
+				}
+				pod, ok := paramString(s.Params, "pod")
+				if !ok {
+					continue
+				}
+				if n, ok := controllerRedisPodOrdinal(pod); ok && n > max {
+					max = n
+				}
+			}
+		}
+	}
+	next := int32(max + 1)
+	if next < 0 {
+		next = 0
+	}
+	if next > c.Status.NextPodOrdinal {
+		c.Status.NextPodOrdinal = next
+		return true
+	}
+	return false
+}
+
+func advanceNextPodOrdinalFromPlan(c *v1alpha1.RedisCluster, p *plan.Plan) {
+	if p == nil {
+		return
+	}
+	next := c.Status.NextPodOrdinal
+	for _, s := range p.Steps {
+		if s.Action != plan.ActionEnsureNode {
+			continue
+		}
+		pod, ok := paramString(s.Params, "pod")
+		if !ok {
+			continue
+		}
+		if n, ok := controllerRedisPodOrdinal(pod); ok && int32(n+1) > next {
+			next = int32(n + 1)
+		}
+	}
+	c.Status.NextPodOrdinal = next
+}
+
+func statusTopologyPods(t *v1alpha1.ClusterTopology) []string {
+	if t == nil {
+		return nil
+	}
+	out := []string{}
+	for _, sh := range t.Shards {
+		if sh.Master.Pod != "" {
+			out = append(out, sh.Master.Pod)
+		}
+		for _, r := range sh.Replicas {
+			if r.Pod != "" {
+				out = append(out, r.Pod)
+			}
+		}
+	}
+	return out
+}
+
+func controllerRedisPodOrdinal(pod string) (int, bool) {
+	if !strings.HasPrefix(pod, "redis-") {
+		return 0, false
+	}
+	n, err := strconv.Atoi(strings.TrimPrefix(pod, "redis-"))
+	if err != nil || n < 0 {
+		return 0, false
+	}
+	return n, true
+}
+
+type missingTopologyNode struct {
+	pod       string
+	nodeID    string
+	role      string
+	slots     string
+	masterPod string
+}
+
+func (r *RedisClusterReconciler) observedDriftContext(ctx context.Context, c *v1alpha1.RedisCluster) (*plan.DriftContext, string) {
+	if c.Status.Topology == nil || len(c.Status.Topology.Shards) == 0 {
+		return nil, ""
+	}
+	live, ok := r.liveManagedPodNames(ctx, c)
+	if !ok {
+		return nil, ""
+	}
+	missing := []missingTopologyNode{}
+	for _, sh := range c.Status.Topology.Shards {
+		if sh.Master.Pod != "" && sh.Master.NodeID != "" && !live[sh.Master.Pod] {
+			missing = append(missing, missingTopologyNode{pod: sh.Master.Pod, nodeID: sh.Master.NodeID, role: "master", slots: sh.Master.Slots})
+		}
+		for _, rep := range sh.Replicas {
+			if rep.Pod != "" && rep.NodeID != "" && !live[rep.Pod] {
+				missing = append(missing, missingTopologyNode{pod: rep.Pod, nodeID: rep.NodeID, role: "replica", masterPod: sh.Master.Pod})
+			}
+		}
+	}
+	if len(missing) == 0 {
+		return underReplicatedDriftContext(c)
+	}
+	if len(missing) > 1 {
+		return nil, fmt.Sprintf("drift convergence supports one missing pod, found %d", len(missing))
+	}
+	m := missing[0]
+	baselineReplicas, err := statusUniformReplicaCount(c.Status.Topology)
+	if err != nil {
+		return nil, err.Error()
+	}
+	_ = r.Observer.ObserveTopology(ctx, c)
+	targetMaster := ""
+	switch m.role {
+	case "replica":
+		if nodeReadyInTopology(c.Status.Topology, m.masterPod) {
+			targetMaster = m.masterPod
+		}
+	case "master":
+		targetMaster = findFailoverMaster(c.Status.Topology, m.slots)
+	}
+	if targetMaster == "" {
+		return nil, fmt.Sprintf("missing %s pod %s has no healthy convergence target master", m.role, m.pod)
+	}
+	replacement := fmt.Sprintf("redis-%d", c.Status.NextPodOrdinal)
+	return &plan.DriftContext{
+		MissingPod:       m.pod,
+		LastKnownNodeID:  m.nodeID,
+		Role:             m.role,
+		ReplacementPod:   replacement,
+		TargetMasterPod:  targetMaster,
+		BaselineShards:   len(c.Status.Topology.Shards),
+		BaselineReplicas: baselineReplicas,
+	}, ""
+}
+
+func (r *RedisClusterReconciler) liveManagedPodNames(ctx context.Context, c *v1alpha1.RedisCluster) (map[string]bool, bool) {
+	selector, err := labels.Parse(labelCluster + "=" + c.Name)
+	if err != nil {
+		return nil, false
+	}
+	var podList corev1.PodList
+	if err := r.List(ctx, &podList, &client.ListOptions{Namespace: c.Name, LabelSelector: selector}); err != nil {
+		return nil, false
+	}
+	out := map[string]bool{}
+	for i := range podList.Items {
+		out[podList.Items[i].Name] = true
+	}
+	return out, true
+}
+
+func statusUniformReplicaCount(t *v1alpha1.ClusterTopology) (int, error) {
+	if t == nil || len(t.Shards) == 0 {
+		return 0, fmt.Errorf("topology is empty")
+	}
+	want := len(t.Shards[0].Replicas)
+	for _, sh := range t.Shards {
+		if len(sh.Replicas) != want {
+			return 0, fmt.Errorf("topology has non-uniform replica counts")
+		}
+	}
+	return want, nil
+}
+
+func nodeReadyInTopology(t *v1alpha1.ClusterTopology, pod string) bool {
+	if t == nil || pod == "" {
+		return false
+	}
+	for _, sh := range t.Shards {
+		if sh.Master.Pod == pod && sh.Master.Ready {
+			return true
+		}
+	}
+	return false
+}
+
+func findFailoverMaster(t *v1alpha1.ClusterTopology, oldSlots string) string {
+	if t == nil || oldSlots == "" {
+		return ""
+	}
+	oldSet, err := parseSlotSpec(oldSlots)
+	if err != nil || len(oldSet) == 0 {
+		return ""
+	}
+	oldSlotsByNumber := map[int]bool{}
+	for _, s := range oldSet {
+		oldSlotsByNumber[s] = true
+	}
+	for _, sh := range t.Shards {
+		if !sh.Master.Ready || sh.Master.Pod == "" {
+			continue
+		}
+		slots, err := parseSlotSpec(sh.Master.Slots)
+		if err != nil {
+			continue
+		}
+		for _, s := range slots {
+			if oldSlotsByNumber[s] {
+				return sh.Master.Pod
+			}
+		}
+	}
+	return ""
+}
+
+func underReplicatedDriftContext(c *v1alpha1.RedisCluster) (*plan.DriftContext, string) {
+	if c.Status.ObservedGeneration != c.Generation {
+		return nil, ""
+	}
+	t := c.Status.Topology
+	if t == nil {
+		return nil, ""
+	}
+	for _, sh := range t.Shards {
+		if sh.Master.Pod == "" || !sh.Master.Ready || sh.Master.Slots == "" {
+			continue
+		}
+		if len(sh.Replicas) >= int(c.Spec.ReplicasPerShard) {
+			continue
+		}
+		return &plan.DriftContext{
+			Role:             "replica",
+			ReplacementPod:   fmt.Sprintf("redis-%d", c.Status.NextPodOrdinal),
+			TargetMasterPod:  sh.Master.Pod,
+			BaselineShards:   len(t.Shards),
+			BaselineReplicas: int(c.Spec.ReplicasPerShard),
+		}, ""
+	}
+	return nil, ""
 }
