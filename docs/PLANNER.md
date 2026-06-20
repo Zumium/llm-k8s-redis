@@ -89,4 +89,4 @@ LLM 不可信。
 
 它不能直接执行 Redis 命令、K8S patch 或 Shell。它只能生成白名单 Action。Action executor 每步执行时仍会重新读取 live K8S / Redis 状态，并按幂等规则执行。
 
-目前 `MigrateSlots`、`ForgetNode`、`DeleteNode` 在 Validator 中是白名单 Action，但 executor 还没实现完整覆盖。Plan 可能通过部分校验，但没有 executor 的 Action 不能真正完成执行。
+目前 `MigrateSlots`、`DeleteNode` 在 Validator 中是白名单 Action，但 executor 还没实现完整覆盖。Plan 可能通过部分校验，但没有 executor 的 Action 不能真正完成执行。
