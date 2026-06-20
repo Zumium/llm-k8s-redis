@@ -96,6 +96,14 @@ func (g *goRedisClient) ClusterReplicate(ctx context.Context, masterNodeID strin
 	return nil
 }
 
+func (g *goRedisClient) ClusterForget(ctx context.Context, nodeID string) error {
+	res := g.c.Do(ctx, "CLUSTER", "FORGET", nodeID)
+	if err := res.Err(); err != nil {
+		return fmt.Errorf("redis CLUSTER FORGET %s: %w", nodeID, err)
+	}
+	return nil
+}
+
 func (g *goRedisClient) ClusterAddSlots(ctx context.Context, slots []int) error {
 	if len(slots) == 0 {
 		return nil

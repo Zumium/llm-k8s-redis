@@ -64,6 +64,7 @@ type fakeRedisClient struct {
 	clusterInfo      func() (string, error)
 	clusterMeet      func(host string, port int) error
 	clusterReplicate func(masterNodeID string) error
+	clusterForget    func(nodeID string) error
 	clusterAddSlots  func(slots []int) error
 	setSlotImporting func(slot int, sourceNodeID string) error
 	setSlotMigrating func(slot int, targetNodeID string) error
@@ -72,6 +73,7 @@ type fakeRedisClient struct {
 	migrateKeys      func(host string, port int, keys []string, timeout time.Duration) error
 	addSlotsCalls    [][]int
 	replicateCalls   []string
+	forgetCalls      []string
 	meetCalls        []meetCall
 	setSlotCalls     []setSlotCall
 	getKeysCalls     []getKeysCall
@@ -147,6 +149,13 @@ func (f *fakeRedisClient) ClusterReplicate(_ context.Context, masterNodeID strin
 		return nil
 	}
 	return f.clusterReplicate(masterNodeID)
+}
+func (f *fakeRedisClient) ClusterForget(_ context.Context, nodeID string) error {
+	f.forgetCalls = append(f.forgetCalls, nodeID)
+	if f.clusterForget == nil {
+		return nil
+	}
+	return f.clusterForget(nodeID)
 }
 func (f *fakeRedisClient) ClusterAddSlots(_ context.Context, slots []int) error {
 	cp := make([]int, len(slots))

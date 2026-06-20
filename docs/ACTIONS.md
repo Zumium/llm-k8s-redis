@@ -251,13 +251,16 @@ Params：
 ```json
 {
   "namespace": "example",
-  "pod": "redis-3"
+  "pod": "redis-3",
+  "lastKnownNodeId": "abc"
 }
 ```
 
+`lastKnownNodeId` 是可选字段。清理仍有 live Pod 的节点时，Controller 可以通过 `namespace` + `pod` 发现 nodeId；清理已经被删除的 Pod 时，必须显式提供 `lastKnownNodeId`，该字段是旧 Redis 节点身份锚点，`pod` 只表达最后已知 Pod 名。
+
 实现简述：
 
-- Controller 根据 `namespace` + `pod` 查询待移除节点的 Redis nodeId
+- Controller 根据 `namespace` + `pod` 查询待移除节点的 Redis nodeId；如果 Pod 已删除，则使用 `lastKnownNodeId` 定位旧 Redis 节点
 - 从其他仍保留在 Redis Cluster 中的节点上执行受控的 `CLUSTER FORGET nodeId`
 - 如果目标节点已经不在某个节点的 `CLUSTER NODES` 结果中，则对该节点视为已完成
 - 对整个保留节点集合重复确认，直到所有保留节点都不再认识待移除节点
@@ -265,9 +268,11 @@ Params：
 
 安全校验：
 
-- `namespace` + `pod` 必须已被 `EnsureNode` 声明，或存在于当前 Redis Cluster 拓扑中
+- `namespace` + `pod` 必须已被 `EnsureNode` 声明、存在于当前 Redis Cluster 拓扑中，或配合 `lastKnownNodeId` 表示已删除节点的最后已知身份
+- 如果目标 Pod 已被删除，`lastKnownNodeId` 必须存在且必须能在保留节点的 `CLUSTER NODES` 结果中匹配到旧节点
 - 如果目标 Pod 是 Master，则必须不再持有 slots
 - 如果目标 Pod 是 Master，则其 Replica 必须已被迁移或删除计划覆盖
+- 如果目标 Pod 已被删除，只能清理 Redis Cluster 中与 `lastKnownNodeId` 匹配的旧 nodeId，不能清理任何 live Pod 当前提供服务的 nodeId
 - `namespace` 必须等于 Redis Cluster 集群名
 
 ## DeleteNode

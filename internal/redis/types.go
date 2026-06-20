@@ -34,6 +34,7 @@ type Client interface {
 	// `CLUSTER REPLICATE`. It must be issued against the future replica,
 	// not the master.
 	ClusterReplicate(ctx context.Context, masterNodeID string) error
+	ClusterForget(ctx context.Context, nodeID string) error
 	// ClusterAddSlots assigns the given slot numbers to this node via
 	// `CLUSTER ADDSLOTS`. The slice may be empty (the call is a no-op in
 	// that case). Slots must be in [0, 16383].

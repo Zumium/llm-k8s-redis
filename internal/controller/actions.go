@@ -51,8 +51,10 @@ func (e *ActionExecutor) ExecuteStep(ctx context.Context, cluster *v1alpha1.Redi
 		return e.addSlots(ctx, cluster, p, stepIndex)
 	case plan.ActionMigrateSlots:
 		return e.migrateSlots(ctx, cluster, p, stepIndex)
+	case plan.ActionForgetNode:
+		return e.forgetNode(ctx, cluster, step)
 	case plan.ActionVerifyCluster:
-		return e.verifyCluster(ctx, cluster, step)
+		return e.verifyCluster(ctx, cluster, p, step)
 	default:
 		msg := fmt.Sprintf("action %q is not yet implemented", step.Action)
 		return StepOutcome{Status: plan.StepStateFailed, Message: msg}, fmt.Errorf("%s", msg)

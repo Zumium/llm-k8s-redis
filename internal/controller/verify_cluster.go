@@ -35,7 +35,7 @@ import (
 // (no seed, PING fail, CLUSTER INFO/NODES error, non-ok cluster_state) keeps
 // the step Running so the reconciler retries; any structural invariant
 // violation fails the step.
-func (e *ActionExecutor) verifyCluster(ctx context.Context, cluster *v1alpha1.RedisCluster, step plan.Step) (StepOutcome, error) {
+func (e *ActionExecutor) verifyCluster(ctx context.Context, cluster *v1alpha1.RedisCluster, _ *plan.Plan, step plan.Step) (StepOutcome, error) {
 	expectedShards, outcome, err, ok := paramInt(step.Params, "expectedShards")
 	if !ok {
 		return outcome, err
