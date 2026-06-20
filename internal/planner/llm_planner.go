@@ -30,7 +30,7 @@ func NewLLMPlanner(client llm.Client, model string) *LLMPlanner {
 	return &LLMPlanner{
 		Client:      client,
 		Model:       model,
-		MaxTokens:   8192,
+		MaxTokens:   0,
 		Temperature: 0,
 	}
 }

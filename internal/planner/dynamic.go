@@ -30,7 +30,7 @@ type DynamicPlanner struct {
 func NewDynamicPlanner(src PlannerSource) *DynamicPlanner {
 	return &DynamicPlanner{
 		Source:      src,
-		MaxTokens:   8192,
+		MaxTokens:   0,
 		Temperature: 0,
 	}
 }

@@ -59,6 +59,9 @@ func TestOpenAIClient_Success(t *testing.T) {
 		if _, ok := req["reasoning_effort"]; ok {
 			t.Errorf("reasoning_effort should be omitted by default")
 		}
+		if req["max_tokens"] != float64(100) {
+			t.Errorf("max_tokens = %v, want 100", req["max_tokens"])
+		}
 	})
 	defer srv.Close()
 
@@ -90,6 +93,23 @@ func TestOpenAIClient_Success(t *testing.T) {
 	}
 	if resp.Usage.InputTokens != 10 || resp.Usage.OutputTokens != 5 {
 		t.Errorf("usage = %+v", resp.Usage)
+	}
+}
+
+func TestOpenAIClient_UsesConfigMaxTokens(t *testing.T) {
+	srv := newOpenAITestServer(t, 200, `{"id":"x","object":"chat.completion","created":1,"model":"gpt-4o","choices":[{"index":0,"message":{"role":"assistant","content":"{}"},"finish_reason":"stop"}],"usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}`, func(body []byte, _ *http.Request) {
+		var req map[string]any
+		_ = json.Unmarshal(body, &req)
+		if req["max_tokens"] != float64(4096) {
+			t.Errorf("max_tokens = %v, want 4096", req["max_tokens"])
+		}
+	})
+	defer srv.Close()
+
+	c, _ := NewOpenAIClient(Config{Provider: ProviderOpenAI, BaseURL: srv.URL, APIKey: "sk-test", Model: "gpt-4o", MaxTokens: 4096})
+	_, err := c.Complete(context.Background(), Request{Messages: []Message{{Role: RoleUser, Content: []ContentPart{{Type: "text", Text: "x"}}}}})
+	if err != nil {
+		t.Fatalf("complete: %v", err)
 	}
 }
 

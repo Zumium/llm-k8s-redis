@@ -46,6 +46,9 @@ func TestDynamicPlanner_UsesSource(t *testing.T) {
 	if fakeClient.lastReq.ReasoningEffort != "max" {
 		t.Errorf("reasoningEffort passed to client = %q, want max", fakeClient.lastReq.ReasoningEffort)
 	}
+	if fakeClient.lastReq.MaxTokens != 2048 {
+		t.Errorf("maxTokens passed to client = %d, want 2048", fakeClient.lastReq.MaxTokens)
+	}
 }
 
 func TestDynamicPlanner_NotLoaded(t *testing.T) {
