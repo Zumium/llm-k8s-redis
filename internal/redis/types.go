@@ -9,6 +9,7 @@ package redis
 
 import (
 	"context"
+	"time"
 )
 
 // Client is the subset of Redis operations the action executors rely on.
@@ -37,6 +38,11 @@ type Client interface {
 	// `CLUSTER ADDSLOTS`. The slice may be empty (the call is a no-op in
 	// that case). Slots must be in [0, 16383].
 	ClusterAddSlots(ctx context.Context, slots []int) error
+	ClusterSetSlotImporting(ctx context.Context, slot int, sourceNodeID string) error
+	ClusterSetSlotMigrating(ctx context.Context, slot int, targetNodeID string) error
+	ClusterSetSlotNode(ctx context.Context, slot int, nodeID string) error
+	ClusterGetKeysInSlot(ctx context.Context, slot, count int) ([]string, error)
+	MigrateKeys(ctx context.Context, host string, port int, keys []string, timeout time.Duration) error
 	// ClusterInfo returns the raw `CLUSTER INFO` output from this node.
 	// The output is a newline-separated `key:value` report including
 	// `cluster_state`, slot coverage and failover counters.

@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -64,10 +65,36 @@ type fakeRedisClient struct {
 	clusterMeet      func(host string, port int) error
 	clusterReplicate func(masterNodeID string) error
 	clusterAddSlots  func(slots []int) error
+	setSlotImporting func(slot int, sourceNodeID string) error
+	setSlotMigrating func(slot int, targetNodeID string) error
+	setSlotNode      func(slot int, nodeID string) error
+	getKeysInSlot    func(slot, count int) ([]string, error)
+	migrateKeys      func(host string, port int, keys []string, timeout time.Duration) error
 	addSlotsCalls    [][]int
 	replicateCalls   []string
 	meetCalls        []meetCall
+	setSlotCalls     []setSlotCall
+	getKeysCalls     []getKeysCall
+	migrateCalls     []migrateCall
 	sets             []string
+}
+
+type setSlotCall struct {
+	mode   string
+	slot   int
+	nodeID string
+}
+
+type getKeysCall struct {
+	slot  int
+	count int
+}
+
+type migrateCall struct {
+	host    string
+	port    int
+	keys    []string
+	timeout time.Duration
 }
 
 type meetCall struct {
@@ -129,6 +156,42 @@ func (f *fakeRedisClient) ClusterAddSlots(_ context.Context, slots []int) error 
 		return nil
 	}
 	return f.clusterAddSlots(slots)
+}
+func (f *fakeRedisClient) ClusterSetSlotImporting(_ context.Context, slot int, sourceNodeID string) error {
+	f.setSlotCalls = append(f.setSlotCalls, setSlotCall{mode: "IMPORTING", slot: slot, nodeID: sourceNodeID})
+	if f.setSlotImporting == nil {
+		return nil
+	}
+	return f.setSlotImporting(slot, sourceNodeID)
+}
+func (f *fakeRedisClient) ClusterSetSlotMigrating(_ context.Context, slot int, targetNodeID string) error {
+	f.setSlotCalls = append(f.setSlotCalls, setSlotCall{mode: "MIGRATING", slot: slot, nodeID: targetNodeID})
+	if f.setSlotMigrating == nil {
+		return nil
+	}
+	return f.setSlotMigrating(slot, targetNodeID)
+}
+func (f *fakeRedisClient) ClusterSetSlotNode(_ context.Context, slot int, nodeID string) error {
+	f.setSlotCalls = append(f.setSlotCalls, setSlotCall{mode: "NODE", slot: slot, nodeID: nodeID})
+	if f.setSlotNode == nil {
+		return nil
+	}
+	return f.setSlotNode(slot, nodeID)
+}
+func (f *fakeRedisClient) ClusterGetKeysInSlot(_ context.Context, slot, count int) ([]string, error) {
+	f.getKeysCalls = append(f.getKeysCalls, getKeysCall{slot: slot, count: count})
+	if f.getKeysInSlot == nil {
+		return nil, nil
+	}
+	return f.getKeysInSlot(slot, count)
+}
+func (f *fakeRedisClient) MigrateKeys(_ context.Context, host string, port int, keys []string, timeout time.Duration) error {
+	cp := append([]string{}, keys...)
+	f.migrateCalls = append(f.migrateCalls, migrateCall{host: host, port: port, keys: cp, timeout: timeout})
+	if f.migrateKeys == nil {
+		return nil
+	}
+	return f.migrateKeys(host, port, keys, timeout)
 }
 func (f *fakeRedisClient) Close() error { return nil }
 

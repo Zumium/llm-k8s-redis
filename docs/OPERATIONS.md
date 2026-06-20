@@ -261,7 +261,7 @@ Controller 按如下顺序排列最终 Master：
 1. 当前 `status.topology.shards` 中已有 Master 的顺序
 2. ScaleOut Plan 中新增 Master 的 `EnsureNode` 顺序
 
-然后将 `0-16383` 按 Master 数量尽量均分，前面的 Master 在不能整除时多持有 1 个 slot。LLM 生成的 `MigrateSlots` 必须把当前 slot owner 迁移到这个目标分布；Validator 必须能从当前 topology 和目标 spec 复现相同的迁移矩阵。
+然后将 `0-16383` 按 Master 数量尽量均分，前面的 Master 在不能整除时多持有 1 个 slot。LLM 生成的 `MigrateSlots` 必须把当前 slot owner 迁移到这个目标分布；Validator 必须能从当前 topology 和目标 spec 复现相同的迁移矩阵。迁移矩阵可能包含 existing Master 到 existing Master 的迁移，不只包含迁入新增 Master 的迁移。
 
 ### ScaleOut计划结构
 
@@ -271,7 +271,7 @@ Controller 按如下顺序排列最终 Master：
 2. 对所有新增 Redis 节点执行 `WaitNodeReady`
 3. 用已有健康节点作为 seed，对所有新增节点执行 `MeetNode`
 4. 对新增 Master 的 Replica 执行 `ReplicateNode`
-5. 对新增 Master 执行 `MigrateSlots`，从已有 Master 迁入按均衡规则计算出的 slots
+5. 执行 `MigrateSlots`，覆盖按均衡规则计算出的所有 source/target slot 迁移
 6. 最后执行 `VerifyCluster`
 
 当只增加 `replicasPerShard` 时，Plan 不应迁移 slots，也不应创建新的 Master。一个典型顺序是：

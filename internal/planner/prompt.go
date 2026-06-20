@@ -52,6 +52,7 @@ func buildSystemPrompt() string {
 	b.WriteString("4. If there is no existing topology, create the full cluster from scratch and end with VerifyCluster.\n")
 	b.WriteString("5. If topology exists, transition from observed state to desired spec with the smallest safe action sequence.\n")
 	b.WriteString("6. AddSlots across all Create steps must cover exactly slots 0-16383 with no overlaps.\n")
+	b.WriteString("7. For shard ScaleOut, do not use AddSlots. Use MigrateSlots for every source/target pair required by the deterministic balanced slot distribution, including existing-master to existing-master moves when needed.\n")
 	return b.String()
 }
 
@@ -85,6 +86,7 @@ func safetyInvariants() string {
 - AddSlots must run only after the target master has at least one replica.
 - A replica must not hold slots.
 - Slots 0-16383 must be fully covered exactly once across all AddSlots steps.
+- For shard ScaleOut, MigrateSlots must exactly rebalance slots to the controller rule: existing masters in observed topology order, then new masters in EnsureNode order, with slots 0-16383 split as evenly as possible.
 - Every namespace param must equal the RedisCluster name.
 - Every pod referenced by an action must be declared by a preceding EnsureNode.
 - All Redis pods must be named "redis-<N>" where <N> is a single non-negative integer starting from 0. Do NOT embed the cluster name or any other prefix. Correct examples: redis-0, redis-1, redis-2. Wrong examples: redis-3s1r-0, redis-cluster-0, redis-example-0. Pod names must be contiguous within each plan; for ScaleOut, new pods must continue from the highest existing ordinal plus one.

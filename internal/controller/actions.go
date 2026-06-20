@@ -49,6 +49,8 @@ func (e *ActionExecutor) ExecuteStep(ctx context.Context, cluster *v1alpha1.Redi
 		return e.replicateNode(ctx, cluster, p, stepIndex)
 	case plan.ActionAddSlots:
 		return e.addSlots(ctx, cluster, p, stepIndex)
+	case plan.ActionMigrateSlots:
+		return e.migrateSlots(ctx, cluster, p, stepIndex)
 	case plan.ActionVerifyCluster:
 		return e.verifyCluster(ctx, cluster, step)
 	default:

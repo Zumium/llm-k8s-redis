@@ -39,6 +39,12 @@ func replicaScaleOutSpec() ClusterSpec {
 	return s
 }
 
+func shardScaleOutSpec() ClusterSpec {
+	s := spec()
+	s.Shards = 3
+	return s
+}
+
 func topology() *ClusterTopology {
 	return &ClusterTopology{Shards: []ShardTopology{
 		{ID: "shard-0", Master: NodeTopology{Pod: "redis-0", Slots: "0-8191", Ready: true}, Replicas: []NodeTopology{{Pod: "redis-1", Ready: true}}},
@@ -65,6 +71,26 @@ func validReplicaScaleOutPlan() *Plan {
 			{ID: "replicate-redis-4", Action: ActionReplicateNode, Params: map[string]any{"namespace": "example", "masterPod": "redis-0", "replicaPod": "redis-4"}},
 			{ID: "replicate-redis-5", Action: ActionReplicateNode, Params: map[string]any{"namespace": "example", "masterPod": "redis-2", "replicaPod": "redis-5"}},
 			{ID: "verify", Action: ActionVerifyCluster, Params: map[string]any{"expectedShards": 2, "expectedReplicasPerShard": 2, "requireClusterStateOk": true, "requireFullSlotCoverage": true, "requireAllSlotOwnersHaveReplicas": true}},
+		},
+	}
+}
+
+func validShardScaleOutPlan() *Plan {
+	return &Plan{
+		DSLVersion:       DSLVersion,
+		PlanID:           "shard-scaleout-001",
+		TargetGeneration: 1,
+		Steps: []Step{
+			{ID: "ensure-redis-4", Action: ActionEnsureNode, Params: map[string]any{"namespace": "example", "pod": "redis-4", "image": "redis:7.2", "memorySize": "2Gi"}},
+			{ID: "ensure-redis-5", Action: ActionEnsureNode, Params: map[string]any{"namespace": "example", "pod": "redis-5", "image": "redis:7.2", "memorySize": "2Gi"}},
+			{ID: "wait-redis-4", Action: ActionWaitNodeReady, Params: map[string]any{"namespace": "example", "pod": "redis-4"}},
+			{ID: "wait-redis-5", Action: ActionWaitNodeReady, Params: map[string]any{"namespace": "example", "pod": "redis-5"}},
+			{ID: "meet-redis-4", Action: ActionMeetNode, Params: map[string]any{"namespace": "example", "sourcePod": "redis-0", "targetPod": "redis-4"}},
+			{ID: "meet-redis-5", Action: ActionMeetNode, Params: map[string]any{"namespace": "example", "sourcePod": "redis-0", "targetPod": "redis-5"}},
+			{ID: "replicate-redis-5", Action: ActionReplicateNode, Params: map[string]any{"namespace": "example", "masterPod": "redis-4", "replicaPod": "redis-5"}},
+			{ID: "migrate-redis-0-redis-2", Action: ActionMigrateSlots, Params: map[string]any{"namespace": "example", "sourcePod": "redis-0", "targetPod": "redis-2", "slots": "5462-8191"}},
+			{ID: "migrate-redis-2-redis-4", Action: ActionMigrateSlots, Params: map[string]any{"namespace": "example", "sourcePod": "redis-2", "targetPod": "redis-4", "slots": "10923-16383"}},
+			{ID: "verify", Action: ActionVerifyCluster, Params: map[string]any{"expectedShards": 3, "expectedReplicasPerShard": 1, "requireClusterStateOk": true, "requireFullSlotCoverage": true, "requireAllSlotOwnersHaveReplicas": true}},
 		},
 	}
 }
@@ -125,6 +151,40 @@ func TestValidate_ValidReplicaScaleOut(t *testing.T) {
 	ctx := ValidationContext{Spec: replicaScaleOutSpec(), Topology: topology()}
 	if err := NewValidator().Validate(validReplicaScaleOutPlan(), ctx); err != nil {
 		t.Fatalf("expected no error, got %v", err)
+	}
+}
+
+func TestValidate_ValidShardScaleOut(t *testing.T) {
+	ctx := ValidationContext{Spec: shardScaleOutSpec(), Topology: topology()}
+	if err := NewValidator().Validate(validShardScaleOutPlan(), ctx); err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+}
+
+func TestValidate_ShardScaleOutRejectsAddSlots(t *testing.T) {
+	p := validShardScaleOutPlan()
+	p.Steps = append(p.Steps[:len(p.Steps)-1], Step{ID: "bad-add-slots", Action: ActionAddSlots, Params: map[string]any{"namespace": "example", "pod": "redis-4", "slots": "10923-10924"}}, p.Steps[len(p.Steps)-1])
+	ctx := ValidationContext{Spec: shardScaleOutSpec(), Topology: topology()}
+	if err := NewValidator().Validate(p, ctx); err == nil {
+		t.Fatal("expected error for AddSlots in shard scaleout")
+	}
+}
+
+func TestValidate_ShardScaleOutRejectsWrongMigrationSlots(t *testing.T) {
+	p := validShardScaleOutPlan()
+	p.Steps[stepIndex(t, p, "migrate-redis-2-redis-4")].Params["slots"] = "10924-16383"
+	ctx := ValidationContext{Spec: shardScaleOutSpec(), Topology: topology()}
+	if err := NewValidator().Validate(p, ctx); err == nil {
+		t.Fatal("expected error for incomplete MigrateSlots matrix")
+	}
+}
+
+func TestValidate_ShardScaleOutRejectsShardAndReplicaChange(t *testing.T) {
+	s := shardScaleOutSpec()
+	s.ReplicasPerShard = 2
+	ctx := ValidationContext{Spec: s, Topology: topology()}
+	if err := NewValidator().Validate(validShardScaleOutPlan(), ctx); err == nil {
+		t.Fatal("expected error when shards and replicasPerShard both change")
 	}
 }
 

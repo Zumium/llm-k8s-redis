@@ -84,6 +84,8 @@ func (s *planSimulator) apply(step Step) error {
 		return s.replicateNode(step)
 	case ActionAddSlots:
 		return s.addSlots(step)
+	case ActionMigrateSlots:
+		return s.migrateSlots(step)
 	case ActionVerifyCluster:
 		return s.verifyCluster(step)
 	default:
@@ -212,6 +214,57 @@ func (s *planSimulator) addSlots(step Step) error {
 	for slot := range slots {
 		n.slots[slot] = struct{}{}
 		s.slotOwners[slot] = pod
+	}
+	return nil
+}
+
+func (s *planSimulator) migrateSlots(step Step) error {
+	sourcePod, ok := paramString(step.Params, "sourcePod")
+	if !ok || sourcePod == "" {
+		return fmt.Errorf("MigrateSlots requires a non-empty sourcePod param")
+	}
+	targetPod, ok := paramString(step.Params, "targetPod")
+	if !ok || targetPod == "" {
+		return fmt.Errorf("MigrateSlots requires a non-empty targetPod param")
+	}
+	if sourcePod == targetPod {
+		return fmt.Errorf("sourcePod and targetPod must differ")
+	}
+	source := s.nodes[sourcePod]
+	if source == nil || !source.ready || !source.clusterMember || source.role != "master" {
+		return fmt.Errorf("source pod %q is not a ready master", sourcePod)
+	}
+	target := s.nodes[targetPod]
+	if target == nil || !target.ready || !target.clusterMember || target.role != "master" {
+		return fmt.Errorf("target pod %q is not a ready master", targetPod)
+	}
+	if s.replicaCount(targetPod) == 0 {
+		return fmt.Errorf("target master %q has no replica", targetPod)
+	}
+	slotsStr, ok := paramString(step.Params, "slots")
+	if !ok || slotsStr == "" {
+		return fmt.Errorf("MigrateSlots requires a non-empty slots param")
+	}
+	slots, err := parseSlots(slotsStr)
+	if err != nil {
+		return err
+	}
+	for slot := range slots {
+		owner, exists := s.slotOwners[slot]
+		if !exists {
+			return fmt.Errorf("slot %d has no owner", slot)
+		}
+		if owner != sourcePod && owner != targetPod {
+			return fmt.Errorf("slot %d belongs to pod %q, not source %q or target %q", slot, owner, sourcePod, targetPod)
+		}
+	}
+	for slot := range slots {
+		if s.slotOwners[slot] == targetPod {
+			continue
+		}
+		delete(source.slots, slot)
+		target.slots[slot] = struct{}{}
+		s.slotOwners[slot] = targetPod
 	}
 	return nil
 }

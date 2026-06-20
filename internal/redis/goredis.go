@@ -112,6 +112,58 @@ func (g *goRedisClient) ClusterAddSlots(ctx context.Context, slots []int) error 
 	return nil
 }
 
+func (g *goRedisClient) ClusterSetSlotImporting(ctx context.Context, slot int, sourceNodeID string) error {
+	res := g.c.Do(ctx, "CLUSTER", "SETSLOT", slot, "IMPORTING", sourceNodeID)
+	if err := res.Err(); err != nil {
+		return fmt.Errorf("redis CLUSTER SETSLOT %d IMPORTING %s: %w", slot, sourceNodeID, err)
+	}
+	return nil
+}
+
+func (g *goRedisClient) ClusterSetSlotMigrating(ctx context.Context, slot int, targetNodeID string) error {
+	res := g.c.Do(ctx, "CLUSTER", "SETSLOT", slot, "MIGRATING", targetNodeID)
+	if err := res.Err(); err != nil {
+		return fmt.Errorf("redis CLUSTER SETSLOT %d MIGRATING %s: %w", slot, targetNodeID, err)
+	}
+	return nil
+}
+
+func (g *goRedisClient) ClusterSetSlotNode(ctx context.Context, slot int, nodeID string) error {
+	res := g.c.Do(ctx, "CLUSTER", "SETSLOT", slot, "NODE", nodeID)
+	if err := res.Err(); err != nil {
+		return fmt.Errorf("redis CLUSTER SETSLOT %d NODE %s: %w", slot, nodeID, err)
+	}
+	return nil
+}
+
+func (g *goRedisClient) ClusterGetKeysInSlot(ctx context.Context, slot, count int) ([]string, error) {
+	res := g.c.Do(ctx, "CLUSTER", "GETKEYSINSLOT", slot, count)
+	if err := res.Err(); err != nil {
+		return nil, fmt.Errorf("redis CLUSTER GETKEYSINSLOT %d %d: %w", slot, count, err)
+	}
+	keys, err := res.StringSlice()
+	if err != nil {
+		return nil, fmt.Errorf("redis CLUSTER GETKEYSINSLOT %d %d result: %w", slot, count, err)
+	}
+	return keys, nil
+}
+
+func (g *goRedisClient) MigrateKeys(ctx context.Context, host string, port int, keys []string, timeout time.Duration) error {
+	if len(keys) == 0 {
+		return nil
+	}
+	args := make([]any, 0, 7+len(keys))
+	args = append(args, "MIGRATE", host, port, "", 0, int(timeout/time.Millisecond), "KEYS")
+	for _, key := range keys {
+		args = append(args, key)
+	}
+	res := g.c.Do(ctx, args...)
+	if err := res.Err(); err != nil {
+		return fmt.Errorf("redis MIGRATE %s:%d %d keys: %w", host, port, len(keys), err)
+	}
+	return nil
+}
+
 func (g *goRedisClient) ClusterInfo(ctx context.Context) (string, error) {
 	res := g.c.Do(ctx, "CLUSTER", "INFO")
 	if err := res.Err(); err != nil {
