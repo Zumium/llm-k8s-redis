@@ -34,10 +34,11 @@ func (p *LLMPlanner) Plan(ctx context.Context, req Request) (*plan.Plan, error) 
 }
 
 func (p *LLMPlanner) askLLMForPlanJSON(ctx context.Context, req Request) (string, error) {
-	response, err := p.LLMClient.Complete(ctx, LLMRequest{
-		System: buildSystemPrompt(),
-		Prompt: buildUserPrompt(req),
-	})
+	llmReq, err := buildLLMRequest(req)
+	if err != nil {
+		return "", err
+	}
+	response, err := p.LLMClient.Complete(ctx, llmReq)
 	if err != nil {
 		return "", fmt.Errorf("llm complete: %w", err)
 	}
@@ -45,6 +46,30 @@ func (p *LLMPlanner) askLLMForPlanJSON(ctx context.Context, req Request) (string
 		return "", fmt.Errorf("llm returned empty response")
 	}
 	return response.Text, nil
+}
+
+func buildLLMRequest(req Request) (LLMRequest, error) {
+	system := buildSystemPrompt()
+	prompt := buildUserPrompt(req)
+	messages := []LLMMessage{
+		{Role: "system", Content: system},
+		{Role: "user", Content: prompt},
+	}
+	for _, feedback := range req.ValidationFeedback {
+		rejectedPlan, err := json.Marshal(feedback.RejectedPlan)
+		if err != nil {
+			return LLMRequest{}, fmt.Errorf("marshal rejected plan: %w", err)
+		}
+		messages = append(messages,
+			LLMMessage{Role: "assistant", Content: string(rejectedPlan)},
+			LLMMessage{Role: "user", Content: buildValidationFeedbackPrompt(feedback.Error)},
+		)
+	}
+	return LLMRequest{Messages: messages}, nil
+}
+
+func buildValidationFeedbackPrompt(validationError string) string {
+	return fmt.Sprintf("The controller Validator rejected that plan:\n%s\nReturn a corrected JSON plan only.", validationError)
 }
 
 func parsePlanJSON(planJSON string) (*plan.Plan, error) {

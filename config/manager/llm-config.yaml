@@ -31,3 +31,4 @@ data:
   # Leave unset for providers/models that do not support this parameter.
   # Test env uses max 思考力度.
   reasoningEffort: "max"
+  planValidationRetries: "1"

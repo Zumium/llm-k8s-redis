@@ -8,17 +8,19 @@ import (
 )
 
 type Config struct {
-	BaseURL         string
-	APIKey          string
-	Model           string
-	MaxTokens       int
-	Temperature     float32
-	ReasoningEffort string
+	BaseURL               string
+	APIKey                string
+	Model                 string
+	MaxTokens             int
+	Temperature           float32
+	ReasoningEffort       string
+	PlanValidationRetries int
 }
 
 func DefaultConfig() Config {
 	return Config{
-		MaxTokens: 8192,
+		MaxTokens:             8192,
+		PlanValidationRetries: 1,
 	}
 }
 
@@ -34,6 +36,9 @@ func (c Config) Validate() error {
 	}
 	if !validReasoningEffort(c.ReasoningEffort) {
 		return fmt.Errorf("llm config: invalid reasoningEffort %q", c.ReasoningEffort)
+	}
+	if c.PlanValidationRetries < 0 || c.PlanValidationRetries > 10 {
+		return fmt.Errorf("llm config: planValidationRetries must be between 0 and 10")
 	}
 	return nil
 }
@@ -66,6 +71,13 @@ func ParseConfig(data map[string]string) (Config, error) {
 	}
 	if value, ok := data["reasoningEffort"]; ok {
 		config.ReasoningEffort = strings.TrimSpace(value)
+	}
+	if value, ok := data["planValidationRetries"]; ok && value != "" {
+		retries, err := strconv.Atoi(strings.TrimSpace(value))
+		if err != nil {
+			return Config{}, fmt.Errorf("llm config: invalid planValidationRetries %q: %w", value, err)
+		}
+		config.PlanValidationRetries = retries
 	}
 
 	if err := config.Validate(); err != nil {

@@ -164,6 +164,84 @@ func TestReconcile_PassesObservedNodesToPlanner(t *testing.T) {
 	}
 }
 
+func TestReconcile_RetriesRejectedPlanWithValidatorFeedback(t *testing.T) {
+	ctx := context.Background()
+	scheme := newScheme(t)
+	cluster := clusterWithTopology()
+	cluster.Finalizers = []string{finalizer}
+	badPlan := &plan.Plan{DSLVersion: plan.DSLVersion, PlanID: "bad", TargetGeneration: 1, Steps: []plan.Step{{ID: "bad", Action: plan.ActionVerifyCluster}}}
+	goodPlan := validCreate2x1Plan()
+	fp := &recordingPlanner{plans: []*plan.Plan{badPlan, goodPlan}}
+	validator := &recordingValidator{errors: []error{errors.New("validator says no")}}
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "example"}}).
+		WithStatusSubresource(&api.RedisCluster{}).
+		Build()
+	r := &RedisClusterReconciler{
+		Client: cl, Scheme: scheme,
+		Planner: fp, Executor: NoopExecutor{}, Observer: &recordingObserver{}, Validator: validator,
+		TopologyRefreshInterval: time.Minute, TopologyStaleThreshold: time.Hour,
+		PlanValidationRetries: 1,
+	}
+
+	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "example"}}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if fp.called != 2 {
+		t.Fatalf("planner calls = %d", fp.called)
+	}
+	if len(fp.reqs[1].ValidationFeedback) != 1 || fp.reqs[1].ValidationFeedback[0].RejectedPlan.PlanID != "bad" {
+		t.Fatalf("feedback = %#v", fp.reqs[1].ValidationFeedback)
+	}
+	if fp.reqs[1].ValidationFeedback[0].Error != "validator says no" {
+		t.Fatalf("feedback error = %#v", fp.reqs[1].ValidationFeedback)
+	}
+	var got api.RedisCluster
+	if err := cl.Get(ctx, types.NamespacedName{Name: "example"}, &got); err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.Status.ActivePlan == nil || got.Status.ActivePlan.ID != "create-1" {
+		t.Fatalf("activePlan = %#v", got.Status.ActivePlan)
+	}
+}
+
+func TestReconcile_PlanValidationRetriesZeroRejectsOnce(t *testing.T) {
+	ctx := context.Background()
+	scheme := newScheme(t)
+	cluster := clusterWithTopology()
+	cluster.Finalizers = []string{finalizer}
+	fp := &recordingPlanner{plan: &plan.Plan{DSLVersion: plan.DSLVersion, PlanID: "bad", TargetGeneration: 1, Steps: []plan.Step{{ID: "bad", Action: plan.ActionVerifyCluster}}}}
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "example"}}).
+		WithStatusSubresource(&api.RedisCluster{}).
+		Build()
+	r := &RedisClusterReconciler{
+		Client: cl, Scheme: scheme,
+		Planner: fp, Executor: NoopExecutor{}, Observer: &recordingObserver{}, Validator: &recordingValidator{err: errors.New("no")},
+		TopologyRefreshInterval: time.Minute, TopologyStaleThreshold: time.Hour,
+		PlanValidationRetries: 0,
+	}
+
+	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "example"}}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if fp.called != 1 {
+		t.Fatalf("planner calls = %d", fp.called)
+	}
+	var got api.RedisCluster
+	if err := cl.Get(ctx, types.NamespacedName{Name: "example"}, &got); err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.Status.ActivePlan != nil {
+		t.Fatalf("activePlan = %#v", got.Status.ActivePlan)
+	}
+	if !hasCondition(got.Status.Conditions, ConditionPlanned, metav1.ConditionFalse, "PlanRejected") {
+		t.Fatalf("expected PlanRejected, got %#v", got.Status.Conditions)
+	}
+}
+
 func hasCondition(conditions []metav1.Condition, typ string, status metav1.ConditionStatus, reason string) bool {
 	for _, c := range conditions {
 		if c.Type == typ && c.Status == status && c.Reason == reason {
@@ -283,13 +361,21 @@ func (o *recordingObserver) CollectObservedNodes(_ context.Context, _ *api.Redis
 type recordingPlanner struct {
 	called  int
 	plan    *plan.Plan
+	plans   []*plan.Plan
 	err     error
 	lastReq planner.Request
+	reqs    []planner.Request
 }
 
 func (p *recordingPlanner) Plan(_ context.Context, req planner.Request) (*plan.Plan, error) {
 	p.called++
 	p.lastReq = req
+	p.reqs = append(p.reqs, req)
+	if len(p.plans) > 0 {
+		next := p.plans[0]
+		p.plans = p.plans[1:]
+		return next, p.err
+	}
 	return p.plan, p.err
 }
 
@@ -302,6 +388,22 @@ func (e *recordingExecutor) ExecuteStep(_ context.Context, _ *api.RedisCluster, 
 	e.called++
 	e.index = stepIndex
 	return StepOutcome{Status: plan.StepStateCompleted, Message: "done"}, nil
+}
+
+type recordingValidator struct {
+	called int
+	err    error
+	errors []error
+}
+
+func (v *recordingValidator) Validate(_ *plan.Plan, _ any) error {
+	v.called++
+	if len(v.errors) > 0 {
+		err := v.errors[0]
+		v.errors = v.errors[1:]
+		return err
+	}
+	return v.err
 }
 
 func clusterWithTopology() *api.RedisCluster {

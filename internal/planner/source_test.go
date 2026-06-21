@@ -30,13 +30,14 @@ func makeConfigMap(name, ns string, data map[string]string) *corev1.ConfigMap {
 
 func validConfigData() map[string]string {
 	return map[string]string{
-		"provider":        "openai",
-		"baseUrl":         "https://api.openai.com/v1",
-		"apiKey":          "sk-test",
-		"model":           "gpt-4o",
-		"maxTokens":       "4096",
-		"temperature":     "0.2",
-		"reasoningEffort": "max",
+		"provider":              "openai",
+		"baseUrl":               "https://api.openai.com/v1",
+		"apiKey":                "sk-test",
+		"model":                 "gpt-4o",
+		"maxTokens":             "4096",
+		"temperature":           "0.2",
+		"reasoningEffort":       "max",
+		"planValidationRetries": "2",
 	}
 }
 
@@ -62,6 +63,9 @@ func TestLoadConfigMap(t *testing.T) {
 	}
 	if config.ReasoningEffort != "max" {
 		t.Errorf("reasoningEffort = %q", config.ReasoningEffort)
+	}
+	if config.PlanValidationRetries != 2 {
+		t.Errorf("planValidationRetries = %d", config.PlanValidationRetries)
 	}
 	if llmClient == nil {
 		t.Error("client should not be nil")

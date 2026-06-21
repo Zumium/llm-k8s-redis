@@ -67,7 +67,12 @@ func TestOpenAIClient_Success(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new client: %v", err)
 	}
-	resp, err := client.Complete(context.Background(), LLMRequest{System: "system", Prompt: "plan"})
+	resp, err := client.Complete(context.Background(), LLMRequest{
+		Messages: []LLMMessage{
+			{Role: "system", Content: "system"},
+			{Role: "user", Content: "plan"},
+		},
+	})
 	if err != nil {
 		t.Fatalf("complete: %v", err)
 	}
@@ -76,12 +81,44 @@ func TestOpenAIClient_Success(t *testing.T) {
 	}
 }
 
+func TestOpenAIClient_ExplicitMessages(t *testing.T) {
+	srv := newOpenAITestServer(t, 200, `{
+		"id":"chatcmpl-1",
+		"object":"chat.completion",
+		"created":1,
+		"model":"gpt-4o",
+		"choices":[{"index":0,"message":{"role":"assistant","content":"{}"},"finish_reason":"stop"}]
+	}`, func(body []byte) {
+		messages := requestMessages(t, parseOpenAIRequest(t, body))
+		if len(messages) != 4 {
+			t.Fatalf("messages = %#v", messages)
+		}
+		for i, want := range []string{"system", "user", "assistant", "user"} {
+			if messages[i]["role"] != want {
+				t.Fatalf("messages = %#v", messages)
+			}
+		}
+	})
+	defer srv.Close()
+
+	client, _ := NewOpenAIClient(Config{BaseURL: srv.URL, APIKey: "sk-test", Model: "gpt-4o"})
+	_, err := client.Complete(context.Background(), LLMRequest{Messages: []LLMMessage{
+		{Role: "system", Content: "system"},
+		{Role: "user", Content: "plan"},
+		{Role: "assistant", Content: "{}"},
+		{Role: "user", Content: "fix"},
+	}})
+	if err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+}
+
 func TestOpenAIClient_HTTPError(t *testing.T) {
 	srv := newOpenAITestServer(t, 401, `{"error":"unauthorized"}`, nil)
 	defer srv.Close()
 
 	client, _ := NewOpenAIClient(Config{BaseURL: srv.URL, APIKey: "sk-test", Model: "gpt-4o"})
-	if _, err := client.Complete(context.Background(), LLMRequest{Prompt: "x"}); err == nil {
+	if _, err := client.Complete(context.Background(), LLMRequest{Messages: []LLMMessage{{Role: "user", Content: "x"}}}); err == nil {
 		t.Fatal("expected error")
 	}
 }
@@ -91,7 +128,7 @@ func TestOpenAIClient_NoChoices(t *testing.T) {
 	defer srv.Close()
 
 	client, _ := NewOpenAIClient(Config{BaseURL: srv.URL, APIKey: "sk-test", Model: "gpt-4o"})
-	if _, err := client.Complete(context.Background(), LLMRequest{Prompt: "x"}); err == nil {
+	if _, err := client.Complete(context.Background(), LLMRequest{Messages: []LLMMessage{{Role: "user", Content: "x"}}}); err == nil {
 		t.Fatal("expected error")
 	}
 }

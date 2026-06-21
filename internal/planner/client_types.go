@@ -7,10 +7,14 @@ type LLMClient interface {
 }
 
 type LLMRequest struct {
-	System string
-	Prompt string
+	Messages []LLMMessage
 }
 
 type LLMResponse struct {
 	Text string
+}
+
+type LLMMessage struct {
+	Role    string
+	Content string
 }

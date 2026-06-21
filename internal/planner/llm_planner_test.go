@@ -12,14 +12,22 @@ import (
 
 type recordingLLMClient struct {
 	resp    *LLMResponse
+	resps   []*LLMResponse
 	err     error
 	lastReq LLMRequest
+	reqs    []LLMRequest
 }
 
 func (c *recordingLLMClient) Complete(_ context.Context, req LLMRequest) (*LLMResponse, error) {
 	c.lastReq = req
+	c.reqs = append(c.reqs, req)
 	if c.err != nil {
 		return nil, c.err
+	}
+	if len(c.resps) > 0 {
+		resp := c.resps[0]
+		c.resps = c.resps[1:]
+		return resp, nil
 	}
 	return c.resp, nil
 }
@@ -121,13 +129,47 @@ func TestLLMPlanner_PromptContainsSpec(t *testing.T) {
 	})
 
 	for _, want := range []string{"Redis Cluster operations planner", "redis.ops/v1alpha1", "CLUSTER NODES"} {
-		if !strings.Contains(llmClient.lastReq.System, want) {
+		if llmClient.lastReq.Messages[0].Role != "system" || !strings.Contains(llmClient.lastReq.Messages[0].Content, want) {
 			t.Errorf("system prompt missing %q", want)
 		}
 	}
 	for _, want := range []string{"RedisCluster name: example", "metadata.generation: 3", "nextPodOrdinal: 4", "redis-0", "node-a", "connected"} {
-		if !strings.Contains(llmClient.lastReq.Prompt, want) {
+		if llmClient.lastReq.Messages[1].Role != "user" || !strings.Contains(llmClient.lastReq.Messages[1].Content, want) {
 			t.Errorf("user prompt missing %q", want)
+		}
+	}
+}
+
+func TestLLMPlanner_FeedbackUsesMessageHistory(t *testing.T) {
+	llmClient := &recordingLLMClient{resp: &LLMResponse{Text: validMinimalPlanJSON()}}
+	rejectedPlan := &plan.Plan{PlanID: "bad-plan", Steps: []plan.Step{{ID: "bad", Action: plan.ActionAddSlots}}}
+
+	_, err := NewLLMPlanner(llmClient).Plan(context.Background(), Request{
+		Spec: sampleSpec(),
+		ValidationFeedback: []ValidationFeedback{{
+			RejectedPlan: rejectedPlan,
+			Error:        "slot coverage is incomplete",
+		}},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	messages := llmClient.lastReq.Messages
+	if len(messages) != 4 {
+		t.Fatalf("messages = %#v", messages)
+	}
+	if messages[0].Role != "system" || messages[1].Role != "user" || messages[2].Role != "assistant" || messages[3].Role != "user" {
+		t.Fatalf("messages = %#v", messages)
+	}
+	for _, want := range []string{"RedisCluster name: example", "bad-plan", "slot coverage is incomplete"} {
+		found := false
+		for _, message := range messages {
+			if strings.Contains(message.Content, want) {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("messages missing %q: %#v", want, messages)
 		}
 	}
 }

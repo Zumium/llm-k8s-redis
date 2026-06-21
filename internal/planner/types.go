@@ -13,8 +13,9 @@ type Planner interface {
 }
 
 type Request struct {
-	Spec          plan.ClusterSpec
-	ObservedState ObservedState
+	Spec               plan.ClusterSpec
+	ObservedState      ObservedState
+	ValidationFeedback []ValidationFeedback
 }
 
 type ObservedState struct {
@@ -24,6 +25,11 @@ type ObservedState struct {
 }
 
 type ObservedNode = plan.ObservedNode
+
+type ValidationFeedback struct {
+	RejectedPlan *plan.Plan
+	Error        string
+}
 
 var ErrNotConfigured = errors.New("planner not configured; provide a Planner implementation")
 

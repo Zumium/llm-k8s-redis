@@ -39,11 +39,8 @@ func (c *OpenAIClient) Complete(ctx context.Context, req LLMRequest) (*LLMRespon
 
 func (c *OpenAIClient) newChatCompletionParams(req LLMRequest) openai.ChatCompletionNewParams {
 	params := openai.ChatCompletionNewParams{
-		Model: shared.ChatModel(c.config.Model),
-		Messages: []openai.ChatCompletionMessageParamUnion{
-			openai.SystemMessage(req.System),
-			openai.UserMessage(req.Prompt),
-		},
+		Model:    shared.ChatModel(c.config.Model),
+		Messages: chatMessages(req),
 		ResponseFormat: openai.ChatCompletionNewParamsResponseFormatUnion{
 			OfJSONObject: &shared.ResponseFormatJSONObjectParam{},
 		},
@@ -58,6 +55,21 @@ func (c *OpenAIClient) newChatCompletionParams(req LLMRequest) openai.ChatComple
 		params.ReasoningEffort = shared.ReasoningEffort(c.config.ReasoningEffort)
 	}
 	return params
+}
+
+func chatMessages(req LLMRequest) []openai.ChatCompletionMessageParamUnion {
+	messages := make([]openai.ChatCompletionMessageParamUnion, 0, len(req.Messages))
+	for _, message := range req.Messages {
+		switch message.Role {
+		case "system":
+			messages = append(messages, openai.SystemMessage(message.Content))
+		case "assistant":
+			messages = append(messages, openai.AssistantMessage(message.Content))
+		default:
+			messages = append(messages, openai.UserMessage(message.Content))
+		}
+	}
+	return messages
 }
 
 func firstChoiceText(completion *openai.ChatCompletion) (string, error) {

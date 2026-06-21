@@ -72,6 +72,7 @@ func main() {
 	}
 
 	var p planner.Planner = planner.NoopPlanner{}
+	planValidationRetries := 0
 	if !disableLLMPlanner {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
@@ -81,6 +82,7 @@ func main() {
 			os.Exit(1)
 		}
 		p = llmPlanner
+		planValidationRetries = config.PlanValidationRetries
 		setupLog.Info("using fixed llm planner backed by configmap", "name", llmConfigMapName, "namespace", llmConfigMapNS, "model", config.Model)
 	} else {
 		setupLog.Info("llm planner disabled; using NoopPlanner")
@@ -97,6 +99,7 @@ func main() {
 		Recorder:                mgr.GetEventRecorder("rediscluster-controller"),
 		TopologyRefreshInterval: topologyRefreshInterval,
 		TopologyStaleThreshold:  topologyStaleThreshold,
+		PlanValidationRetries:   planValidationRetries,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "RedisCluster")
 		os.Exit(1)

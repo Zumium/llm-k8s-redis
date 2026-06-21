@@ -20,13 +20,14 @@ func TestNewLLMPlannerFromConfigMap(t *testing.T) {
 	cm := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{Name: "llm-config", Namespace: "ns"},
 		Data: map[string]string{
-			"provider":        "openai",
-			"baseUrl":         "https://api.openai.com/v1",
-			"apiKey":          "sk-test",
-			"model":           "deepseek-v4-flash",
-			"maxTokens":       "2048",
-			"temperature":     "0.1",
-			"reasoningEffort": "max",
+			"provider":              "openai",
+			"baseUrl":               "https://api.openai.com/v1",
+			"apiKey":                "sk-test",
+			"model":                 "deepseek-v4-flash",
+			"maxTokens":             "2048",
+			"temperature":           "0.1",
+			"reasoningEffort":       "max",
+			"planValidationRetries": "4",
 		},
 	}
 	cl := fake.NewClientBuilder().WithScheme(s).WithObjects(cm).Build()
@@ -46,6 +47,9 @@ func TestNewLLMPlannerFromConfigMap(t *testing.T) {
 	}
 	if config.ReasoningEffort != "max" {
 		t.Errorf("reasoningEffort = %q", config.ReasoningEffort)
+	}
+	if config.PlanValidationRetries != 4 {
+		t.Errorf("planValidationRetries = %d", config.PlanValidationRetries)
 	}
 	if p.LLMClient == nil {
 		t.Fatal("client is nil")

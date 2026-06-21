@@ -59,6 +59,7 @@ type RedisClusterReconciler struct {
 	Recorder                events.EventRecorder
 	TopologyRefreshInterval time.Duration
 	TopologyStaleThreshold  time.Duration
+	PlanValidationRetries   int
 }
 
 // Reconcile advances a RedisCluster by at most one plan step.
@@ -138,40 +139,50 @@ func (r *RedisClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 			return r.finish(ctx, &cluster, ctrl.Result{RequeueAfter: 10 * time.Second}, nil)
 		}
 		req.ObservedState.Nodes = nodes
-		newPlan, err := r.Planner.Plan(ctx, req)
-		if err != nil {
-			logger.Error(err, "planner returned an error")
-			setCondition(&cluster, ConditionPlanned, metav1.ConditionFalse, "PlannerFailed", err.Error())
-			cluster.Status.ObservedGeneration = cluster.Generation
-			return r.finish(ctx, &cluster, ctrl.Result{}, nil)
+		validationRetries := r.PlanValidationRetries
+		if validationRetries < 0 {
+			validationRetries = 0
 		}
-		if newPlan == nil {
-			setCondition(&cluster, ConditionPlanned, metav1.ConditionFalse, "PlannerEmpty", "planner returned no plan")
-			return r.finish(ctx, &cluster, ctrl.Result{RequeueAfter: 10 * time.Second}, nil)
-		}
-		if err := r.Validator.Validate(newPlan, validationContext(&cluster, spec, nodes)); err != nil {
-			if topologyMatchesSpec(cluster.Status.Topology, spec) {
-				logger.Info("plan rejected but topology already matches spec, marking ready")
+		for attempt := 0; attempt <= validationRetries; attempt++ {
+			newPlan, err := r.Planner.Plan(ctx, req)
+			if err != nil {
+				logger.Error(err, "planner returned an error")
+				setCondition(&cluster, ConditionPlanned, metav1.ConditionFalse, "PlannerFailed", err.Error())
 				cluster.Status.ObservedGeneration = cluster.Generation
-				setCondition(&cluster, ConditionPlanned, metav1.ConditionFalse, "NoPlanNeeded", "topology already matches spec")
-				setCondition(&cluster, ConditionReady, metav1.ConditionTrue, "ClusterReady", "cluster matches desired topology")
-				return r.finish(ctx, &cluster, ctrl.Result{RequeueAfter: r.TopologyRefreshInterval}, nil)
+				return r.finish(ctx, &cluster, ctrl.Result{}, nil)
 			}
-			setCondition(&cluster, ConditionPlanned, metav1.ConditionFalse, "PlanRejected", err.Error())
+			if newPlan == nil {
+				setCondition(&cluster, ConditionPlanned, metav1.ConditionFalse, "PlannerEmpty", "planner returned no plan")
+				return r.finish(ctx, &cluster, ctrl.Result{RequeueAfter: 10 * time.Second}, nil)
+			}
+			if err := r.Validator.Validate(newPlan, validationContext(&cluster, spec, nodes)); err != nil {
+				if topologyMatchesSpec(cluster.Status.Topology, spec) {
+					logger.Info("plan rejected but topology already matches spec, marking ready")
+					cluster.Status.ObservedGeneration = cluster.Generation
+					setCondition(&cluster, ConditionPlanned, metav1.ConditionFalse, "NoPlanNeeded", "topology already matches spec")
+					setCondition(&cluster, ConditionReady, metav1.ConditionTrue, "ClusterReady", "cluster matches desired topology")
+					return r.finish(ctx, &cluster, ctrl.Result{RequeueAfter: r.TopologyRefreshInterval}, nil)
+				}
+				if attempt < validationRetries {
+					req.ValidationFeedback = append(req.ValidationFeedback, planner.ValidationFeedback{RejectedPlan: newPlan, Error: err.Error()})
+					continue
+				}
+				setCondition(&cluster, ConditionPlanned, metav1.ConditionFalse, "PlanRejected", err.Error())
+				cluster.Status.ObservedGeneration = cluster.Generation
+				r.event(&cluster, "PlanRejected", err.Error())
+				return r.finish(ctx, &cluster, ctrl.Result{}, nil)
+			}
+			advanceNextPodOrdinalFromPlan(&cluster, newPlan)
+			cluster.Status.ActivePlan, err = planToStatus(newPlan)
+			if err != nil {
+				setCondition(&cluster, ConditionPlanned, metav1.ConditionFalse, "PlanPersistFailed", err.Error())
+				cluster.Status.ObservedGeneration = cluster.Generation
+				return r.finish(ctx, &cluster, ctrl.Result{}, nil)
+			}
 			cluster.Status.ObservedGeneration = cluster.Generation
-			r.event(&cluster, "PlanRejected", err.Error())
-			return r.finish(ctx, &cluster, ctrl.Result{}, nil)
+			setCondition(&cluster, ConditionPlanned, metav1.ConditionTrue, "PlanAccepted", "plan passed validation")
+			return r.finish(ctx, &cluster, ctrl.Result{Requeue: true}, nil)
 		}
-		advanceNextPodOrdinalFromPlan(&cluster, newPlan)
-		cluster.Status.ActivePlan, err = planToStatus(newPlan)
-		if err != nil {
-			setCondition(&cluster, ConditionPlanned, metav1.ConditionFalse, "PlanPersistFailed", err.Error())
-			cluster.Status.ObservedGeneration = cluster.Generation
-			return r.finish(ctx, &cluster, ctrl.Result{}, nil)
-		}
-		cluster.Status.ObservedGeneration = cluster.Generation
-		setCondition(&cluster, ConditionPlanned, metav1.ConditionTrue, "PlanAccepted", "plan passed validation")
-		return r.finish(ctx, &cluster, ctrl.Result{Requeue: true}, nil)
 	}
 
 	// Active plan present: evaluate aggregate state, then drive one step.
