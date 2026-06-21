@@ -14,6 +14,7 @@ import (
 
 	v1alpha1 "github.com/example/llm-k8s-redis/api/v1alpha1"
 	"github.com/example/llm-k8s-redis/internal/plan"
+	"github.com/example/llm-k8s-redis/internal/planner"
 	"github.com/example/llm-k8s-redis/internal/redis"
 )
 
@@ -22,6 +23,7 @@ import (
 // a topology snapshot without executing a plan step.
 type Observer interface {
 	ObserveTopology(ctx context.Context, cluster *v1alpha1.RedisCluster) error
+	CollectObservedNodes(ctx context.Context, cluster *v1alpha1.RedisCluster) ([]planner.ObservedNode, error)
 }
 
 // noopObserver is the default Observer used when none is wired. It performs no
@@ -30,6 +32,10 @@ type noopObserver struct{}
 
 func (noopObserver) ObserveTopology(_ context.Context, _ *v1alpha1.RedisCluster) error {
 	return nil
+}
+
+func (noopObserver) CollectObservedNodes(_ context.Context, _ *v1alpha1.RedisCluster) ([]planner.ObservedNode, error) {
+	return nil, nil
 }
 
 // compile-time check that ActionExecutor satisfies Observer.
@@ -94,7 +100,7 @@ func (e *ActionExecutor) observeTopology(ctx context.Context, cluster *v1alpha1.
 	}
 	obs.podsByIP = mapPodsByIP(pods)
 
-	seed, ok := pickSeedPod(pods)
+	seed, ok := pickObservationSeedPod(cluster, pods)
 	if !ok {
 		obs.message = fmt.Sprintf("no ready managed pod with IP yet for cluster %s", cluster.Name)
 		return obs, nil
@@ -140,6 +146,38 @@ func (e *ActionExecutor) observeTopology(ctx context.Context, cluster *v1alpha1.
 	return obs, nil
 }
 
+func (e *ActionExecutor) CollectObservedNodes(ctx context.Context, cluster *v1alpha1.RedisCluster) ([]planner.ObservedNode, error) {
+	if e.RedisFactory == nil {
+		e.RedisFactory = redis.DefaultFactory
+	}
+	pods, outcome, ok := e.listManagedPods(ctx, cluster)
+	if !ok {
+		return nil, fmt.Errorf("%s", outcome.Message)
+	}
+
+	entries := []clusterNodeEntry{}
+	seed, ok := pickObservationSeedPod(cluster, pods)
+	if !ok {
+		return observedNodes(cluster, pods, entries), nil
+	}
+	addr := podRedisAddr(&seed)
+	rc, err := e.RedisFactory(addr)
+	if err != nil {
+		return nil, fmt.Errorf("build redis client for seed %s: %w", addr, err)
+	}
+	defer rc.Close()
+
+	if err := rc.Ping(ctx); err != nil {
+		return nil, fmt.Errorf("seed redis at %s not reachable: %w", addr, err)
+	}
+	if raw, err := rc.ClusterNodes(ctx); err != nil {
+		return nil, fmt.Errorf("seed redis at %s CLUSTER NODES failed: %w", addr, err)
+	} else {
+		entries = parseClusterNodes(raw)
+	}
+	return observedNodes(cluster, pods, entries), nil
+}
+
 // listManagedPods lists all Pods in the cluster's namespace labeled as
 // belonging to this RedisCluster. It returns a Failed outcome if the list
 // call errors for a non-transient reason.
@@ -171,6 +209,126 @@ func pickSeedPod(pods []corev1.Pod) (corev1.Pod, bool) {
 		}
 	}
 	return corev1.Pod{}, false
+}
+
+func pickObservationSeedPod(cluster *v1alpha1.RedisCluster, pods []corev1.Pod) (corev1.Pod, bool) {
+	podsByName := map[string]corev1.Pod{}
+	for _, p := range pods {
+		podsByName[p.Name] = p
+	}
+	if cluster != nil && cluster.Status.Topology != nil {
+		for _, sh := range cluster.Status.Topology.Shards {
+			p, ok := podsByName[sh.Master.Pod]
+			if ok && podReady(&p) && p.Status.PodIP != "" {
+				return p, true
+			}
+		}
+	}
+	return pickSeedPod(pods)
+}
+
+func observedNodes(cluster *v1alpha1.RedisCluster, pods []corev1.Pod, entries []clusterNodeEntry) []planner.ObservedNode {
+	podToNodeID, nodeIDToPod := lastKnownNodeMaps(cluster)
+	podsByIP := mapPodsByIP(pods)
+	for _, entry := range entries {
+		if pod := podNameForIP(podsByIP, ipFromAddr(entry.Addr)); pod != "" {
+			podToNodeID[pod] = entry.ID
+			nodeIDToPod[entry.ID] = pod
+		}
+	}
+	seen := map[string]bool{}
+	out := make([]planner.ObservedNode, 0, len(pods)+len(entries))
+
+	for _, p := range pods {
+		n := planner.ObservedNode{
+			Pod:       p.Name,
+			PodExists: true,
+			NodeID:    podToNodeID[p.Name],
+			Ready:     podReady(&p),
+			Deleting:  p.DeletionTimestamp != nil,
+			Role:      "unknown",
+		}
+		entry := findByIP(entries, p.Status.PodIP)
+		if entry == nil && n.NodeID != "" {
+			entry = findByID(entries, n.NodeID)
+		}
+		if entry != nil {
+			fillObservedNode(&n, *entry, nodeIDToPod)
+			seen[entry.ID] = true
+		}
+		out = append(out, n)
+	}
+
+	for _, entry := range entries {
+		if seen[entry.ID] {
+			continue
+		}
+		n := planner.ObservedNode{Pod: nodeIDToPod[entry.ID], PodExists: false}
+		fillObservedNode(&n, entry, nodeIDToPod)
+		out = append(out, n)
+	}
+
+	sort.Slice(out, func(i, j int) bool {
+		ai, aok := controllerRedisPodOrdinal(out[i].Pod)
+		bi, bok := controllerRedisPodOrdinal(out[j].Pod)
+		if aok && bok {
+			return ai < bi
+		}
+		if aok != bok {
+			return aok
+		}
+		if out[i].Pod != out[j].Pod {
+			return out[i].Pod < out[j].Pod
+		}
+		return out[i].NodeID < out[j].NodeID
+	})
+	return out
+}
+
+func fillObservedNode(n *planner.ObservedNode, entry clusterNodeEntry, nodeIDToPod map[string]string) {
+	n.RedisSeen = true
+	n.NodeID = entry.ID
+	n.Role = redisRole(entry)
+	n.Slots = strings.Join(entry.Slots, ",")
+	if entry.MasterID != "-" {
+		n.MasterID = entry.MasterID
+		n.MasterPod = nodeIDToPod[entry.MasterID]
+	}
+	n.Flags = append([]string{}, entry.Flags...)
+	n.LinkState = entry.LinkState
+}
+
+func redisRole(entry clusterNodeEntry) string {
+	switch {
+	case entry.isMaster():
+		return "master"
+	case entry.isReplica():
+		return "replica"
+	default:
+		return "unknown"
+	}
+}
+
+func lastKnownNodeMaps(cluster *v1alpha1.RedisCluster) (map[string]string, map[string]string) {
+	podToNodeID := map[string]string{}
+	nodeIDToPod := map[string]string{}
+	if cluster == nil || cluster.Status.Topology == nil {
+		return podToNodeID, nodeIDToPod
+	}
+	add := func(n v1alpha1.NodeTopology) {
+		if n.Pod == "" || n.NodeID == "" {
+			return
+		}
+		podToNodeID[n.Pod] = n.NodeID
+		nodeIDToPod[n.NodeID] = n.Pod
+	}
+	for _, sh := range cluster.Status.Topology.Shards {
+		add(sh.Master)
+		for _, r := range sh.Replicas {
+			add(r)
+		}
+	}
+	return podToNodeID, nodeIDToPod
 }
 
 // mapPodsByIP indexes ready pods by their PodIP for Redis-node -> Pod lookup.

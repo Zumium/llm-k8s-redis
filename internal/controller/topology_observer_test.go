@@ -69,6 +69,80 @@ func TestObserveTopology_NoSeed(t *testing.T) {
 	}
 }
 
+func TestPickObservationSeedPod_PrefersReadyMaster(t *testing.T) {
+	cluster := testCluster()
+	cluster.Status.Topology = &api.ClusterTopology{Shards: []api.ShardTopology{
+		{Master: api.NodeTopology{Pod: "redis-2"}},
+	}}
+	pods := []corev1.Pod{
+		*vcPod("redis-1", "10.0.0.2", true),
+		*vcPod("redis-2", "10.0.0.3", true),
+	}
+
+	seed, ok := pickObservationSeedPod(cluster, pods)
+	if !ok {
+		t.Fatal("expected seed")
+	}
+	if seed.Name != "redis-2" {
+		t.Fatalf("expected master seed redis-2, got %s", seed.Name)
+	}
+}
+
+func TestPickObservationSeedPod_FallsBackWithoutTopology(t *testing.T) {
+	cluster := testCluster()
+	pods := []corev1.Pod{
+		*vcPod("redis-1", "10.0.0.2", true),
+		*vcPod("redis-2", "10.0.0.3", true),
+	}
+
+	seed, ok := pickObservationSeedPod(cluster, pods)
+	if !ok {
+		t.Fatal("expected seed")
+	}
+	if seed.Name != "redis-1" {
+		t.Fatalf("expected fallback seed redis-1, got %s", seed.Name)
+	}
+}
+
+func TestPickObservationSeedPod_SkipsUnusableMaster(t *testing.T) {
+	cluster := testCluster()
+	cluster.Status.Topology = &api.ClusterTopology{Shards: []api.ShardTopology{
+		{Master: api.NodeTopology{Pod: "redis-0"}},
+		{Master: api.NodeTopology{Pod: "redis-2"}},
+	}}
+	pods := []corev1.Pod{
+		*vcPod("redis-1", "10.0.0.2", true),
+		*vcPod("redis-0", "", true),
+		*vcPod("redis-2", "10.0.0.3", true),
+	}
+
+	seed, ok := pickObservationSeedPod(cluster, pods)
+	if !ok {
+		t.Fatal("expected seed")
+	}
+	if seed.Name != "redis-2" {
+		t.Fatalf("expected second usable master redis-2, got %s", seed.Name)
+	}
+}
+
+func TestCollectObservedNodes_NoSeedKeepsPodFacts(t *testing.T) {
+	ctx := context.Background()
+	cluster := testCluster()
+	pods := []*corev1.Pod{vcPod("redis-0", "", false)}
+	exec := vcExec(t, cluster, pods, nil)
+
+	nodes, err := exec.CollectObservedNodes(ctx, cluster)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(nodes) != 1 {
+		t.Fatalf("expected one observed node, got %#v", nodes)
+	}
+	if nodes[0].Pod != "redis-0" || !nodes[0].PodExists || nodes[0].RedisSeen || nodes[0].Ready {
+		t.Fatalf("unexpected pod fact: %#v", nodes[0])
+	}
+}
+
 func TestObserveTopology_PingFail(t *testing.T) {
 	ctx := context.Background()
 	cluster := testCluster()
@@ -119,6 +193,58 @@ func TestObserveTopology_ClusterNodesError(t *testing.T) {
 	}
 	if obs.healthy {
 		t.Fatal("expected unhealthy when CLUSTER NODES fails")
+	}
+}
+
+func TestCollectObservedNodes_ClusterNodesErrorFails(t *testing.T) {
+	ctx := context.Background()
+	cluster := testCluster()
+	pods := vcFourReadyPods()
+	fc := &fakeRedisClient{
+		clusterNodes: func() (string, error) { return "", errors.New("nodes err") },
+	}
+	exec := vcExec(t, cluster, pods, fc)
+
+	nodes, err := exec.CollectObservedNodes(ctx, cluster)
+	if err == nil {
+		t.Fatalf("expected error, got nodes %#v", nodes)
+	}
+}
+
+func TestCollectObservedNodes_JoinsPodsRedisAndLastKnownTopology(t *testing.T) {
+	ctx := context.Background()
+	cluster := testCluster()
+	cluster.Status.Topology = &api.ClusterTopology{Shards: []api.ShardTopology{{
+		Master:   api.NodeTopology{Pod: "redis-0", NodeID: vcMaster0ID},
+		Replicas: []api.NodeTopology{{Pod: "redis-2", NodeID: vcReplica0ID}},
+	}}}
+	pods := []*corev1.Pod{
+		vcPod("redis-0", "10.0.0.1", true),
+		vcPod("redis-1", "10.0.0.2", true),
+	}
+	fc := &fakeRedisClient{
+		clusterNodes: func() (string, error) { return clusterOK(), nil },
+	}
+	exec := vcExec(t, cluster, pods, fc)
+
+	nodes, err := exec.CollectObservedNodes(ctx, cluster)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(nodes) != 4 {
+		t.Fatalf("expected 4 observed nodes, got %#v", nodes)
+	}
+	if nodes[0].Pod != "redis-0" || !nodes[0].PodExists || !nodes[0].RedisSeen || nodes[0].NodeID != vcMaster0ID || nodes[0].Slots != "0-8191" {
+		t.Fatalf("unexpected redis-0 fact: %#v", nodes[0])
+	}
+	if nodes[1].Pod != "redis-1" || nodes[1].NodeID != vcMaster1ID || nodes[1].Role != "master" {
+		t.Fatalf("unexpected redis-1 fact: %#v", nodes[1])
+	}
+	if nodes[2].Pod != "redis-2" || nodes[2].PodExists || !nodes[2].RedisSeen || nodes[2].NodeID != vcReplica0ID || nodes[2].MasterPod != "redis-0" {
+		t.Fatalf("unexpected redis-only fact with last known pod: %#v", nodes[2])
+	}
+	if nodes[3].MasterPod != "redis-1" {
+		t.Fatalf("expected live join to set replica master pod, got %#v", nodes[3])
 	}
 }
 

@@ -25,9 +25,6 @@ type Planner interface {
 // Request carries everything the planner needs to generate a plan: the desired
 // spec and the observed cluster state.
 type Request struct {
-	// Cluster is the full RedisCluster CR being reconciled.
-	Cluster *v1alpha1.RedisCluster
-
 	// Spec is the projection of the cluster's spec used for plan generation
 	// and validation.
 	Spec plan.ClusterSpec
@@ -39,13 +36,26 @@ type Request struct {
 
 // ObservedState is the cluster snapshot available to the planner.
 type ObservedState struct {
-	// Topology is the last observed Redis Cluster topology, if any.
-	Topology *v1alpha1.ClusterTopology
 	// ActivePlan is the previously executed plan, if any. Useful for
 	// re-planning after a failure.
 	ActivePlan     *v1alpha1.PlanStatus
 	NextPodOrdinal int
-	Drift          *plan.DriftContext
+	Nodes          []ObservedNode
+}
+
+type ObservedNode struct {
+	Pod       string
+	PodExists bool
+	RedisSeen bool
+	NodeID    string
+	Role      string
+	Slots     string
+	MasterID  string
+	MasterPod string
+	Ready     bool
+	Deleting  bool
+	Flags     []string
+	LinkState string
 }
 
 // ErrNotConfigured is returned by NoopPlanner.

@@ -229,6 +229,7 @@ func validateDrift(p *Plan, spec ClusterSpec, ctx ValidationContext, ensurePods 
 	if err := validateDriftReplacementOrdinal(ctx, d.ReplacementPod); err != nil {
 		return err
 	}
+	forgetNodeCount := 0
 	for i, s := range p.Steps {
 		switch s.Action {
 		case ActionEnsureNode:
@@ -272,6 +273,7 @@ func validateDrift(p *Plan, spec ClusterSpec, ctx ValidationContext, ensurePods 
 				return fmt.Errorf("step %q: replacement pod missing preceding MeetNode", s.ID)
 			}
 		case ActionForgetNode:
+			forgetNodeCount++
 			if d.MissingPod == "" || d.LastKnownNodeID == "" {
 				return fmt.Errorf("step %q: ForgetNode is not allowed without missing pod and lastKnownNodeId in observed drift context", s.ID)
 			}
@@ -290,6 +292,9 @@ func validateDrift(p *Plan, spec ClusterSpec, ctx ValidationContext, ensurePods 
 				return fmt.Errorf("step %q: expectedReplicasPerShard must equal spec.replicasPerShard %d", s.ID, spec.ReplicasPerShard)
 			}
 		}
+	}
+	if d.MissingPod != "" && d.LastKnownNodeID != "" && forgetNodeCount != 1 {
+		return fmt.Errorf("drift convergence requires exactly one ForgetNode for missing pod %q with lastKnownNodeId %q, got %d", d.MissingPod, d.LastKnownNodeID, forgetNodeCount)
 	}
 	return nil
 }

@@ -126,9 +126,7 @@ func (r *RedisClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return r.finish(ctx, &cluster, ctrl.Result{RequeueAfter: r.TopologyRefreshInterval}, nil)
 	}
 	if drift != nil && cluster.Status.ActivePlan != nil {
-		cluster.Status.ActivePlan = nil
-		setCondition(&cluster, ConditionReady, metav1.ConditionFalse, "Replanning", "observed state drifted from active plan")
-		setCondition(&cluster, ConditionPlanned, metav1.ConditionFalse, "PlanSuperseded", "observed state drifted from active plan")
+		drift = nil
 	}
 
 	if r.shouldRefreshTopology(ctx, &cluster) {
@@ -142,7 +140,14 @@ func (r *RedisClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	// No active plan: produce, validate and persist one.
 	if cluster.Status.ActivePlan == nil {
 		req := toPlannerRequest(&cluster, spec)
-		req.ObservedState.Drift = drift
+		nodes, err := r.Observer.CollectObservedNodes(ctx, &cluster)
+		if err != nil {
+			logger.Error(err, "collect observed nodes failed")
+			setCondition(&cluster, ConditionPlanned, metav1.ConditionFalse, "ObservedNodesFailed", err.Error())
+			cluster.Status.ObservedGeneration = cluster.Generation
+			return r.finish(ctx, &cluster, ctrl.Result{RequeueAfter: 10 * time.Second}, nil)
+		}
+		req.ObservedState.Nodes = nodes
 		newPlan, err := r.Planner.Plan(ctx, req)
 		if err != nil {
 			logger.Error(err, "planner returned an error")
@@ -371,10 +376,8 @@ func toPlanNode(n v1alpha1.NodeTopology) plan.NodeTopology {
 
 func toPlannerRequest(c *v1alpha1.RedisCluster, spec plan.ClusterSpec) planner.Request {
 	return planner.Request{
-		Cluster: c,
-		Spec:    spec,
+		Spec: spec,
 		ObservedState: planner.ObservedState{
-			Topology:       c.Status.Topology,
 			ActivePlan:     c.Status.ActivePlan,
 			NextPodOrdinal: int(c.Status.NextPodOrdinal),
 		},

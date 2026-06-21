@@ -114,6 +114,56 @@ func TestReconcile_EnsuresFinalizerNamespaceAndPlans(t *testing.T) {
 	}
 }
 
+func TestReconcile_PassesObservedNodesToPlanner(t *testing.T) {
+	ctx := context.Background()
+	scheme := newScheme(t)
+	cluster := &api.RedisCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "example", Generation: 1, Finalizers: []string{finalizer}},
+		Spec:       api.RedisClusterSpec{Shards: 2, ReplicasPerShard: 1, Image: "redis:7.2", MemorySize: "2Gi"},
+		Status: api.RedisClusterStatus{
+			TopologyObservedAt: metav1.Now(),
+			Topology: &api.ClusterTopology{Shards: []api.ShardTopology{
+				{Master: api.NodeTopology{Pod: "redis-2", Ready: true}, Replicas: []api.NodeTopology{{Pod: "redis-1", Ready: true}}},
+			}},
+		},
+	}
+	replica := readyPodWithIP(cluster, "redis-1", "10.0.0.1")
+	master := readyPodWithIP(cluster, "redis-2", "10.0.0.2")
+	fc := &fakeRedisClient{
+		clusterInfo:  func() (string, error) { return "cluster_state:ok\r\ncluster_slots_assigned:16384\r\n", nil },
+		clusterNodes: func() (string, error) { return clusterOK(), nil },
+	}
+	fp := &recordingPlanner{plan: validCreate2x1Plan()}
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "example"}}, replica, master).
+		WithStatusSubresource(&api.RedisCluster{}).
+		Build()
+	exec := &ActionExecutor{Client: cl, Scheme: scheme, RedisFactory: fakeFactory(fc)}
+	r := &RedisClusterReconciler{
+		Client: cl, Scheme: scheme,
+		Planner: fp, Executor: NoopExecutor{}, Observer: exec, Validator: plan.NewValidator(),
+		TopologyRefreshInterval: time.Minute, TopologyStaleThreshold: time.Hour,
+	}
+
+	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "example"}}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	nodes := fp.lastReq.ObservedState.Nodes
+	if len(nodes) != 4 {
+		t.Fatalf("expected 4 observed nodes, got %#v", nodes)
+	}
+	if nodes[0].Pod != "redis-1" || !nodes[0].PodExists || !nodes[0].RedisSeen || nodes[0].NodeID != vcMaster0ID || nodes[0].Role != "master" {
+		t.Fatalf("unexpected joined node: %#v", nodes[0])
+	}
+	if nodes[1].Pod != "redis-2" || !nodes[1].PodExists || !nodes[1].RedisSeen || nodes[1].NodeID != vcMaster1ID || !nodes[1].Ready {
+		t.Fatalf("unexpected joined node: %#v", nodes[1])
+	}
+	if nodes[2].PodExists || !nodes[2].RedisSeen || nodes[2].NodeID != vcReplica0ID || nodes[2].Role != "replica" || nodes[2].MasterID != vcMaster0ID {
+		t.Fatalf("unexpected redis-only node: %#v", nodes[2])
+	}
+}
+
 func hasCondition(conditions []metav1.Condition, typ string, status metav1.ConditionStatus, reason string) bool {
 	for _, c := range conditions {
 		if c.Type == typ && c.Status == status && c.Reason == reason {
@@ -226,6 +276,10 @@ func (o *recordingObserver) ObserveTopology(_ context.Context, _ *api.RedisClust
 	return nil
 }
 
+func (o *recordingObserver) CollectObservedNodes(_ context.Context, _ *api.RedisCluster) ([]planner.ObservedNode, error) {
+	return nil, nil
+}
+
 type recordingPlanner struct {
 	called  int
 	plan    *plan.Plan
@@ -239,12 +293,78 @@ func (p *recordingPlanner) Plan(_ context.Context, req planner.Request) (*plan.P
 	return p.plan, p.err
 }
 
+type recordingExecutor struct {
+	called int
+	index  int
+}
+
+func (e *recordingExecutor) ExecuteStep(_ context.Context, _ *api.RedisCluster, _ *plan.Plan, stepIndex int) (StepOutcome, error) {
+	e.called++
+	e.index = stepIndex
+	return StepOutcome{Status: plan.StepStateCompleted, Message: "done"}, nil
+}
+
 func clusterWithTopology() *api.RedisCluster {
 	return &api.RedisCluster{
 		ObjectMeta: metav1.ObjectMeta{Name: "example", Generation: 1},
 		Spec:       api.RedisClusterSpec{Shards: 2, ReplicasPerShard: 1, Image: "redis:7.2", MemorySize: "2Gi"},
 		Status: api.RedisClusterStatus{
 			Topology: &api.ClusterTopology{Shards: []api.ShardTopology{{ID: "shard-0"}}},
+		},
+	}
+}
+
+func missingReplicaCluster(next int32) *api.RedisCluster {
+	cluster := clusterWithTopology()
+	cluster.Finalizers = []string{finalizer}
+	cluster.Status.NextPodOrdinal = next
+	cluster.Status.ObservedGeneration = 1
+	cluster.Status.TopologyObservedAt = metav1.Now()
+	cluster.Status.Topology = &api.ClusterTopology{Shards: []api.ShardTopology{
+		{ID: "shard-0", Master: api.NodeTopology{Pod: "redis-0", NodeID: "master-0", Slots: "0-8191", Ready: true}, Replicas: []api.NodeTopology{{Pod: "redis-1", NodeID: "replica-1", Ready: true}}},
+		{ID: "shard-1", Master: api.NodeTopology{Pod: "redis-2", NodeID: "master-2", Slots: "8192-16383", Ready: true}, Replicas: []api.NodeTopology{{Pod: "redis-3", NodeID: "replica-3", Ready: true}}},
+	}}
+	return cluster
+}
+
+func missingReplicaDriftPlan(replacement string) *plan.Plan {
+	return &plan.Plan{
+		DSLVersion:       plan.DSLVersion,
+		PlanID:           "drift-1",
+		TargetGeneration: 1,
+		Steps: []plan.Step{
+			{ID: "ensure", Action: plan.ActionEnsureNode, Params: map[string]any{"namespace": "example", "pod": replacement, "image": "redis:7.2", "memorySize": "2Gi"}},
+			{ID: "wait", Action: plan.ActionWaitNodeReady, Params: map[string]any{"namespace": "example", "pod": replacement}},
+			{ID: "meet", Action: plan.ActionMeetNode, Params: map[string]any{"namespace": "example", "sourcePod": "redis-0", "targetPod": replacement}},
+			{ID: "replicate", Action: plan.ActionReplicateNode, Params: map[string]any{"namespace": "example", "masterPod": "redis-0", "replicaPod": replacement}},
+			{ID: "forget", Action: plan.ActionForgetNode, Params: map[string]any{"namespace": "example", "pod": "redis-1", "lastKnownNodeId": "replica-1"}},
+			{ID: "verify", Action: plan.ActionVerifyCluster, Params: map[string]any{"expectedShards": 2, "expectedReplicasPerShard": 1, "requireClusterStateOk": true, "requireFullSlotCoverage": true, "requireAllSlotOwnersHaveReplicas": true}},
+		},
+	}
+}
+
+func validCreate2x1Plan() *plan.Plan {
+	return &plan.Plan{
+		DSLVersion:       plan.DSLVersion,
+		PlanID:           "create-1",
+		TargetGeneration: 1,
+		Steps: []plan.Step{
+			{ID: "ensure-redis-0", Action: plan.ActionEnsureNode, Params: map[string]any{"namespace": "example", "pod": "redis-0", "image": "redis:7.2", "memorySize": "2Gi"}},
+			{ID: "ensure-redis-1", Action: plan.ActionEnsureNode, Params: map[string]any{"namespace": "example", "pod": "redis-1", "image": "redis:7.2", "memorySize": "2Gi"}},
+			{ID: "ensure-redis-2", Action: plan.ActionEnsureNode, Params: map[string]any{"namespace": "example", "pod": "redis-2", "image": "redis:7.2", "memorySize": "2Gi"}},
+			{ID: "ensure-redis-3", Action: plan.ActionEnsureNode, Params: map[string]any{"namespace": "example", "pod": "redis-3", "image": "redis:7.2", "memorySize": "2Gi"}},
+			{ID: "wait-redis-0", Action: plan.ActionWaitNodeReady, Params: map[string]any{"namespace": "example", "pod": "redis-0"}},
+			{ID: "wait-redis-1", Action: plan.ActionWaitNodeReady, Params: map[string]any{"namespace": "example", "pod": "redis-1"}},
+			{ID: "wait-redis-2", Action: plan.ActionWaitNodeReady, Params: map[string]any{"namespace": "example", "pod": "redis-2"}},
+			{ID: "wait-redis-3", Action: plan.ActionWaitNodeReady, Params: map[string]any{"namespace": "example", "pod": "redis-3"}},
+			{ID: "meet-redis-1", Action: plan.ActionMeetNode, Params: map[string]any{"namespace": "example", "sourcePod": "redis-0", "targetPod": "redis-1"}},
+			{ID: "meet-redis-2", Action: plan.ActionMeetNode, Params: map[string]any{"namespace": "example", "sourcePod": "redis-0", "targetPod": "redis-2"}},
+			{ID: "meet-redis-3", Action: plan.ActionMeetNode, Params: map[string]any{"namespace": "example", "sourcePod": "redis-0", "targetPod": "redis-3"}},
+			{ID: "replicate-redis-1", Action: plan.ActionReplicateNode, Params: map[string]any{"namespace": "example", "masterPod": "redis-0", "replicaPod": "redis-1"}},
+			{ID: "replicate-redis-3", Action: plan.ActionReplicateNode, Params: map[string]any{"namespace": "example", "masterPod": "redis-2", "replicaPod": "redis-3"}},
+			{ID: "add-slots-redis-0", Action: plan.ActionAddSlots, Params: map[string]any{"namespace": "example", "pod": "redis-0", "slots": "0-8191"}},
+			{ID: "add-slots-redis-2", Action: plan.ActionAddSlots, Params: map[string]any{"namespace": "example", "pod": "redis-2", "slots": "8192-16383"}},
+			{ID: "verify", Action: plan.ActionVerifyCluster, Params: map[string]any{"expectedShards": 2, "expectedReplicasPerShard": 1, "requireClusterStateOk": true, "requireFullSlotCoverage": true, "requireAllSlotOwnersHaveReplicas": true}},
 		},
 	}
 }
@@ -667,8 +787,8 @@ func TestReconcile_MissingReplicaRequestsDriftPlan(t *testing.T) {
 	if fp.called != 1 {
 		t.Fatalf("expected planner call, got %d", fp.called)
 	}
-	if fp.lastReq.ObservedState.Drift == nil || fp.lastReq.ObservedState.Drift.ReplacementPod != "redis-4" {
-		t.Fatalf("unexpected drift context: %#v", fp.lastReq.ObservedState.Drift)
+	if len(fp.lastReq.ObservedState.Nodes) != 0 {
+		t.Fatalf("recording observer should not add observed nodes, got %#v", fp.lastReq.ObservedState.Nodes)
 	}
 	var got api.RedisCluster
 	if err := cl.Get(ctx, client.ObjectKey{Name: "example"}, &got); err != nil {
@@ -679,6 +799,110 @@ func TestReconcile_MissingReplicaRequestsDriftPlan(t *testing.T) {
 	}
 	if got.Status.NextPodOrdinal != 5 {
 		t.Fatalf("expected nextPodOrdinal 5, got %d", got.Status.NextPodOrdinal)
+	}
+}
+
+func TestReconcile_ActiveDriftPlanExecutesWhenDriftStillObserved(t *testing.T) {
+	ctx := context.Background()
+	scheme := newScheme(t)
+	cluster := missingReplicaCluster(5)
+	active, err := planToStatus(missingReplicaDriftPlan("redis-4"))
+	if err != nil {
+		t.Fatalf("planToStatus: %v", err)
+	}
+	cluster.Status.ActivePlan = active
+	fp := &recordingPlanner{err: errors.New("unexpected planner call")}
+	exec := &recordingExecutor{}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
+		cluster,
+		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "example"}},
+		vcPod("redis-0", "10.0.0.1", true),
+		vcPod("redis-2", "10.0.0.2", true),
+		vcPod("redis-3", "10.0.0.3", true),
+	).WithStatusSubresource(&api.RedisCluster{}).Build()
+	r := &RedisClusterReconciler{
+		Client: cl, Scheme: scheme, Planner: fp, Executor: exec,
+		Validator: plan.NewValidator(), Observer: &recordingObserver{},
+		TopologyRefreshInterval: time.Minute, TopologyStaleThreshold: time.Hour,
+	}
+
+	res, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "example"}})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if !res.Requeue {
+		t.Fatal("expected requeue after completing first step")
+	}
+	if fp.called != 0 {
+		t.Fatalf("expected no planner call, got %d", fp.called)
+	}
+	if exec.called != 1 || exec.index != 0 {
+		t.Fatalf("expected executor step 0 once, got calls=%d index=%d", exec.called, exec.index)
+	}
+	var got api.RedisCluster
+	if err := cl.Get(ctx, client.ObjectKey{Name: "example"}, &got); err != nil {
+		t.Fatalf("get cluster: %v", err)
+	}
+	if got.Status.ActivePlan == nil {
+		t.Fatal("expected active plan to remain")
+	}
+	if got.Status.ActivePlan.Steps[0].Status != string(plan.StepStateCompleted) {
+		t.Fatalf("expected first step completed, got %#v", got.Status.ActivePlan.Steps[0])
+	}
+	if got.Status.NextPodOrdinal != 5 {
+		t.Fatalf("expected nextPodOrdinal to stay 5, got %d", got.Status.NextPodOrdinal)
+	}
+}
+
+func TestReconcile_InvalidActiveDriftPlanStillExecutesWhenRunning(t *testing.T) {
+	ctx := context.Background()
+	scheme := newScheme(t)
+	cluster := missingReplicaCluster(5)
+	bad := missingReplicaDriftPlan("redis-4")
+	bad.Steps[3].Params["masterPod"] = "redis-2"
+	active, err := planToStatus(bad)
+	if err != nil {
+		t.Fatalf("planToStatus: %v", err)
+	}
+	cluster.Status.ActivePlan = active
+	newPlan := missingReplicaDriftPlan("redis-5")
+	fp := &recordingPlanner{plan: newPlan}
+	exec := &recordingExecutor{}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
+		cluster,
+		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "example"}},
+		vcPod("redis-0", "10.0.0.1", true),
+		vcPod("redis-2", "10.0.0.2", true),
+		vcPod("redis-3", "10.0.0.3", true),
+	).WithStatusSubresource(&api.RedisCluster{}).Build()
+	r := &RedisClusterReconciler{
+		Client: cl, Scheme: scheme, Planner: fp, Executor: exec,
+		Validator: plan.NewValidator(), Observer: &recordingObserver{},
+		TopologyRefreshInterval: time.Minute, TopologyStaleThreshold: time.Hour,
+	}
+
+	res, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "example"}})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if !res.Requeue {
+		t.Fatal("expected requeue after completing first step")
+	}
+	if exec.called != 1 || exec.index != 0 {
+		t.Fatalf("expected executor step 0 once, got calls=%d index=%d", exec.called, exec.index)
+	}
+	if fp.called != 0 {
+		t.Fatalf("expected no planner call, got %d", fp.called)
+	}
+	var got api.RedisCluster
+	if err := cl.Get(ctx, client.ObjectKey{Name: "example"}, &got); err != nil {
+		t.Fatalf("get cluster: %v", err)
+	}
+	if got.Status.ActivePlan == nil {
+		t.Fatal("expected active plan to remain")
+	}
+	if got.Status.ActivePlan.Steps[0].Status != string(plan.StepStateCompleted) {
+		t.Fatalf("expected first step completed, got %#v", got.Status.ActivePlan.Steps[0])
 	}
 }
 

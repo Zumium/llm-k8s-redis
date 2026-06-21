@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"strings"
 
-	v1alpha1 "github.com/example/llm-k8s-redis/api/v1alpha1"
 	"github.com/example/llm-k8s-redis/internal/plan"
 )
 
@@ -49,11 +48,8 @@ func buildSystemPrompt() string {
 	b.WriteString("1. Output ONLY the JSON plan. No markdown fences, no commentary.\n")
 	b.WriteString("2. Every pod-targeting action must include a \"namespace\" param equal to the cluster name.\n")
 	b.WriteString("3. Do NOT invent Redis nodeIds; the controller discovers them at runtime.\n")
-	b.WriteString("4. If there is no existing topology, create the full cluster from scratch and end with VerifyCluster.\n")
-	b.WriteString("5. If topology exists, transition from observed state to desired spec with the smallest safe action sequence.\n")
-	b.WriteString("6. AddSlots across all Create steps must cover exactly slots 0-16383 with no overlaps.\n")
-	b.WriteString("7. For shard ScaleOut, do not use AddSlots. Use MigrateSlots for every source/target pair required by the deterministic balanced slot distribution, including existing-master to existing-master moves when needed.\n")
-	b.WriteString("8. If observed drift is present, use the exact replacementPod from the observed state, do not use AddSlots or MigrateSlots for a single missing node, and include ForgetNode only when lastKnownNodeId is non-empty.\n")
+	b.WriteString("4. All Redis pods must be named redis-<N> where N is a single non-negative integer.\n")
+	b.WriteString("5. Reconcile desired spec, live Pods, and CLUSTER NODES facts before choosing actions.\n")
 	return b.String()
 }
 
@@ -110,49 +106,33 @@ func buildUserPrompt(req Request) string {
 	fmt.Fprintf(&b, "nextPodOrdinal: %d\n\n", req.ObservedState.NextPodOrdinal)
 
 	b.WriteString("## Observed state\n")
-	if req.ObservedState.Topology == nil || len(req.ObservedState.Topology.Shards) == 0 {
-		b.WriteString("No existing topology; the cluster has not been created yet.\n\n")
-	} else {
-		b.WriteString("Current topology:\n")
-		writeTopology(&b, req.ObservedState.Topology)
-		b.WriteString("\n")
-	}
-	if req.ObservedState.Drift != nil {
-		d := req.ObservedState.Drift
-		b.WriteString("Observed drift:\n")
-		fmt.Fprintf(&b, "- missingPod: %s\n", d.MissingPod)
-		fmt.Fprintf(&b, "- lastKnownNodeId: %s\n", d.LastKnownNodeID)
-		fmt.Fprintf(&b, "- role: %s\n", d.Role)
-		fmt.Fprintf(&b, "- replacementPod: %s\n", d.ReplacementPod)
-		fmt.Fprintf(&b, "- targetMasterPod: %s\n", d.TargetMasterPod)
-		fmt.Fprintf(&b, "- observedShards: %d\n", d.BaselineShards)
-		fmt.Fprintf(&b, "- observedReplicasPerShard: %d\n\n", d.BaselineReplicas)
-	}
+	writeObservedNodes(&b, req.ObservedState.Nodes)
+	b.WriteString("\n")
 
 	b.WriteString("## Task\n")
-	if req.ObservedState.Drift != nil {
-		b.WriteString("Generate a plan that safely converges the observed drift to the desired spec.\n")
-		b.WriteString("Use only EnsureNode, WaitNodeReady, MeetNode, ReplicateNode, ForgetNode, and VerifyCluster.\n")
-		b.WriteString("Use replacementPod for the new node. Include ForgetNode only if lastKnownNodeId is non-empty. Verify against the desired spec counts.\n")
-	} else if req.ObservedState.Topology == nil || len(req.ObservedState.Topology.Shards) == 0 {
-		b.WriteString("Generate a Create plan that provisions the full Redis Cluster matching the desired spec.\n")
-		b.WriteString("Distribute slots evenly across all masters. Ensure every master has replicas before assigning slots.\n")
-	} else {
-		b.WriteString("Generate a plan that safely transitions the observed state to the desired spec.\n")
-		b.WriteString("Infer the required path from the current topology and desired spec; do not include an operation field.\n")
-	}
+	b.WriteString("Bring the cluster from the observed state to the desired spec. Pick whichever whitelisted action sequence you think is safest; the controller's Validator is the final safety net.\n")
 	b.WriteString("Return only the JSON plan.\n")
 	return b.String()
 }
 
-func writeTopology(b *strings.Builder, t *v1alpha1.ClusterTopology) {
-	for _, sh := range t.Shards {
-		fmt.Fprintf(b, "- shard %s: master pod=%s nodeId=%s slots=%q ready=%v\n",
-			sh.ID, sh.Master.Pod, sh.Master.NodeID, sh.Master.Slots, sh.Master.Ready)
-		for _, r := range sh.Replicas {
-			fmt.Fprintf(b, "    replica pod=%s nodeId=%s ready=%v\n", r.Pod, r.NodeID, r.Ready)
-		}
+func writeObservedNodes(b *strings.Builder, nodes []ObservedNode) {
+	if len(nodes) == 0 {
+		b.WriteString("No observed nodes.\n")
+		return
 	}
+	b.WriteString("pod | podExists | redisSeen | nodeId | role | slots | masterId | masterPod | ready | deleting | flags | linkState\n")
+	for _, n := range nodes {
+		fmt.Fprintf(b, "%s | %v | %v | %s | %s | %s | %s | %s | %v | %v | %s | %s\n",
+			dash(n.Pod), n.PodExists, n.RedisSeen, dash(n.NodeID), dash(n.Role), dash(n.Slots),
+			dash(n.MasterID), dash(n.MasterPod), n.Ready, n.Deleting, dash(strings.Join(n.Flags, ",")), dash(n.LinkState))
+	}
+}
+
+func dash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
 }
 
 // planJSONSchema returns a minimal JSON Schema for the Plan object. Providers

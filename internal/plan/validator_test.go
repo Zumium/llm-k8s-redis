@@ -292,6 +292,21 @@ func TestValidate_DriftPlanRequiresReplacementAndLastKnownNodeID(t *testing.T) {
 	if err := NewValidator().Validate(p, ctx); err != nil {
 		t.Fatalf("expected drift plan to pass, got %v", err)
 	}
+
+	withoutForget := *p
+	withoutForget.Steps = append([]Step{}, p.Steps[:4]...)
+	withoutForget.Steps = append(withoutForget.Steps, p.Steps[5:]...)
+	if err := NewValidator().Validate(&withoutForget, ctx); err == nil {
+		t.Fatal("expected drift plan without ForgetNode to fail")
+	}
+
+	withDuplicateForget := *p
+	withDuplicateForget.Steps = append([]Step{}, p.Steps[:5]...)
+	withDuplicateForget.Steps = append(withDuplicateForget.Steps, p.Steps[4:]...)
+	if err := NewValidator().Validate(&withDuplicateForget, ctx); err == nil {
+		t.Fatal("expected drift plan with duplicate ForgetNode to fail")
+	}
+
 	delete(p.Steps[4].Params, "lastKnownNodeId")
 	if err := NewValidator().Validate(p, ctx); err == nil {
 		t.Fatal("expected drift plan without lastKnownNodeId to fail")
