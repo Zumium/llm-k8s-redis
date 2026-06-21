@@ -87,7 +87,7 @@ func (v *Validator) Validate(p *Plan, input any) error {
 		}
 		return simulatePlan(p, ctx)
 	}
-	if err := validateExistingTopologyPlan(p, spec, ctx, ensurePods); err != nil {
+	if err := validateExistingTopologyPlan(p, spec, &ctx, ensurePods); err != nil {
 		return err
 	}
 	return simulatePlan(p, ctx)
@@ -359,26 +359,278 @@ func validateCreatePodNames(ensurePods map[string]bool) error {
 	return nil
 }
 
-func validateExistingTopologyPlan(p *Plan, spec ClusterSpec, ctx ValidationContext, ensurePods map[string]bool) error {
+func validateExistingTopologyPlan(p *Plan, spec ClusterSpec, ctx *ValidationContext, ensurePods map[string]bool) error {
 	topology := ctx.Topology
 	currentShards := len(topology.Shards)
 	currentReplicas, err := uniformReplicaCount(topology)
 	if err != nil {
+		// Non-uniform topology is only allowed on the heal path: shards count
+		// matches spec, every shard has a ready slot-owning master, slot
+		// coverage is complete, and the cluster is in a recoverable state.
+		if h := healableTopology(topology, spec, ctx.ObservedNodes); h != nil {
+			return validateHealRepair(p, spec, ctx, ensurePods, h)
+		}
 		return err
 	}
 	if int(spec.Shards) == currentShards && int(spec.ReplicasPerShard) > currentReplicas {
-		return validateReplicaScaleOut(p, spec, ctx, ensurePods)
+		return validateReplicaScaleOut(p, spec, *ctx, ensurePods)
 	}
 	if int(spec.Shards) > currentShards && int(spec.ReplicasPerShard) == currentReplicas {
-		return validateShardScaleOut(p, spec, ctx, ensurePods)
+		return validateShardScaleOut(p, spec, *ctx, ensurePods)
 	}
 	if int(spec.Shards) > currentShards && int(spec.ReplicasPerShard) > currentReplicas {
 		return fmt.Errorf("shards and replicasPerShard cannot both change in one scaleout")
 	}
 	if int(spec.Shards) == currentShards && int(spec.ReplicasPerShard) == currentReplicas {
-		return validateSameSpecRepair(ctx, ensurePods)
+		return validateSameSpecRepair(*ctx, ensurePods)
 	}
 	return fmt.Errorf("unsupported existing-topology change: spec.shards=%d current=%d spec.replicasPerShard=%d current=%d", spec.Shards, currentShards, spec.ReplicasPerShard, currentReplicas)
+}
+
+// healableTopology inspects a non-uniform topology and decides whether the
+// cluster is in a state the heal path can repair. Returns nil when the state
+// is not healable (caller should surface the original uniformReplicaCount
+// error).
+//
+// Healable criteria (failover recoverable only):
+//   - shard count equals spec
+//   - every shard has a ready, slot-owning master
+//   - slots 0-16383 are covered exactly once across masters
+//   - at least one shard is under-replicated (otherwise it is not a heal case)
+//   - observed nodes reveal at least one ghost (a Redis-seen, slotless node
+//     whose pod is gone or flagged fail). A heal plan must clean these up.
+func healableTopology(topology *ClusterTopology, spec ClusterSpec, observed []ObservedNode) *healState {
+	if topology == nil || int(spec.Shards) != len(topology.Shards) {
+		return nil
+	}
+	covered := map[int]string{}
+	for _, sh := range topology.Shards {
+		if sh.Master.Pod == "" || !sh.Master.Ready || sh.Master.Slots == "" {
+			return nil
+		}
+		slots, err := parseSlots(sh.Master.Slots)
+		if err != nil {
+			return nil
+		}
+		for slot := range slots {
+			if _, ok := covered[slot]; ok {
+				return nil
+			}
+			covered[slot] = sh.Master.Pod
+		}
+	}
+	if len(covered) != 16384 {
+		return nil
+	}
+
+	underReplicated := []ShardTopology{}
+	for _, sh := range topology.Shards {
+		if len(sh.Replicas) < int(spec.ReplicasPerShard) {
+			underReplicated = append(underReplicated, sh)
+		}
+	}
+	if len(underReplicated) == 0 {
+		return nil
+	}
+
+	ghosts := ghostNodes(observed)
+	if len(ghosts) == 0 {
+		return nil
+	}
+
+	return &healState{
+		underReplicated: underReplicated,
+		ghosts:          ghosts,
+	}
+}
+
+// ghostNodes returns observed nodes that Redis still remembers but that hold no
+// slots and whose pod is gone or Redis has flagged failed. These are leftovers
+// from a master that died and whose replica was auto-promoted by failover.
+func ghostNodes(observed []ObservedNode) []ObservedNode {
+	var out []ObservedNode
+	for _, n := range observed {
+		if !n.RedisSeen {
+			continue
+		}
+		if n.Slots != "" {
+			continue
+		}
+		failed := !n.PodExists || hasFailFlag(n.Flags)
+		if !failed {
+			continue
+		}
+		out = append(out, n)
+	}
+	return out
+}
+
+func hasFailFlag(flags []string) bool {
+	for _, f := range flags {
+		if f == "fail" || f == "fail?" {
+			return true
+		}
+	}
+	return false
+}
+
+// healState summarises what a heal plan must fix.
+type healState struct {
+	underReplicated []ShardTopology
+	ghosts          []ObservedNode
+}
+
+// validateHealRepair checks a plan that repairs a failover-damaged cluster:
+// it replenishes under-replicated shards with new replicas and forgets/deletes
+// ghost nodes left by the dead master.
+//
+// Allowed actions: EnsureNode, WaitNodeReady, MeetNode, ReplicateNode,
+// ForgetNode, DeleteNode, VerifyCluster. AddSlots/MigrateSlots are forbidden
+// because slots are already fully covered and owned by healthy masters.
+func validateHealRepair(p *Plan, spec ClusterSpec, ctx *ValidationContext, ensurePods map[string]bool, h *healState) error {
+	// Heal mode relaxes the "slot-owning master has replica" intermediate
+	// invariant: the cluster starts violating it and the plan restores it.
+	ctx.HealMode = true
+	// Action whitelist.
+	for _, s := range p.Steps {
+		switch s.Action {
+		case ActionEnsureNode, ActionWaitNodeReady, ActionMeetNode, ActionReplicateNode, ActionForgetNode, ActionDeleteNode, ActionVerifyCluster:
+		default:
+			return fmt.Errorf("step %q: action %q is not allowed for heal repair", s.ID, s.Action)
+		}
+	}
+
+	// New pods must be contiguous from nextPodOrdinal.
+	existingPods := topologyPods(ctx.Topology)
+	newPods := map[string]bool{}
+	for pod := range ensurePods {
+		if !existingPods[pod] {
+			newPods[pod] = true
+		}
+	}
+	if err := validateSequentialNewPods(existingPods, newPods, effectiveNextPodOrdinal(*ctx)); err != nil {
+		return err
+	}
+
+	// Verify every under-replicated shard gets one new replica per missing slot.
+	replicasByMaster := map[string]int{}
+	replicaTargets := map[string]bool{}
+	masterSet := map[string]bool{}
+	for _, sh := range ctx.Topology.Shards {
+		masterSet[sh.Master.Pod] = true
+	}
+	for i, s := range p.Steps {
+		if s.Action != ActionReplicateNode {
+			continue
+		}
+		masterPod, ok := paramString(s.Params, "masterPod")
+		if !ok || !masterSet[masterPod] {
+			return fmt.Errorf("step %q: masterPod %q is not an existing master", s.ID, masterPod)
+		}
+		replicaPod, ok := paramString(s.Params, "replicaPod")
+		if !ok || !newPods[replicaPod] {
+			return fmt.Errorf("step %q: replicaPod %q is not a new pod", s.ID, replicaPod)
+		}
+		if replicaTargets[replicaPod] {
+			return fmt.Errorf("step %q: replica pod %q is assigned more than once", s.ID, replicaPod)
+		}
+		if !precededAction(p, i, ActionEnsureNode, "pod", replicaPod) {
+			return fmt.Errorf("step %q: replica pod %q missing preceding EnsureNode", s.ID, replicaPod)
+		}
+		if !precededAction(p, i, ActionWaitNodeReady, "pod", replicaPod) {
+			return fmt.Errorf("step %q: replica pod %q missing preceding WaitNodeReady", s.ID, replicaPod)
+		}
+		replicaTargets[replicaPod] = true
+		replicasByMaster[masterPod]++
+	}
+	needByMaster := map[string]int{}
+	wantNewReplicas := 0
+	for _, sh := range h.underReplicated {
+		need := int(spec.ReplicasPerShard) - len(sh.Replicas)
+		needByMaster[sh.Master.Pod] = need
+		wantNewReplicas += need
+	}
+	if len(replicaTargets) != wantNewReplicas {
+		return fmt.Errorf("heal plan assigns %d new replicas, expected %d", len(replicaTargets), wantNewReplicas)
+	}
+	for master, need := range needByMaster {
+		if replicasByMaster[master] != need {
+			return fmt.Errorf("master %q gets %d new replicas, expected %d", master, replicasByMaster[master], need)
+		}
+	}
+
+	// Verify every ghost node is forgotten. ForgetNode must carry
+	// lastKnownNodeId when the ghost pod no longer exists.
+	ghostSeen := map[string]bool{}
+	for _, g := range h.ghosts {
+		ghostSeen[g.NodeID] = false
+	}
+	for _, s := range p.Steps {
+		if s.Action != ActionForgetNode {
+			continue
+		}
+		var id string
+		if v, ok := s.Params["lastKnownNodeId"]; ok {
+			if str, ok := v.(string); ok {
+				id = str
+			}
+		}
+		if id == "" {
+			// Executor can resolve id from pod when the pod still exists; for
+			// ghosts whose pod is gone we must require lastKnownNodeId.
+			pod, _ := paramString(s.Params, "pod")
+			podStillExists := false
+			for _, g := range h.ghosts {
+				if g.Pod == pod && g.PodExists {
+					podStillExists = true
+					break
+				}
+			}
+			if !podStillExists {
+				return fmt.Errorf("step %q: ForgetNode requires lastKnownNodeId when pod %q no longer exists", s.ID, pod)
+			}
+			continue
+		}
+		if _, ok := ghostSeen[id]; !ok {
+			return fmt.Errorf("step %q: lastKnownNodeId %q is not a known ghost node", s.ID, id)
+		}
+		ghostSeen[id] = true
+	}
+	for id, seen := range ghostSeen {
+		if !seen {
+			return fmt.Errorf("heal plan must forget ghost node %s", id)
+		}
+	}
+
+	// Ensure the plan only forgets ghosts it declares (no random ForgetNode).
+	// A ForgetNode matches a ghost either by pod name or by lastKnownNodeId,
+	// because a topology refresh may drop the dead pod's name->nodeId mapping.
+	ghostPods := map[string]bool{}
+	ghostIDs := map[string]bool{}
+	for _, g := range h.ghosts {
+		if g.Pod != "" {
+			ghostPods[g.Pod] = true
+		}
+		if g.NodeID != "" {
+			ghostIDs[g.NodeID] = true
+		}
+	}
+	for _, s := range p.Steps {
+		if s.Action != ActionForgetNode {
+			continue
+		}
+		pod, _ := paramString(s.Params, "pod")
+		id, _ := paramString(s.Params, "lastKnownNodeId")
+		if pod != "" && ghostPods[pod] {
+			continue
+		}
+		if id != "" && ghostIDs[id] {
+			continue
+		}
+		return fmt.Errorf("step %q: ForgetNode target pod %q / nodeId %q is not a known ghost", s.ID, pod, id)
+	}
+
+	return simulatePlan(p, *ctx)
 }
 
 func validateSameSpecRepair(ctx ValidationContext, ensurePods map[string]bool) error {

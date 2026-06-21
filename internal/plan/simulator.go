@@ -15,12 +15,13 @@ type planSimulator struct {
 	spec       ClusterSpec
 	nodes      map[string]*simulatedNode
 	slotOwners map[int]string
+	healMode   bool
 }
 
 func simulatePlan(p *Plan, ctx ValidationContext) error {
 	s := newPlanSimulator(ctx)
 	for i, step := range p.Steps {
-		if err := s.apply(step); err != nil {
+		if err := s.apply(step, p, i); err != nil {
 			return fmt.Errorf("step %q: %w", step.ID, err)
 		}
 		if i != len(p.Steps)-1 {
@@ -37,6 +38,7 @@ func newPlanSimulator(ctx ValidationContext) *planSimulator {
 		spec:       ctx.Spec,
 		nodes:      map[string]*simulatedNode{},
 		slotOwners: map[int]string{},
+		healMode:   ctx.HealMode,
 	}
 	if len(ctx.ObservedNodes) > 0 {
 		s.addObservedNodes(ctx.ObservedNodes)
@@ -121,7 +123,7 @@ func (s *planSimulator) ensureExistingNode(pod string) *simulatedNode {
 	return n
 }
 
-func (s *planSimulator) apply(step Step) error {
+func (s *planSimulator) apply(step Step, p *Plan, stepIndex int) error {
 	switch step.Action {
 	case ActionEnsureNode:
 		return s.ensureNode(step)
@@ -138,7 +140,7 @@ func (s *planSimulator) apply(step Step) error {
 	case ActionForgetNode:
 		return s.forgetNode(step)
 	case ActionDeleteNode:
-		return s.deleteNode(step)
+		return s.deleteNode(step, p, stepIndex)
 	case ActionVerifyCluster:
 		return s.verifyCluster(step)
 	default:
@@ -330,7 +332,17 @@ func (s *planSimulator) forgetNode(step Step) error {
 	if !ok || pod == "" {
 		return fmt.Errorf("ForgetNode requires a non-empty pod param")
 	}
-	n := s.nodes[pod]
+	key := pod
+	n := s.nodes[key]
+	if n == nil {
+		// The pod may be gone (ghost); fall back to lastKnownNodeId, which is
+		// the key under which addObservedNodes registered the node when its
+		// pod name was empty.
+		if id, ok := paramString(step.Params, "lastKnownNodeId"); ok && id != "" {
+			key = id
+			n = s.nodes[key]
+		}
+	}
 	if n == nil || !n.clusterMember {
 		return fmt.Errorf("pod %q is not a known cluster member", pod)
 	}
@@ -341,14 +353,19 @@ func (s *planSimulator) forgetNode(step Step) error {
 	return nil
 }
 
-func (s *planSimulator) deleteNode(step Step) error {
+func (s *planSimulator) deleteNode(step Step, p *Plan, stepIndex int) error {
 	pod, ok := paramString(step.Params, "pod")
 	if !ok || pod == "" {
 		return fmt.Errorf("DeleteNode requires a non-empty pod param")
 	}
 	n := s.nodes[pod]
 	if n == nil {
-		return fmt.Errorf("pod %q is unknown", pod)
+		// Pod not in simulator: allow only when a preceding ForgetNode
+		// targeted this pod (cleaning up a ghost whose pod name was lost).
+		if !precededAction(p, stepIndex, ActionForgetNode, "pod", pod) {
+			return fmt.Errorf("pod %q is unknown", pod)
+		}
+		return nil
 	}
 	if n.clusterMember {
 		return fmt.Errorf("pod %q is still an active cluster member", pod)
@@ -404,7 +421,7 @@ func (s *planSimulator) checkInvariants() error {
 			if n.role != "master" {
 				return fmt.Errorf("slot-owning pod %q is not a master", pod)
 			}
-			if s.replicaCount(pod) == 0 {
+			if !s.healMode && s.replicaCount(pod) == 0 {
 				return fmt.Errorf("slot-owning master %q has no replica", pod)
 			}
 		}

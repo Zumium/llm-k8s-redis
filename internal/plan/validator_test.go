@@ -722,3 +722,116 @@ func TestValidate_ReplicaScaleOutRejectsVerifyMismatch(t *testing.T) {
 		t.Fatal("expected error for VerifyCluster replica mismatch")
 	}
 }
+
+// healTopology models a 2-shard cluster after redis-0 (master of shard-0) died
+// and Redis auto-promoted its replica redis-1 to master of slots 0-8191.
+// shard-0 is now under-replicated (0 replicas); redis-0 is a ghost.
+func healTopology() *ClusterTopology {
+	return &ClusterTopology{Shards: []ShardTopology{
+		{ID: "shard-0", Master: NodeTopology{Pod: "redis-1", NodeID: "node-1", Slots: "0-8191", Ready: true}},
+		{ID: "shard-1", Master: NodeTopology{Pod: "redis-2", NodeID: "node-2", Slots: "8192-16383", Ready: true}, Replicas: []NodeTopology{{Pod: "redis-3", NodeID: "node-3", Ready: true}}},
+	}}
+}
+
+// healObservedNodes includes redis-0 as a ghost: Redis still lists it, it owns
+// no slots, its pod is gone, and it carries the fail flag.
+func healObservedNodes() []ObservedNode {
+	return []ObservedNode{
+		{Pod: "redis-1", PodExists: true, RedisSeen: true, NodeID: "node-1", Role: "master", Slots: "0-8191", Ready: true},
+		{Pod: "redis-2", PodExists: true, RedisSeen: true, NodeID: "node-2", Role: "master", Slots: "8192-16383", Ready: true},
+		{Pod: "redis-3", PodExists: true, RedisSeen: true, NodeID: "node-3", Role: "replica", MasterID: "node-2", MasterPod: "redis-2", Ready: true},
+		{Pod: "redis-0", PodExists: false, RedisSeen: true, NodeID: "node-0", Role: "master", Slots: "", Flags: []string{"master", "fail"}},
+	}
+}
+
+func healCtx() ValidationContext {
+	return ValidationContext{Spec: spec(), Topology: healTopology(), ObservedNodes: healObservedNodes(), NextPodOrdinal: 4}
+}
+
+// validHealPlan replenishes shard-0 with a new replica redis-4 and forgets the
+// dead redis-0 ghost, then verifies the cluster.
+func validHealPlan() *Plan {
+	return &Plan{
+		DSLVersion:       DSLVersion,
+		PlanID:           "heal-1",
+		TargetGeneration: 1,
+		Steps: []Step{
+			{ID: "ensure-redis-4", Action: ActionEnsureNode, Params: map[string]any{"namespace": "example", "pod": "redis-4", "image": "redis:7.2", "memorySize": "2Gi"}},
+			{ID: "wait-redis-4", Action: ActionWaitNodeReady, Params: map[string]any{"namespace": "example", "pod": "redis-4"}},
+			{ID: "meet-redis-4", Action: ActionMeetNode, Params: map[string]any{"namespace": "example", "sourcePod": "redis-1", "targetPod": "redis-4"}},
+			{ID: "replicate-redis-4", Action: ActionReplicateNode, Params: map[string]any{"namespace": "example", "masterPod": "redis-1", "replicaPod": "redis-4"}},
+			{ID: "forget-redis-0", Action: ActionForgetNode, Params: map[string]any{"namespace": "example", "pod": "redis-0", "lastKnownNodeId": "node-0"}},
+			{ID: "delete-redis-0", Action: ActionDeleteNode, Params: map[string]any{"namespace": "example", "pod": "redis-0"}},
+			{ID: "verify", Action: ActionVerifyCluster, Params: map[string]any{"expectedShards": 2, "expectedReplicasPerShard": 1, "requireClusterStateOk": true, "requireFullSlotCoverage": true, "requireAllSlotOwnersHaveReplicas": true}},
+		},
+	}
+}
+
+func TestValidate_HealRepairAcceptsValidPlan(t *testing.T) {
+	if err := NewValidator().Validate(validHealPlan(), healCtx()); err != nil {
+		t.Fatalf("expected heal plan to pass, got %v", err)
+	}
+}
+
+func TestValidate_HealRepairRejectsMissingReplicaReplenish(t *testing.T) {
+	p := validHealPlan()
+	// Drop the EnsureNode/Wait/Meet/Replicate for redis-4 so shard-0 stays
+	// under-replicated.
+	p.Steps = p.Steps[4:]
+	if err := NewValidator().Validate(p, healCtx()); err == nil {
+		t.Fatal("expected error when heal plan does not replenish under-replicated shard")
+	}
+}
+
+func TestValidate_HealRepairRejectsMissingGhostForget(t *testing.T) {
+	p := validHealPlan()
+	// Drop the ForgetNode + DeleteNode steps; redis-0 ghost remains.
+	idx := stepIndex(t, p, "forget-redis-0")
+	p.Steps = append(p.Steps[:idx], p.Steps[idx+2:]...)
+	if err := NewValidator().Validate(p, healCtx()); err == nil {
+		t.Fatal("expected error when heal plan does not forget ghost node")
+	}
+}
+
+func TestValidate_HealRepairRejectsForgetWithoutLastKnownNodeId(t *testing.T) {
+	p := validHealPlan()
+	delete(p.Steps[stepIndex(t, p, "forget-redis-0")].Params, "lastKnownNodeId")
+	if err := NewValidator().Validate(p, healCtx()); err == nil {
+		t.Fatal("expected error when ForgetNode omits lastKnownNodeId for gone-pod ghost")
+	}
+}
+
+func TestValidate_HealRepairRejectsAddSlots(t *testing.T) {
+	p := validHealPlan()
+	p.Steps = append(p.Steps[:len(p.Steps)-1],
+		Step{ID: "addslots-bad", Action: ActionAddSlots, Params: map[string]any{"namespace": "example", "pod": "redis-1", "slots": "0-100"}},
+		p.Steps[len(p.Steps)-1],
+	)
+	if err := NewValidator().Validate(p, healCtx()); err == nil {
+		t.Fatal("expected error when heal plan contains AddSlots")
+	}
+}
+
+func TestValidate_HealRepairRejectsNonUniformShardCount(t *testing.T) {
+	// 3 shards in spec but only 2 in topology: not healable, must reject.
+	ctx := healCtx()
+	ctx.Spec = shardScaleOutSpec()
+	if err := NewValidator().Validate(validHealPlan(), ctx); err == nil {
+		t.Fatal("expected error when shard count mismatches spec")
+	}
+}
+
+// TestValidate_HealRepairMatchesGhostByNodeID covers the realistic case where a
+// topology refresh has dropped the dead pod's name from status.topology, so the
+// ghost's Pod is empty. The plan must still pass when ForgetNode carries
+// lastKnownNodeId matching the ghost's node id.
+func TestValidate_HealRepairMatchesGhostByNodeID(t *testing.T) {
+	ghosts := healObservedNodes()
+	// Simulate topology refresh losing the dead pod's name mapping.
+	ghosts[3].Pod = ""
+	ctx := healCtx()
+	ctx.ObservedNodes = ghosts
+	if err := NewValidator().Validate(validHealPlan(), ctx); err != nil {
+		t.Fatalf("expected heal plan to pass when ghost matched by nodeId, got %v", err)
+	}
+}

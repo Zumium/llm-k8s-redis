@@ -607,10 +607,19 @@ func TestReconcile_LazyRefreshSkipsWhenFresh(t *testing.T) {
 func TestReconcile_CompletedPlanRequeuesForRefresh(t *testing.T) {
 	ctx := context.Background()
 	scheme := newScheme(t)
-	cluster := clusterWithTopology()
-	cluster.Finalizers = []string{finalizer}
-	cluster.Status.ActivePlan = completedPlan()
-	cluster.Status.TopologyObservedAt = metav1.Now()
+	cluster := &api.RedisCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "example", Generation: 1, Finalizers: []string{finalizer}},
+		Spec:       api.RedisClusterSpec{Shards: 2, ReplicasPerShard: 1, Image: "redis:7.2", MemorySize: "2Gi"},
+		Status: api.RedisClusterStatus{
+			ObservedGeneration: 1,
+			TopologyObservedAt: metav1.Now(),
+			Topology: &api.ClusterTopology{Shards: []api.ShardTopology{
+				{ID: "shard-0", Master: api.NodeTopology{Pod: "redis-0", NodeID: "master-0", Slots: "0-8191", Ready: true}, Replicas: []api.NodeTopology{{Pod: "redis-1", NodeID: "replica-1", Ready: true}}},
+				{ID: "shard-1", Master: api.NodeTopology{Pod: "redis-2", NodeID: "master-2", Slots: "8192-16383", Ready: true}, Replicas: []api.NodeTopology{{Pod: "redis-3", NodeID: "replica-3", Ready: true}}},
+			}},
+			ActivePlan: completedPlan(),
+		},
+	}
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "example"}}).WithStatusSubresource(&api.RedisCluster{}).Build()
 	r := &RedisClusterReconciler{
 		Client: cl, Scheme: scheme, Planner: planner.NoopPlanner{}, Executor: NoopExecutor{},
@@ -630,10 +639,19 @@ func TestReconcile_CompletedPlanRequeuesForRefresh(t *testing.T) {
 func TestReconcile_FailedPlanRequeuesForRefresh(t *testing.T) {
 	ctx := context.Background()
 	scheme := newScheme(t)
-	cluster := clusterWithTopology()
-	cluster.Finalizers = []string{finalizer}
-	cluster.Status.ActivePlan = failedPlan()
-	cluster.Status.TopologyObservedAt = metav1.Now()
+	cluster := &api.RedisCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "example", Generation: 1, Finalizers: []string{finalizer}},
+		Spec:       api.RedisClusterSpec{Shards: 2, ReplicasPerShard: 1, Image: "redis:7.2", MemorySize: "2Gi"},
+		Status: api.RedisClusterStatus{
+			ObservedGeneration: 1,
+			TopologyObservedAt: metav1.Now(),
+			Topology: &api.ClusterTopology{Shards: []api.ShardTopology{
+				{ID: "shard-0", Master: api.NodeTopology{Pod: "redis-0", NodeID: "master-0", Slots: "0-8191", Ready: true}, Replicas: []api.NodeTopology{{Pod: "redis-1", NodeID: "replica-1", Ready: true}}},
+				{ID: "shard-1", Master: api.NodeTopology{Pod: "redis-2", NodeID: "master-2", Slots: "8192-16383", Ready: true}, Replicas: []api.NodeTopology{{Pod: "redis-3", NodeID: "replica-3", Ready: true}}},
+			}},
+			ActivePlan: failedPlan(),
+		},
+	}
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "example"}}).WithStatusSubresource(&api.RedisCluster{}).Build()
 	r := &RedisClusterReconciler{
 		Client: cl, Scheme: scheme, Planner: planner.NoopPlanner{}, Executor: NoopExecutor{},
@@ -1035,6 +1053,93 @@ func TestReconcile_LazyRefreshSkipsWhenPodSetMatches(t *testing.T) {
 	}
 	if obs.called != 0 {
 		t.Fatalf("expected no refresh when pod set matches and topology fresh, got %d", obs.called)
+	}
+}
+
+func TestReconcile_CompletedPlan_TopologyMismatchTriggersReplan(t *testing.T) {
+	ctx := context.Background()
+	scheme := newScheme(t)
+	cluster := clusterWithTopology()
+	cluster.Finalizers = []string{finalizer}
+	cluster.Status.ObservedGeneration = 1
+	cluster.Status.TopologyObservedAt = metav1.Now()
+	cluster.Status.ActivePlan = completedPlan()
+	fp := &recordingPlanner{err: errors.New("expected planner call")}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "example"}}).WithStatusSubresource(&api.RedisCluster{}).Build()
+	r := &RedisClusterReconciler{
+		Client: cl, Scheme: scheme, Planner: fp, Executor: NoopExecutor{},
+		Validator: plan.NewValidator(), Observer: &recordingObserver{},
+		TopologyRefreshInterval: time.Minute, TopologyStaleThreshold: time.Hour,
+	}
+
+	res, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "example"}})
+	if err != nil {
+		t.Fatalf("reconcile 1: %v", err)
+	}
+	if !res.Requeue {
+		t.Fatal("expected requeue after clearing drifted completed plan")
+	}
+	if fp.called != 0 {
+		t.Fatalf("expected no planner call yet, got %d", fp.called)
+	}
+	var got api.RedisCluster
+	if err := cl.Get(ctx, client.ObjectKey{Name: "example"}, &got); err != nil {
+		t.Fatalf("get cluster: %v", err)
+	}
+	if got.Status.ActivePlan != nil {
+		t.Fatalf("expected activePlan cleared, got %#v", got.Status.ActivePlan)
+	}
+	if !hasCondition(got.Status.Conditions, ConditionReady, metav1.ConditionFalse, "Replanning") {
+		t.Fatalf("expected Ready=False/Replanning, got %#v", got.Status.Conditions)
+	}
+
+	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "example"}}); err != nil {
+		t.Fatalf("reconcile 2: %v", err)
+	}
+	if fp.called != 1 {
+		t.Fatalf("expected planner call, got %d", fp.called)
+	}
+}
+
+func TestReconcile_FailedPlan_TopologyMismatchTriggersReplan(t *testing.T) {
+	ctx := context.Background()
+	scheme := newScheme(t)
+	cluster := clusterWithTopology()
+	cluster.Finalizers = []string{finalizer}
+	cluster.Status.ObservedGeneration = 1
+	cluster.Status.TopologyObservedAt = metav1.Now()
+	cluster.Status.ActivePlan = failedPlan()
+	fp := &recordingPlanner{err: errors.New("expected planner call")}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "example"}}).WithStatusSubresource(&api.RedisCluster{}).Build()
+	r := &RedisClusterReconciler{
+		Client: cl, Scheme: scheme, Planner: fp, Executor: NoopExecutor{},
+		Validator: plan.NewValidator(), Observer: &recordingObserver{},
+		TopologyRefreshInterval: time.Minute, TopologyStaleThreshold: time.Hour,
+	}
+
+	res, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "example"}})
+	if err != nil {
+		t.Fatalf("reconcile 1: %v", err)
+	}
+	if !res.Requeue {
+		t.Fatal("expected requeue after clearing drifted failed plan")
+	}
+	var got api.RedisCluster
+	if err := cl.Get(ctx, client.ObjectKey{Name: "example"}, &got); err != nil {
+		t.Fatalf("get cluster: %v", err)
+	}
+	if got.Status.ActivePlan != nil {
+		t.Fatalf("expected activePlan cleared, got %#v", got.Status.ActivePlan)
+	}
+	if !hasCondition(got.Status.Conditions, ConditionReady, metav1.ConditionFalse, "Replanning") {
+		t.Fatalf("expected Ready=False/Replanning, got %#v", got.Status.Conditions)
+	}
+
+	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "example"}}); err != nil {
+		t.Fatalf("reconcile 2: %v", err)
+	}
+	if fp.called != 1 {
+		t.Fatalf("expected planner call, got %d", fp.called)
 	}
 }
 
