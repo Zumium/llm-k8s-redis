@@ -78,17 +78,22 @@ type ValidationContext struct {
 	Spec           ClusterSpec
 	Topology       *ClusterTopology
 	NextPodOrdinal int
-	Drift          *DriftContext
+	ObservedNodes  []ObservedNode
 }
 
-type DriftContext struct {
-	MissingPod       string
-	LastKnownNodeID  string
-	Role             string
-	ReplacementPod   string
-	TargetMasterPod  string
-	BaselineShards   int
-	BaselineReplicas int
+type ObservedNode struct {
+	Pod       string
+	PodExists bool
+	RedisSeen bool
+	NodeID    string
+	Role      string
+	Slots     string
+	MasterID  string
+	MasterPod string
+	Ready     bool
+	Deleting  bool
+	Flags     []string
+	LinkState string
 }
 
 type ClusterTopology struct {

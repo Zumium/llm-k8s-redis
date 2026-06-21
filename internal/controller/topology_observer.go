@@ -14,7 +14,6 @@ import (
 
 	v1alpha1 "github.com/example/llm-k8s-redis/api/v1alpha1"
 	"github.com/example/llm-k8s-redis/internal/plan"
-	"github.com/example/llm-k8s-redis/internal/planner"
 	"github.com/example/llm-k8s-redis/internal/redis"
 )
 
@@ -23,7 +22,7 @@ import (
 // a topology snapshot without executing a plan step.
 type Observer interface {
 	ObserveTopology(ctx context.Context, cluster *v1alpha1.RedisCluster) error
-	CollectObservedNodes(ctx context.Context, cluster *v1alpha1.RedisCluster) ([]planner.ObservedNode, error)
+	CollectObservedNodes(ctx context.Context, cluster *v1alpha1.RedisCluster) ([]plan.ObservedNode, error)
 }
 
 // noopObserver is the default Observer used when none is wired. It performs no
@@ -34,7 +33,7 @@ func (noopObserver) ObserveTopology(_ context.Context, _ *v1alpha1.RedisCluster)
 	return nil
 }
 
-func (noopObserver) CollectObservedNodes(_ context.Context, _ *v1alpha1.RedisCluster) ([]planner.ObservedNode, error) {
+func (noopObserver) CollectObservedNodes(_ context.Context, _ *v1alpha1.RedisCluster) ([]plan.ObservedNode, error) {
 	return nil, nil
 }
 
@@ -146,7 +145,7 @@ func (e *ActionExecutor) observeTopology(ctx context.Context, cluster *v1alpha1.
 	return obs, nil
 }
 
-func (e *ActionExecutor) CollectObservedNodes(ctx context.Context, cluster *v1alpha1.RedisCluster) ([]planner.ObservedNode, error) {
+func (e *ActionExecutor) CollectObservedNodes(ctx context.Context, cluster *v1alpha1.RedisCluster) ([]plan.ObservedNode, error) {
 	if e.RedisFactory == nil {
 		e.RedisFactory = redis.DefaultFactory
 	}
@@ -227,7 +226,7 @@ func pickObservationSeedPod(cluster *v1alpha1.RedisCluster, pods []corev1.Pod) (
 	return pickSeedPod(pods)
 }
 
-func observedNodes(cluster *v1alpha1.RedisCluster, pods []corev1.Pod, entries []clusterNodeEntry) []planner.ObservedNode {
+func observedNodes(cluster *v1alpha1.RedisCluster, pods []corev1.Pod, entries []clusterNodeEntry) []plan.ObservedNode {
 	podToNodeID, nodeIDToPod := lastKnownNodeMaps(cluster)
 	podsByIP := mapPodsByIP(pods)
 	for _, entry := range entries {
@@ -237,10 +236,10 @@ func observedNodes(cluster *v1alpha1.RedisCluster, pods []corev1.Pod, entries []
 		}
 	}
 	seen := map[string]bool{}
-	out := make([]planner.ObservedNode, 0, len(pods)+len(entries))
+	out := make([]plan.ObservedNode, 0, len(pods)+len(entries))
 
 	for _, p := range pods {
-		n := planner.ObservedNode{
+		n := plan.ObservedNode{
 			Pod:       p.Name,
 			PodExists: true,
 			NodeID:    podToNodeID[p.Name],
@@ -263,7 +262,7 @@ func observedNodes(cluster *v1alpha1.RedisCluster, pods []corev1.Pod, entries []
 		if seen[entry.ID] {
 			continue
 		}
-		n := planner.ObservedNode{Pod: nodeIDToPod[entry.ID], PodExists: false}
+		n := plan.ObservedNode{Pod: nodeIDToPod[entry.ID], PodExists: false}
 		fillObservedNode(&n, entry, nodeIDToPod)
 		out = append(out, n)
 	}
@@ -285,7 +284,7 @@ func observedNodes(cluster *v1alpha1.RedisCluster, pods []corev1.Pod, entries []
 	return out
 }
 
-func fillObservedNode(n *planner.ObservedNode, entry clusterNodeEntry, nodeIDToPod map[string]string) {
+func fillObservedNode(n *plan.ObservedNode, entry clusterNodeEntry, nodeIDToPod map[string]string) {
 	n.RedisSeen = true
 	n.NodeID = entry.ID
 	n.Role = redisRole(entry)

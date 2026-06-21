@@ -67,7 +67,7 @@ func actionReference() string {
 		{plan.ActionReplicateNode, `{"namespace":"<cluster>","masterPod":"<name>","replicaPod":"<name>"}`},
 		{plan.ActionAddSlots, `{"namespace":"<cluster>","pod":"<name>","slots":"<start-end>"}`},
 		{plan.ActionMigrateSlots, `{"namespace":"<cluster>","sourcePod":"<name>","targetPod":"<name>","slots":"<start-end>"}`},
-		{plan.ActionForgetNode, `{"namespace":"<cluster>","pod":"<last-known-name>","lastKnownNodeId":"<node-id-for-deleted-pod>"}`},
+		{plan.ActionForgetNode, `{"namespace":"<cluster>","pod":"<name>","lastKnownNodeId":"<optional last-known node id only when pod is gone>"}`},
 		{plan.ActionDeleteNode, `{"namespace":"<cluster>","pod":"<name>"}`},
 		{plan.ActionVerifyCluster, `{"expectedShards":<n>,"expectedReplicasPerShard":<n>,"requireClusterStateOk":true,"requireFullSlotCoverage":true,"requireAllSlotOwnersHaveReplicas":true}`},
 	}
@@ -87,7 +87,6 @@ func safetyInvariants() string {
 - Every namespace param must equal the RedisCluster name.
 - Every new pod referenced by WaitNodeReady/MeetNode/ReplicateNode/AddSlots must be declared by a preceding EnsureNode.
 - All Redis pods must be named "redis-<N>" where <N> is a single non-negative integer. Do NOT embed the cluster name or any other prefix. Correct examples: redis-0, redis-1, redis-2. Wrong examples: redis-3s1r-0, redis-cluster-0, redis-example-0. Pod names are globally non-reusable. Create uses redis-0 upward; all later new pods must start at the provided nextPodOrdinal and must not fill historical gaps.
-- Plans for single-node drift must not use AddSlots or MigrateSlots, must use replacementPod for EnsureNode, and must use lastKnownNodeId when forgetting a deleted pod. If lastKnownNodeId is empty, do not include ForgetNode.
 - sourcePod and targetPod (or masterPod and replicaPod) must not be the same pod.`)
 }
 

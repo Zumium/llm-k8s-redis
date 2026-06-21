@@ -38,6 +38,10 @@ func newPlanSimulator(ctx ValidationContext) *planSimulator {
 		nodes:      map[string]*simulatedNode{},
 		slotOwners: map[int]string{},
 	}
+	if len(ctx.ObservedNodes) > 0 {
+		s.addObservedNodes(ctx.ObservedNodes)
+		return s
+	}
 	if ctx.Topology == nil {
 		return s
 	}
@@ -63,12 +67,57 @@ func newPlanSimulator(ctx ValidationContext) *planSimulator {
 	return s
 }
 
-func (s *planSimulator) ensureExistingNode(pod string) *simulatedNode {
+func (s *planSimulator) addObservedNodes(nodes []ObservedNode) {
+	nodeIDToPod := map[string]string{}
+	for _, observed := range nodes {
+		if observed.NodeID != "" && observed.Pod != "" {
+			nodeIDToPod[observed.NodeID] = observed.Pod
+		}
+	}
+	for _, observed := range nodes {
+		pod := observed.Pod
+		if pod == "" {
+			pod = observed.NodeID
+		}
+		if pod == "" {
+			continue
+		}
+		n := s.ensureSimulatedNode(pod)
+		n.exists = observed.PodExists
+		n.ready = observed.Ready && !observed.Deleting
+		n.clusterMember = observed.RedisSeen
+		n.role = observed.Role
+		if n.role == "" {
+			n.role = "unknown"
+		}
+		if observed.MasterPod != "" {
+			n.replicaOf = observed.MasterPod
+		} else if observed.MasterID != "" {
+			n.replicaOf = nodeIDToPod[observed.MasterID]
+		}
+		if observed.Role == "master" && observed.Slots != "" {
+			if slots, err := parseSlots(observed.Slots); err == nil {
+				for slot := range slots {
+					n.slots[slot] = struct{}{}
+					s.slotOwners[slot] = pod
+				}
+			}
+		}
+	}
+}
+
+func (s *planSimulator) ensureSimulatedNode(pod string) *simulatedNode {
 	n := s.nodes[pod]
 	if n == nil {
-		n = &simulatedNode{exists: true, slots: map[int]struct{}{}}
+		n = &simulatedNode{slots: map[int]struct{}{}}
 		s.nodes[pod] = n
 	}
+	return n
+}
+
+func (s *planSimulator) ensureExistingNode(pod string) *simulatedNode {
+	n := s.ensureSimulatedNode(pod)
+	n.exists = true
 	return n
 }
 
@@ -86,6 +135,10 @@ func (s *planSimulator) apply(step Step) error {
 		return s.addSlots(step)
 	case ActionMigrateSlots:
 		return s.migrateSlots(step)
+	case ActionForgetNode:
+		return s.forgetNode(step)
+	case ActionDeleteNode:
+		return s.deleteNode(step)
 	case ActionVerifyCluster:
 		return s.verifyCluster(step)
 	default:
@@ -129,6 +182,9 @@ func (s *planSimulator) meetNode(step Step) error {
 	targetPod, ok := paramString(step.Params, "targetPod")
 	if !ok || targetPod == "" {
 		return fmt.Errorf("MeetNode requires a non-empty targetPod param")
+	}
+	if sourcePod == targetPod {
+		return fmt.Errorf("sourcePod and targetPod must differ")
 	}
 	source := s.nodes[sourcePod]
 	if source == nil || !source.ready {
@@ -269,6 +325,39 @@ func (s *planSimulator) migrateSlots(step Step) error {
 	return nil
 }
 
+func (s *planSimulator) forgetNode(step Step) error {
+	pod, ok := paramString(step.Params, "pod")
+	if !ok || pod == "" {
+		return fmt.Errorf("ForgetNode requires a non-empty pod param")
+	}
+	n := s.nodes[pod]
+	if n == nil || !n.clusterMember {
+		return fmt.Errorf("pod %q is not a known cluster member", pod)
+	}
+	if len(n.slots) > 0 {
+		return fmt.Errorf("pod %q still owns slots", pod)
+	}
+	n.clusterMember = false
+	return nil
+}
+
+func (s *planSimulator) deleteNode(step Step) error {
+	pod, ok := paramString(step.Params, "pod")
+	if !ok || pod == "" {
+		return fmt.Errorf("DeleteNode requires a non-empty pod param")
+	}
+	n := s.nodes[pod]
+	if n == nil {
+		return fmt.Errorf("pod %q is unknown", pod)
+	}
+	if n.clusterMember {
+		return fmt.Errorf("pod %q is still an active cluster member", pod)
+	}
+	n.exists = false
+	n.ready = false
+	return nil
+}
+
 func (s *planSimulator) verifyCluster(step Step) error {
 	expectedShards, ok := paramInt(step.Params, "expectedShards")
 	if !ok {
@@ -286,7 +375,7 @@ func (s *planSimulator) verifyCluster(step Step) error {
 	}
 	masters := 0
 	for pod, n := range s.nodes {
-		if n.role != "master" || len(n.slots) == 0 {
+		if !n.exists || !n.clusterMember || n.role != "master" || len(n.slots) == 0 {
 			continue
 		}
 		masters++
@@ -305,6 +394,9 @@ func (s *planSimulator) verifyCluster(step Step) error {
 
 func (s *planSimulator) checkInvariants() error {
 	for pod, n := range s.nodes {
+		if !n.exists || !n.clusterMember {
+			continue
+		}
 		if n.role == "replica" && len(n.slots) > 0 {
 			return fmt.Errorf("replica pod %q owns slots", pod)
 		}
@@ -319,6 +411,9 @@ func (s *planSimulator) checkInvariants() error {
 	}
 	seen := map[int]string{}
 	for pod, n := range s.nodes {
+		if !n.exists || !n.clusterMember {
+			continue
+		}
 		for slot := range n.slots {
 			if prev, ok := seen[slot]; ok {
 				return fmt.Errorf("slot %d belongs to both %q and %q", slot, prev, pod)
@@ -335,7 +430,7 @@ func (s *planSimulator) checkInvariants() error {
 func (s *planSimulator) replicaCount(masterPod string) int {
 	count := 0
 	for _, n := range s.nodes {
-		if n.role == "replica" && n.replicaOf == masterPod {
+		if n.exists && n.clusterMember && n.role == "replica" && n.replicaOf == masterPod {
 			count++
 		}
 	}

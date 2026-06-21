@@ -43,20 +43,7 @@ type ObservedState struct {
 	Nodes          []ObservedNode
 }
 
-type ObservedNode struct {
-	Pod       string
-	PodExists bool
-	RedisSeen bool
-	NodeID    string
-	Role      string
-	Slots     string
-	MasterID  string
-	MasterPod string
-	Ready     bool
-	Deleting  bool
-	Flags     []string
-	LinkState string
-}
+type ObservedNode = plan.ObservedNode
 
 // ErrNotConfigured is returned by NoopPlanner.
 var ErrNotConfigured = errors.New("planner not configured; provide a Planner implementation")

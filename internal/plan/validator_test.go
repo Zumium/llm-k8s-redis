@@ -261,21 +261,7 @@ func TestValidate_ReplicaScaleOutUsesNextPodOrdinal(t *testing.T) {
 	}
 }
 
-func TestValidate_DriftPlanRequiresReplacementAndLastKnownNodeID(t *testing.T) {
-	ctx := ValidationContext{
-		Spec:           spec(),
-		Topology:       topology(),
-		NextPodOrdinal: 4,
-		Drift: &DriftContext{
-			MissingPod:       "redis-1",
-			LastKnownNodeID:  "node-1",
-			Role:             "replica",
-			ReplacementPod:   "redis-4",
-			TargetMasterPod:  "redis-0",
-			BaselineShards:   2,
-			BaselineReplicas: 1,
-		},
-	}
+func validReplicaReplacementPlan() *Plan {
 	p := &Plan{
 		DSLVersion:       DSLVersion,
 		PlanID:           "repair-1",
@@ -289,57 +275,144 @@ func TestValidate_DriftPlanRequiresReplacementAndLastKnownNodeID(t *testing.T) {
 			{ID: "verify", Action: ActionVerifyCluster, Params: map[string]any{"expectedShards": 2, "expectedReplicasPerShard": 1, "requireClusterStateOk": true, "requireFullSlotCoverage": true, "requireAllSlotOwnersHaveReplicas": true}},
 		},
 	}
-	if err := NewValidator().Validate(p, ctx); err != nil {
-		t.Fatalf("expected drift plan to pass, got %v", err)
-	}
+	return p
+}
 
-	withoutForget := *p
-	withoutForget.Steps = append([]Step{}, p.Steps[:4]...)
-	withoutForget.Steps = append(withoutForget.Steps, p.Steps[5:]...)
-	if err := NewValidator().Validate(&withoutForget, ctx); err == nil {
-		t.Fatal("expected drift plan without ForgetNode to fail")
+func TestValidate_ForgetNodeRejectsSlotOwner(t *testing.T) {
+	p := &Plan{
+		DSLVersion:       DSLVersion,
+		PlanID:           "forget-slot-owner",
+		TargetGeneration: 1,
+		Steps: []Step{
+			{ID: "forget", Action: ActionForgetNode, Params: map[string]any{"namespace": "example", "pod": "redis-0"}},
+			{ID: "verify", Action: ActionVerifyCluster, Params: map[string]any{"expectedShards": 2, "expectedReplicasPerShard": 1, "requireClusterStateOk": true, "requireFullSlotCoverage": true, "requireAllSlotOwnersHaveReplicas": true}},
+		},
 	}
-
-	withDuplicateForget := *p
-	withDuplicateForget.Steps = append([]Step{}, p.Steps[:5]...)
-	withDuplicateForget.Steps = append(withDuplicateForget.Steps, p.Steps[4:]...)
-	if err := NewValidator().Validate(&withDuplicateForget, ctx); err == nil {
-		t.Fatal("expected drift plan with duplicate ForgetNode to fail")
-	}
-
-	delete(p.Steps[4].Params, "lastKnownNodeId")
+	ctx := ValidationContext{Spec: spec(), Topology: topology(), NextPodOrdinal: 4}
 	if err := NewValidator().Validate(p, ctx); err == nil {
-		t.Fatal("expected drift plan without lastKnownNodeId to fail")
+		t.Fatal("expected ForgetNode to reject slot owner")
 	}
 }
 
-func TestValidate_DriftPlanAllowsMissingNodeIDWhenNoForgetNode(t *testing.T) {
-	ctx := ValidationContext{
-		Spec:           spec(),
-		Topology:       topology(),
-		NextPodOrdinal: 4,
-		Drift: &DriftContext{
-			Role:             "replica",
-			ReplacementPod:   "redis-4",
-			TargetMasterPod:  "redis-0",
-			BaselineShards:   2,
-			BaselineReplicas: 1,
-		},
+func TestValidate_ForgetNodeAcceptsNonSlotMember(t *testing.T) {
+	ctx := ValidationContext{Spec: spec(), Topology: topology(), NextPodOrdinal: 4}
+	if err := NewValidator().Validate(validReplicaReplacementPlan(), ctx); err != nil {
+		t.Fatalf("expected ForgetNode repair plan to pass, got %v", err)
 	}
+}
+
+func TestValidate_RepairRejectsSkippedNextPodOrdinal(t *testing.T) {
+	ctx := ValidationContext{Spec: spec(), Topology: topology(), NextPodOrdinal: 4}
+	p := validReplicaReplacementPlan()
+	for i := range p.Steps {
+		for _, key := range []string{"pod", "targetPod", "replicaPod"} {
+			if p.Steps[i].Params[key] == "redis-4" {
+				p.Steps[i].Params[key] = "redis-5"
+			}
+		}
+	}
+	if err := NewValidator().Validate(p, ctx); err == nil {
+		t.Fatal("expected repair plan to reject skipped nextPodOrdinal")
+	}
+}
+
+func TestValidate_UsesObservedNodesOverStaleTopology(t *testing.T) {
+	ctx := ValidationContext{
+		Spec:     spec(),
+		Topology: topology(),
+		ObservedNodes: []ObservedNode{
+			{Pod: "redis-0", PodExists: true, RedisSeen: true, NodeID: "node-0", Role: "master", Slots: "0-8191", Ready: true},
+			{Pod: "redis-1", PodExists: true, RedisSeen: true, NodeID: "node-1", Role: "replica", MasterID: "node-0", MasterPod: "redis-0", Ready: true},
+		},
+		NextPodOrdinal: 4,
+	}
+	if err := NewValidator().Validate(validReplicaReplacementPlan(), ctx); err == nil {
+		t.Fatal("expected observed nodes to override stale two-shard topology")
+	}
+}
+
+func TestValidate_DeleteNodeRejectsActiveMember(t *testing.T) {
 	p := &Plan{
 		DSLVersion:       DSLVersion,
-		PlanID:           "repair-1",
+		PlanID:           "delete-active-member",
+		TargetGeneration: 1,
+		Steps: []Step{
+			{ID: "delete", Action: ActionDeleteNode, Params: map[string]any{"namespace": "example", "pod": "redis-1"}},
+			{ID: "verify", Action: ActionVerifyCluster, Params: map[string]any{"expectedShards": 2, "expectedReplicasPerShard": 1, "requireClusterStateOk": true, "requireFullSlotCoverage": true, "requireAllSlotOwnersHaveReplicas": true}},
+		},
+	}
+	ctx := ValidationContext{Spec: spec(), Topology: topology(), NextPodOrdinal: 4}
+	if err := NewValidator().Validate(p, ctx); err == nil {
+		t.Fatal("expected DeleteNode to reject active Redis member")
+	}
+}
+
+func TestValidate_DeleteNodeRejectsUnknownNode(t *testing.T) {
+	p := &Plan{
+		DSLVersion:       DSLVersion,
+		PlanID:           "delete-unknown",
+		TargetGeneration: 1,
+		Steps: []Step{
+			{ID: "delete", Action: ActionDeleteNode, Params: map[string]any{"namespace": "example", "pod": "redis-9"}},
+			{ID: "verify", Action: ActionVerifyCluster, Params: map[string]any{"expectedShards": 2, "expectedReplicasPerShard": 1, "requireClusterStateOk": true, "requireFullSlotCoverage": true, "requireAllSlotOwnersHaveReplicas": true}},
+		},
+	}
+	ctx := ValidationContext{Spec: spec(), Topology: topology(), NextPodOrdinal: 4}
+	if err := NewValidator().Validate(p, ctx); err == nil {
+		t.Fatal("expected DeleteNode to reject unknown node")
+	}
+}
+
+func TestValidate_DeleteNodeAcceptsForgottenNode(t *testing.T) {
+	p := validReplicaReplacementPlan()
+	verify := p.Steps[len(p.Steps)-1]
+	p.Steps = append(p.Steps[:len(p.Steps)-1], Step{ID: "delete", Action: ActionDeleteNode, Params: map[string]any{"namespace": "example", "pod": "redis-1"}}, verify)
+	ctx := ValidationContext{Spec: spec(), Topology: topology(), NextPodOrdinal: 4}
+	if err := NewValidator().Validate(p, ctx); err != nil {
+		t.Fatalf("expected DeleteNode after ForgetNode to pass, got %v", err)
+	}
+}
+
+func TestValidate_DeleteNodeAcceptsNeverJoinedNode(t *testing.T) {
+	p := &Plan{
+		DSLVersion:       DSLVersion,
+		PlanID:           "delete-never-joined",
 		TargetGeneration: 1,
 		Steps: []Step{
 			{ID: "ensure", Action: ActionEnsureNode, Params: map[string]any{"namespace": "example", "pod": "redis-4", "image": "redis:7.2", "memorySize": "2Gi"}},
 			{ID: "wait", Action: ActionWaitNodeReady, Params: map[string]any{"namespace": "example", "pod": "redis-4"}},
-			{ID: "meet", Action: ActionMeetNode, Params: map[string]any{"namespace": "example", "sourcePod": "redis-0", "targetPod": "redis-4"}},
-			{ID: "replicate", Action: ActionReplicateNode, Params: map[string]any{"namespace": "example", "masterPod": "redis-0", "replicaPod": "redis-4"}},
+			{ID: "delete", Action: ActionDeleteNode, Params: map[string]any{"namespace": "example", "pod": "redis-4"}},
 			{ID: "verify", Action: ActionVerifyCluster, Params: map[string]any{"expectedShards": 2, "expectedReplicasPerShard": 1, "requireClusterStateOk": true, "requireFullSlotCoverage": true, "requireAllSlotOwnersHaveReplicas": true}},
 		},
 	}
+	ctx := ValidationContext{Spec: spec(), Topology: topology(), NextPodOrdinal: 4}
 	if err := NewValidator().Validate(p, ctx); err != nil {
-		t.Fatalf("expected drift plan without ForgetNode to pass, got %v", err)
+		t.Fatalf("expected DeleteNode of never-joined node to pass, got %v", err)
+	}
+}
+
+func TestValidate_ForgetNodeRejectsLeavingSlotMasterWithoutReplica(t *testing.T) {
+	p := &Plan{
+		DSLVersion:       DSLVersion,
+		PlanID:           "delete-last-replica",
+		TargetGeneration: 1,
+		Steps: []Step{
+			{ID: "forget", Action: ActionForgetNode, Params: map[string]any{"namespace": "example", "pod": "redis-1"}},
+			{ID: "delete", Action: ActionDeleteNode, Params: map[string]any{"namespace": "example", "pod": "redis-1"}},
+			{ID: "verify", Action: ActionVerifyCluster, Params: map[string]any{"expectedShards": 2, "expectedReplicasPerShard": 1, "requireClusterStateOk": true, "requireFullSlotCoverage": true, "requireAllSlotOwnersHaveReplicas": true}},
+		},
+	}
+	ctx := ValidationContext{Spec: spec(), Topology: topology(), NextPodOrdinal: 4}
+	if err := NewValidator().Validate(p, ctx); err == nil {
+		t.Fatal("expected deleting the last replica to fail")
+	}
+}
+
+func TestValidate_MeetNodeRejectsSelfMeet(t *testing.T) {
+	p := validCreatePlan()
+	p.Steps[stepIndex(t, p, "meet-redis-1")].Params["targetPod"] = "redis-0"
+	if err := NewValidator().Validate(p, spec()); err == nil {
+		t.Fatal("expected self MeetNode to fail")
 	}
 }
 
@@ -380,6 +453,123 @@ func TestValidate_NamespaceMismatch(t *testing.T) {
 	p.Steps[0].Params["namespace"] = "other"
 	if err := NewValidator().Validate(p, spec()); err == nil {
 		t.Fatal("expected error for namespace mismatch")
+	}
+}
+
+func TestValidate_RejectsActionSchemaErrors(t *testing.T) {
+	tests := []struct {
+		name string
+		edit func(*Plan)
+	}{
+		{
+			name: "missing string",
+			edit: func(p *Plan) { delete(p.Steps[0].Params, "image") },
+		},
+		{
+			name: "wrong string type",
+			edit: func(p *Plan) { p.Steps[0].Params["image"] = 7 },
+		},
+		{
+			name: "empty string",
+			edit: func(p *Plan) { p.Steps[0].Params["image"] = "" },
+		},
+		{
+			name: "bad pod name",
+			edit: func(p *Plan) { p.Steps[0].Params["pod"] = "example-0" },
+		},
+		{
+			name: "verify integer missing",
+			edit: func(p *Plan) { delete(p.Steps[stepIndex(t, p, "verify")].Params, "expectedShards") },
+		},
+		{
+			name: "verify integer wrong type",
+			edit: func(p *Plan) { p.Steps[stepIndex(t, p, "verify")].Params["expectedShards"] = "2" },
+		},
+		{
+			name: "verify integer float",
+			edit: func(p *Plan) { p.Steps[stepIndex(t, p, "verify")].Params["expectedShards"] = 2.5 },
+		},
+		{
+			name: "verify bool missing",
+			edit: func(p *Plan) { delete(p.Steps[stepIndex(t, p, "verify")].Params, "requireClusterStateOk") },
+		},
+		{
+			name: "verify bool wrong type",
+			edit: func(p *Plan) { p.Steps[stepIndex(t, p, "verify")].Params["requireClusterStateOk"] = "true" },
+		},
+		{
+			name: "verify bool false",
+			edit: func(p *Plan) { p.Steps[stepIndex(t, p, "verify")].Params["requireClusterStateOk"] = false },
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := validCreatePlan()
+			tt.edit(p)
+			if err := NewValidator().Validate(p, spec()); err == nil {
+				t.Fatal("expected schema error")
+			}
+		})
+	}
+}
+
+func TestValidateStepSchema_Actions(t *testing.T) {
+	valid := []Step{
+		{Action: ActionEnsureNode, Params: map[string]any{"namespace": "example", "pod": "redis-0", "image": "redis:7.2", "memorySize": "2Gi"}},
+		{Action: ActionWaitNodeReady, Params: map[string]any{"namespace": "example", "pod": "redis-0"}},
+		{Action: ActionMeetNode, Params: map[string]any{"namespace": "example", "sourcePod": "redis-0", "targetPod": "redis-1"}},
+		{Action: ActionReplicateNode, Params: map[string]any{"namespace": "example", "masterPod": "redis-0", "replicaPod": "redis-1"}},
+		{Action: ActionAddSlots, Params: map[string]any{"namespace": "example", "pod": "redis-0", "slots": "0-1"}},
+		{Action: ActionMigrateSlots, Params: map[string]any{"namespace": "example", "sourcePod": "redis-0", "targetPod": "redis-2", "slots": "0-1"}},
+		{Action: ActionForgetNode, Params: map[string]any{"namespace": "example", "pod": "redis-1"}},
+		{Action: ActionForgetNode, Params: map[string]any{"namespace": "example", "pod": "redis-1", "lastKnownNodeId": "node-1"}},
+		{Action: ActionDeleteNode, Params: map[string]any{"namespace": "example", "pod": "redis-1"}},
+		{Action: ActionVerifyCluster, Params: map[string]any{"expectedShards": 2, "expectedReplicasPerShard": 1, "requireClusterStateOk": true, "requireFullSlotCoverage": true, "requireAllSlotOwnersHaveReplicas": true}},
+	}
+	for _, step := range valid {
+		if err := validateStepSchema(step); err != nil {
+			t.Fatalf("%s should pass schema validation: %v", step.Action, err)
+		}
+	}
+
+	invalidForget := Step{Action: ActionForgetNode, Params: map[string]any{"namespace": "example", "pod": "redis-1", "lastKnownNodeId": ""}}
+	if err := validateStepSchema(invalidForget); err == nil {
+		t.Fatal("expected empty lastKnownNodeId to fail")
+	}
+}
+
+func TestValidateStepSchema_ActionFailures(t *testing.T) {
+	tests := []struct {
+		name string
+		step Step
+	}{
+		{name: "EnsureNode missing pod", step: Step{Action: ActionEnsureNode, Params: map[string]any{"namespace": "example", "image": "redis:7.2", "memorySize": "2Gi"}}},
+		{name: "EnsureNode bad pod", step: Step{Action: ActionEnsureNode, Params: map[string]any{"namespace": "example", "pod": "example-0", "image": "redis:7.2", "memorySize": "2Gi"}}},
+		{name: "WaitNodeReady missing pod", step: Step{Action: ActionWaitNodeReady, Params: map[string]any{"namespace": "example"}}},
+		{name: "WaitNodeReady bad pod", step: Step{Action: ActionWaitNodeReady, Params: map[string]any{"namespace": "example", "pod": "example-0"}}},
+		{name: "MeetNode missing targetPod", step: Step{Action: ActionMeetNode, Params: map[string]any{"namespace": "example", "sourcePod": "redis-0"}}},
+		{name: "MeetNode bad sourcePod", step: Step{Action: ActionMeetNode, Params: map[string]any{"namespace": "example", "sourcePod": "example-0", "targetPod": "redis-1"}}},
+		{name: "ReplicateNode missing replicaPod", step: Step{Action: ActionReplicateNode, Params: map[string]any{"namespace": "example", "masterPod": "redis-0"}}},
+		{name: "ReplicateNode bad masterPod", step: Step{Action: ActionReplicateNode, Params: map[string]any{"namespace": "example", "masterPod": "example-0", "replicaPod": "redis-1"}}},
+		{name: "AddSlots missing slots", step: Step{Action: ActionAddSlots, Params: map[string]any{"namespace": "example", "pod": "redis-0"}}},
+		{name: "AddSlots bad pod", step: Step{Action: ActionAddSlots, Params: map[string]any{"namespace": "example", "pod": "example-0", "slots": "0-1"}}},
+		{name: "AddSlots invalid slots", step: Step{Action: ActionAddSlots, Params: map[string]any{"namespace": "example", "pod": "redis-0", "slots": "0-99999"}}},
+		{name: "MigrateSlots missing targetPod", step: Step{Action: ActionMigrateSlots, Params: map[string]any{"namespace": "example", "sourcePod": "redis-0", "slots": "0-1"}}},
+		{name: "MigrateSlots bad sourcePod", step: Step{Action: ActionMigrateSlots, Params: map[string]any{"namespace": "example", "sourcePod": "example-0", "targetPod": "redis-2", "slots": "0-1"}}},
+		{name: "MigrateSlots invalid slots", step: Step{Action: ActionMigrateSlots, Params: map[string]any{"namespace": "example", "sourcePod": "redis-0", "targetPod": "redis-2", "slots": "bad"}}},
+		{name: "ForgetNode missing pod", step: Step{Action: ActionForgetNode, Params: map[string]any{"namespace": "example"}}},
+		{name: "ForgetNode bad pod", step: Step{Action: ActionForgetNode, Params: map[string]any{"namespace": "example", "pod": "example-1"}}},
+		{name: "DeleteNode missing pod", step: Step{Action: ActionDeleteNode, Params: map[string]any{"namespace": "example"}}},
+		{name: "DeleteNode bad pod", step: Step{Action: ActionDeleteNode, Params: map[string]any{"namespace": "example", "pod": "example-1"}}},
+		{name: "VerifyCluster missing expectedShards", step: Step{Action: ActionVerifyCluster, Params: map[string]any{"expectedReplicasPerShard": 1, "requireClusterStateOk": true, "requireFullSlotCoverage": true, "requireAllSlotOwnersHaveReplicas": true}}},
+		{name: "VerifyCluster false bool", step: Step{Action: ActionVerifyCluster, Params: map[string]any{"expectedShards": 2, "expectedReplicasPerShard": 1, "requireClusterStateOk": false, "requireFullSlotCoverage": true, "requireAllSlotOwnersHaveReplicas": true}}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := validateStepSchema(tt.step); err == nil {
+				t.Fatal("expected schema error")
+			}
+		})
 	}
 }
 

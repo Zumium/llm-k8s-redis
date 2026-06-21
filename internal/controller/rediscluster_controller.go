@@ -119,16 +119,6 @@ func (r *RedisClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 
 	bumpNextPodOrdinal(&cluster)
 
-	drift, blocked := r.observedDriftContext(ctx, &cluster)
-	if blocked != "" {
-		setCondition(&cluster, ConditionReady, metav1.ConditionFalse, "DriftBlocked", blocked)
-		setCondition(&cluster, ConditionPlanned, metav1.ConditionFalse, "DriftBlocked", blocked)
-		return r.finish(ctx, &cluster, ctrl.Result{RequeueAfter: r.TopologyRefreshInterval}, nil)
-	}
-	if drift != nil && cluster.Status.ActivePlan != nil {
-		drift = nil
-	}
-
 	if r.shouldRefreshTopology(ctx, &cluster) {
 		if err := r.Observer.ObserveTopology(ctx, &cluster); err != nil {
 			logger.Error(err, "lazy topology refresh failed")
@@ -159,9 +149,7 @@ func (r *RedisClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 			setCondition(&cluster, ConditionPlanned, metav1.ConditionFalse, "PlannerEmpty", "planner returned no plan")
 			return r.finish(ctx, &cluster, ctrl.Result{RequeueAfter: 10 * time.Second}, nil)
 		}
-		vctx := validationContext(&cluster, spec)
-		vctx.Drift = drift
-		if err := r.Validator.Validate(newPlan, vctx); err != nil {
+		if err := r.Validator.Validate(newPlan, validationContext(&cluster, spec, nodes)); err != nil {
 			if topologyMatchesSpec(cluster.Status.Topology, spec) {
 				logger.Info("plan rejected but topology already matches spec, marking ready")
 				cluster.Status.ObservedGeneration = cluster.Generation
@@ -339,11 +327,12 @@ func toClusterSpec(c *v1alpha1.RedisCluster) plan.ClusterSpec {
 	}
 }
 
-func validationContext(c *v1alpha1.RedisCluster, spec plan.ClusterSpec) plan.ValidationContext {
+func validationContext(c *v1alpha1.RedisCluster, spec plan.ClusterSpec, nodes []plan.ObservedNode) plan.ValidationContext {
 	return plan.ValidationContext{
 		Spec:           spec,
 		Topology:       toPlanTopology(c.Status.Topology),
 		NextPodOrdinal: int(c.Status.NextPodOrdinal),
+		ObservedNodes:  nodes,
 	}
 }
 
@@ -690,163 +679,4 @@ func controllerRedisPodOrdinal(pod string) (int, bool) {
 		return 0, false
 	}
 	return n, true
-}
-
-type missingTopologyNode struct {
-	pod       string
-	nodeID    string
-	role      string
-	slots     string
-	masterPod string
-}
-
-func (r *RedisClusterReconciler) observedDriftContext(ctx context.Context, c *v1alpha1.RedisCluster) (*plan.DriftContext, string) {
-	if c.Status.Topology == nil || len(c.Status.Topology.Shards) == 0 {
-		return nil, ""
-	}
-	live, ok := r.liveManagedPodNames(ctx, c)
-	if !ok {
-		return nil, ""
-	}
-	missing := []missingTopologyNode{}
-	for _, sh := range c.Status.Topology.Shards {
-		if sh.Master.Pod != "" && sh.Master.NodeID != "" && !live[sh.Master.Pod] {
-			missing = append(missing, missingTopologyNode{pod: sh.Master.Pod, nodeID: sh.Master.NodeID, role: "master", slots: sh.Master.Slots})
-		}
-		for _, rep := range sh.Replicas {
-			if rep.Pod != "" && rep.NodeID != "" && !live[rep.Pod] {
-				missing = append(missing, missingTopologyNode{pod: rep.Pod, nodeID: rep.NodeID, role: "replica", masterPod: sh.Master.Pod})
-			}
-		}
-	}
-	if len(missing) == 0 {
-		return underReplicatedDriftContext(c)
-	}
-	if len(missing) > 1 {
-		return nil, fmt.Sprintf("drift convergence supports one missing pod, found %d", len(missing))
-	}
-	m := missing[0]
-	baselineReplicas, err := statusUniformReplicaCount(c.Status.Topology)
-	if err != nil {
-		return nil, err.Error()
-	}
-	_ = r.Observer.ObserveTopology(ctx, c)
-	targetMaster := ""
-	switch m.role {
-	case "replica":
-		if nodeReadyInTopology(c.Status.Topology, m.masterPod) {
-			targetMaster = m.masterPod
-		}
-	case "master":
-		targetMaster = findFailoverMaster(c.Status.Topology, m.slots)
-	}
-	if targetMaster == "" {
-		return nil, fmt.Sprintf("missing %s pod %s has no healthy convergence target master", m.role, m.pod)
-	}
-	replacement := fmt.Sprintf("redis-%d", c.Status.NextPodOrdinal)
-	return &plan.DriftContext{
-		MissingPod:       m.pod,
-		LastKnownNodeID:  m.nodeID,
-		Role:             m.role,
-		ReplacementPod:   replacement,
-		TargetMasterPod:  targetMaster,
-		BaselineShards:   len(c.Status.Topology.Shards),
-		BaselineReplicas: baselineReplicas,
-	}, ""
-}
-
-func (r *RedisClusterReconciler) liveManagedPodNames(ctx context.Context, c *v1alpha1.RedisCluster) (map[string]bool, bool) {
-	selector, err := labels.Parse(labelCluster + "=" + c.Name)
-	if err != nil {
-		return nil, false
-	}
-	var podList corev1.PodList
-	if err := r.List(ctx, &podList, &client.ListOptions{Namespace: c.Name, LabelSelector: selector}); err != nil {
-		return nil, false
-	}
-	out := map[string]bool{}
-	for i := range podList.Items {
-		out[podList.Items[i].Name] = true
-	}
-	return out, true
-}
-
-func statusUniformReplicaCount(t *v1alpha1.ClusterTopology) (int, error) {
-	if t == nil || len(t.Shards) == 0 {
-		return 0, fmt.Errorf("topology is empty")
-	}
-	want := len(t.Shards[0].Replicas)
-	for _, sh := range t.Shards {
-		if len(sh.Replicas) != want {
-			return 0, fmt.Errorf("topology has non-uniform replica counts")
-		}
-	}
-	return want, nil
-}
-
-func nodeReadyInTopology(t *v1alpha1.ClusterTopology, pod string) bool {
-	if t == nil || pod == "" {
-		return false
-	}
-	for _, sh := range t.Shards {
-		if sh.Master.Pod == pod && sh.Master.Ready {
-			return true
-		}
-	}
-	return false
-}
-
-func findFailoverMaster(t *v1alpha1.ClusterTopology, oldSlots string) string {
-	if t == nil || oldSlots == "" {
-		return ""
-	}
-	oldSet, err := parseSlotSpec(oldSlots)
-	if err != nil || len(oldSet) == 0 {
-		return ""
-	}
-	oldSlotsByNumber := map[int]bool{}
-	for _, s := range oldSet {
-		oldSlotsByNumber[s] = true
-	}
-	for _, sh := range t.Shards {
-		if !sh.Master.Ready || sh.Master.Pod == "" {
-			continue
-		}
-		slots, err := parseSlotSpec(sh.Master.Slots)
-		if err != nil {
-			continue
-		}
-		for _, s := range slots {
-			if oldSlotsByNumber[s] {
-				return sh.Master.Pod
-			}
-		}
-	}
-	return ""
-}
-
-func underReplicatedDriftContext(c *v1alpha1.RedisCluster) (*plan.DriftContext, string) {
-	if c.Status.ObservedGeneration != c.Generation {
-		return nil, ""
-	}
-	t := c.Status.Topology
-	if t == nil {
-		return nil, ""
-	}
-	for _, sh := range t.Shards {
-		if sh.Master.Pod == "" || !sh.Master.Ready || sh.Master.Slots == "" {
-			continue
-		}
-		if len(sh.Replicas) >= int(c.Spec.ReplicasPerShard) {
-			continue
-		}
-		return &plan.DriftContext{
-			Role:             "replica",
-			ReplacementPod:   fmt.Sprintf("redis-%d", c.Status.NextPodOrdinal),
-			TargetMasterPod:  sh.Master.Pod,
-			BaselineShards:   len(t.Shards),
-			BaselineReplicas: int(c.Spec.ReplicasPerShard),
-		}, ""
-	}
-	return nil, ""
 }

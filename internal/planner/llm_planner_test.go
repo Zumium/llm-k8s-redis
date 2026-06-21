@@ -232,7 +232,7 @@ func TestLLMPlanner_PromptContainsSpec(t *testing.T) {
 	if fake.lastReq.System == "" {
 		t.Error("system prompt should not be empty")
 	}
-	for _, want := range []string{"Redis Cluster operations planner", "redis.ops/v1alpha1", "CLUSTER NODES"} {
+	for _, want := range []string{"Redis Cluster operations planner", "redis.ops/v1alpha1", "CLUSTER NODES", "optional last-known node id only when pod is gone"} {
 		if !contains(fake.lastReq.System, want) {
 			t.Errorf("system prompt missing %q", want)
 		}
@@ -240,15 +240,33 @@ func TestLLMPlanner_PromptContainsSpec(t *testing.T) {
 	if fake.lastText == "" {
 		t.Error("user prompt should not be empty")
 	}
-	// The user prompt should contain the spec fields.
-	for _, want := range []string{"example", "redis:7.2", "2Gi", "nextPodOrdinal: 4", "redis-0", "node-a", "master", "0-16383", "connected"} {
+	for _, want := range []string{
+		"RedisCluster name: example",
+		"metadata.generation: 3",
+		"shards: 2",
+		"replicasPerShard: 1",
+		"image: redis:7.2",
+		"memorySize: 2Gi",
+		"nextPodOrdinal: 4",
+		"pod | podExists | redisSeen | nodeId | role | slots | masterId | masterPod | ready | deleting | flags | linkState",
+		"redis-0",
+		"node-a",
+		"master",
+		"0-16383",
+		"connected",
+		"Bring the cluster from the observed state to the desired spec.",
+		"Return only the JSON plan.",
+	} {
 		if !contains(fake.lastText, want) {
 			t.Errorf("user prompt missing %q", want)
 		}
 	}
-	for _, bad := range []string{"Generate a Create plan", "Observed drift", "Live context", "Current topology"} {
+	for _, bad := range []string{"Generate a Create plan", "Observed drift", "Live context", "Current topology", "replacementPod", "single-node drift", "node-id-for-deleted-pod"} {
 		if contains(fake.lastText, bad) {
 			t.Errorf("user prompt should not contain %q", bad)
+		}
+		if contains(fake.lastReq.System, bad) {
+			t.Errorf("system prompt should not contain %q", bad)
 		}
 	}
 }

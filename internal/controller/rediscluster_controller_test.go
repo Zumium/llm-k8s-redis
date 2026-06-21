@@ -276,7 +276,7 @@ func (o *recordingObserver) ObserveTopology(_ context.Context, _ *api.RedisClust
 	return nil
 }
 
-func (o *recordingObserver) CollectObservedNodes(_ context.Context, _ *api.RedisCluster) ([]planner.ObservedNode, error) {
+func (o *recordingObserver) CollectObservedNodes(_ context.Context, _ *api.RedisCluster) ([]plan.ObservedNode, error) {
 	return nil, nil
 }
 
