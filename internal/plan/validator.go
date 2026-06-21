@@ -6,29 +6,10 @@ import (
 	"strings"
 )
 
-var allowedActions = map[ActionType]bool{
-	ActionEnsureNode:    true,
-	ActionWaitNodeReady: true,
-	ActionMeetNode:      true,
-	ActionReplicateNode: true,
-	ActionAddSlots:      true,
-	ActionMigrateSlots:  true,
-	ActionForgetNode:    true,
-	ActionDeleteNode:    true,
-	ActionVerifyCluster: true,
-}
-
-// Validator enforces the deterministic safety invariants described in
-// docs/OPERATIONS.md and docs/ACTIONS.md. It never calls out to the LLM, K8S,
-// or Redis: validation must be fully reproducible from the plan and the spec.
 type Validator struct{}
 
-// NewValidator returns a Validator.
 func NewValidator() *Validator { return &Validator{} }
 
-// Validate runs generic checks that apply to every plan, then validates the
-// action shape against the observed state. It accepts ClusterSpec for callers
-// without topology and ValidationContext for callers that have topology.
 func (v *Validator) Validate(p *Plan, input any) error {
 	ctx, err := validationContext(input)
 	if err != nil {
@@ -50,9 +31,6 @@ func (v *Validator) Validate(p *Plan, input any) error {
 	seen := map[string]bool{}
 	ensurePods := map[string]bool{}
 	for i, s := range p.Steps {
-		if !allowedActions[s.Action] {
-			return fmt.Errorf("step %d: action %q is not in the whitelist", i, s.Action)
-		}
 		if s.ID == "" {
 			return fmt.Errorf("step %d: id is empty", i)
 		}
@@ -63,8 +41,11 @@ func (v *Validator) Validate(p *Plan, input any) error {
 		if err := validateStepSchema(s); err != nil {
 			return fmt.Errorf("step %q: %w", s.ID, err)
 		}
-		if err := validateNamespace(s, spec); err != nil {
-			return fmt.Errorf("step %q: %w", s.ID, err)
+		if s.Action != ActionVerifyCluster {
+			ns, _ := paramString(s.Params, "namespace")
+			if ns != spec.Name {
+				return fmt.Errorf("step %q: namespace %q must equal cluster name %q", s.ID, ns, spec.Name)
+			}
 		}
 		if s.Action == ActionEnsureNode {
 			pod, ok := paramString(s.Params, "pod")
@@ -82,12 +63,12 @@ func (v *Validator) Validate(p *Plan, input any) error {
 	topology := validationTopology(ctx)
 	ctx.Topology = topology
 	if topology == nil || len(topology.Shards) == 0 {
-		if err := validateCreate(p, spec, ensurePods); err != nil {
+		if err := validateCreate(spec, ensurePods); err != nil {
 			return err
 		}
 		return simulatePlan(p, ctx)
 	}
-	if err := validateExistingTopologyPlan(p, spec, &ctx, ensurePods); err != nil {
+	if err := validateExistingTopologyPlan(p, spec, &ctx, topology, ensurePods); err != nil {
 		return err
 	}
 	return simulatePlan(p, ctx)
@@ -147,63 +128,12 @@ func topologyFromObservedNodes(nodes []ObservedNode) *ClusterTopology {
 	return &ClusterTopology{Shards: masters}
 }
 
-// validateNamespace checks that every pod-targeting action carries a namespace
-// param equal to the cluster name. VerifyCluster carries no namespace and is
-// skipped.
-func validateNamespace(s Step, spec ClusterSpec) error {
-	if s.Action == ActionVerifyCluster {
-		return nil
-	}
-	ns, ok := paramString(s.Params, "namespace")
-	if !ok {
-		return fmt.Errorf("missing namespace param")
-	}
-	if ns != spec.Name {
-		return fmt.Errorf("namespace %q must equal cluster name %q", ns, spec.Name)
-	}
-	return nil
-}
-
-func validateCreate(p *Plan, spec ClusterSpec, ensurePods map[string]bool) error {
-	// EnsureNode count must equal shards * (1 + replicasPerShard).
+func validateCreate(spec ClusterSpec, ensurePods map[string]bool) error {
 	want := int(spec.Shards) * (1 + int(spec.ReplicasPerShard))
 	if len(ensurePods) != want {
 		return fmt.Errorf("EnsureNode declared %d distinct pods, expected shards*(1+replicasPerShard)=%d", len(ensurePods), want)
 	}
-	if err := validateCreatePodNames(ensurePods); err != nil {
-		return err
-	}
-
-	// AddSlots must cover 0-16383 exactly once, and target a declared node.
-	covered := map[int]struct{}{}
-	for _, s := range p.Steps {
-		if s.Action != ActionAddSlots {
-			continue
-		}
-		pod, _ := paramString(s.Params, "pod")
-		if !ensurePods[pod] {
-			return fmt.Errorf("step %q: AddSlots target pod %q was not declared by any EnsureNode", s.ID, pod)
-		}
-		slotsStr, ok := paramString(s.Params, "slots")
-		if !ok {
-			return fmt.Errorf("step %q: AddSlots missing slots param", s.ID)
-		}
-		set, err := parseSlots(slotsStr)
-		if err != nil {
-			return fmt.Errorf("step %q: %w", s.ID, err)
-		}
-		for slot := range set {
-			if _, exists := covered[slot]; exists {
-				return fmt.Errorf("step %q: slot %d overlaps a previous AddSlots", s.ID, slot)
-			}
-			covered[slot] = struct{}{}
-		}
-	}
-	if len(covered) != 16384 {
-		return fmt.Errorf("AddSlots must cover all 16384 slots, covered %d", len(covered))
-	}
-
-	return nil
+	return validateCreatePodNames(ensurePods)
 }
 
 func validateStepSchema(s Step) error {
@@ -266,7 +196,7 @@ func validateStepSchema(s Step) error {
 		}
 		return requireTrueBoolParams(s.Params, "requireClusterStateOk", "requireFullSlotCoverage", "requireAllSlotOwnersHaveReplicas")
 	default:
-		return nil
+		return fmt.Errorf("action %q is not in the whitelist", s.Action)
 	}
 }
 
@@ -359,46 +289,30 @@ func validateCreatePodNames(ensurePods map[string]bool) error {
 	return nil
 }
 
-func validateExistingTopologyPlan(p *Plan, spec ClusterSpec, ctx *ValidationContext, ensurePods map[string]bool) error {
-	topology := ctx.Topology
+func validateExistingTopologyPlan(p *Plan, spec ClusterSpec, ctx *ValidationContext, topology *ClusterTopology, ensurePods map[string]bool) error {
 	currentShards := len(topology.Shards)
 	currentReplicas, err := uniformReplicaCount(topology)
 	if err != nil {
-		// Non-uniform topology is only allowed on the heal path: shards count
-		// matches spec, every shard has a ready slot-owning master, slot
-		// coverage is complete, and the cluster is in a recoverable state.
 		if h := healableTopology(topology, spec, ctx.ObservedNodes); h != nil {
-			return validateHealRepair(p, spec, ctx, ensurePods, h)
+			return validateHealRepair(p, spec, ctx, topology, ensurePods, h)
 		}
 		return err
 	}
 	if int(spec.Shards) == currentShards && int(spec.ReplicasPerShard) > currentReplicas {
-		return validateReplicaScaleOut(p, spec, *ctx, ensurePods)
+		return validateReplicaScaleOut(p, spec, *ctx, topology, ensurePods)
 	}
 	if int(spec.Shards) > currentShards && int(spec.ReplicasPerShard) == currentReplicas {
-		return validateShardScaleOut(p, spec, *ctx, ensurePods)
+		return validateShardScaleOut(p, spec, *ctx, topology, ensurePods)
 	}
 	if int(spec.Shards) > currentShards && int(spec.ReplicasPerShard) > currentReplicas {
 		return fmt.Errorf("shards and replicasPerShard cannot both change in one scaleout")
 	}
 	if int(spec.Shards) == currentShards && int(spec.ReplicasPerShard) == currentReplicas {
-		return validateSameSpecRepair(*ctx, ensurePods)
+		return validateSameSpecRepair(*ctx, topology, ensurePods)
 	}
 	return fmt.Errorf("unsupported existing-topology change: spec.shards=%d current=%d spec.replicasPerShard=%d current=%d", spec.Shards, currentShards, spec.ReplicasPerShard, currentReplicas)
 }
 
-// healableTopology inspects a non-uniform topology and decides whether the
-// cluster is in a state the heal path can repair. Returns nil when the state
-// is not healable (caller should surface the original uniformReplicaCount
-// error).
-//
-// Healable criteria (failover recoverable only):
-//   - shard count equals spec
-//   - every shard has a ready, slot-owning master
-//   - slots 0-16383 are covered exactly once across masters
-//   - at least one shard is under-replicated (otherwise it is not a heal case)
-//   - observed nodes reveal at least one ghost (a Redis-seen, slotless node
-//     whose pod is gone or flagged fail). A heal plan must clean these up.
 func healableTopology(topology *ClusterTopology, spec ClusterSpec, observed []ObservedNode) *healState {
 	if topology == nil || int(spec.Shards) != len(topology.Shards) {
 		return nil
@@ -444,9 +358,6 @@ func healableTopology(topology *ClusterTopology, spec ClusterSpec, observed []Ob
 	}
 }
 
-// ghostNodes returns observed nodes that Redis still remembers but that hold no
-// slots and whose pod is gone or Redis has flagged failed. These are leftovers
-// from a master that died and whose replica was auto-promoted by failover.
 func ghostNodes(observed []ObservedNode) []ObservedNode {
 	var out []ObservedNode
 	for _, n := range observed {
@@ -474,24 +385,13 @@ func hasFailFlag(flags []string) bool {
 	return false
 }
 
-// healState summarises what a heal plan must fix.
 type healState struct {
 	underReplicated []ShardTopology
 	ghosts          []ObservedNode
 }
 
-// validateHealRepair checks a plan that repairs a failover-damaged cluster:
-// it replenishes under-replicated shards with new replicas and forgets/deletes
-// ghost nodes left by the dead master.
-//
-// Allowed actions: EnsureNode, WaitNodeReady, MeetNode, ReplicateNode,
-// ForgetNode, DeleteNode, VerifyCluster. AddSlots/MigrateSlots are forbidden
-// because slots are already fully covered and owned by healthy masters.
-func validateHealRepair(p *Plan, spec ClusterSpec, ctx *ValidationContext, ensurePods map[string]bool, h *healState) error {
-	// Heal mode relaxes the "slot-owning master has replica" intermediate
-	// invariant: the cluster starts violating it and the plan restores it.
-	ctx.HealMode = true
-	// Action whitelist.
+func validateHealRepair(p *Plan, spec ClusterSpec, ctx *ValidationContext, topology *ClusterTopology, ensurePods map[string]bool, h *healState) error {
+	ctx.healMode = true
 	for _, s := range p.Steps {
 		switch s.Action {
 		case ActionEnsureNode, ActionWaitNodeReady, ActionMeetNode, ActionReplicateNode, ActionForgetNode, ActionDeleteNode, ActionVerifyCluster:
@@ -500,67 +400,26 @@ func validateHealRepair(p *Plan, spec ClusterSpec, ctx *ValidationContext, ensur
 		}
 	}
 
-	// New pods must be contiguous from nextPodOrdinal.
-	existingPods := topologyPods(ctx.Topology)
+	existingPods := topologyPods(topology)
 	newPods := map[string]bool{}
 	for pod := range ensurePods {
 		if !existingPods[pod] {
 			newPods[pod] = true
 		}
 	}
-	if err := validateSequentialNewPods(existingPods, newPods, effectiveNextPodOrdinal(*ctx)); err != nil {
+	if err := validateSequentialNewPods(existingPods, newPods, effectiveNextPodOrdinal(*ctx, topology)); err != nil {
 		return err
 	}
 
-	// Verify every under-replicated shard gets one new replica per missing slot.
-	replicasByMaster := map[string]int{}
-	replicaTargets := map[string]bool{}
-	masterSet := map[string]bool{}
-	for _, sh := range ctx.Topology.Shards {
-		masterSet[sh.Master.Pod] = true
-	}
-	for i, s := range p.Steps {
-		if s.Action != ActionReplicateNode {
-			continue
-		}
-		masterPod, ok := paramString(s.Params, "masterPod")
-		if !ok || !masterSet[masterPod] {
-			return fmt.Errorf("step %q: masterPod %q is not an existing master", s.ID, masterPod)
-		}
-		replicaPod, ok := paramString(s.Params, "replicaPod")
-		if !ok || !newPods[replicaPod] {
-			return fmt.Errorf("step %q: replicaPod %q is not a new pod", s.ID, replicaPod)
-		}
-		if replicaTargets[replicaPod] {
-			return fmt.Errorf("step %q: replica pod %q is assigned more than once", s.ID, replicaPod)
-		}
-		if !precededAction(p, i, ActionEnsureNode, "pod", replicaPod) {
-			return fmt.Errorf("step %q: replica pod %q missing preceding EnsureNode", s.ID, replicaPod)
-		}
-		if !precededAction(p, i, ActionWaitNodeReady, "pod", replicaPod) {
-			return fmt.Errorf("step %q: replica pod %q missing preceding WaitNodeReady", s.ID, replicaPod)
-		}
-		replicaTargets[replicaPod] = true
-		replicasByMaster[masterPod]++
-	}
 	needByMaster := map[string]int{}
-	wantNewReplicas := 0
 	for _, sh := range h.underReplicated {
 		need := int(spec.ReplicasPerShard) - len(sh.Replicas)
 		needByMaster[sh.Master.Pod] = need
-		wantNewReplicas += need
 	}
-	if len(replicaTargets) != wantNewReplicas {
-		return fmt.Errorf("heal plan assigns %d new replicas, expected %d", len(replicaTargets), wantNewReplicas)
-	}
-	for master, need := range needByMaster {
-		if replicasByMaster[master] != need {
-			return fmt.Errorf("master %q gets %d new replicas, expected %d", master, replicasByMaster[master], need)
-		}
+	if err := validateNewReplicaAssignments(p, needByMaster, newPods, "master", "new replica pod"); err != nil {
+		return err
 	}
 
-	// Verify every ghost node is forgotten. ForgetNode must carry
-	// lastKnownNodeId when the ghost pod no longer exists.
 	ghostSeen := map[string]bool{}
 	for _, g := range h.ghosts {
 		ghostSeen[g.NodeID] = false
@@ -576,8 +435,6 @@ func validateHealRepair(p *Plan, spec ClusterSpec, ctx *ValidationContext, ensur
 			}
 		}
 		if id == "" {
-			// Executor can resolve id from pod when the pod still exists; for
-			// ghosts whose pod is gone we must require lastKnownNodeId.
 			pod, _ := paramString(s.Params, "pod")
 			podStillExists := false
 			for _, g := range h.ghosts {
@@ -602,9 +459,6 @@ func validateHealRepair(p *Plan, spec ClusterSpec, ctx *ValidationContext, ensur
 		}
 	}
 
-	// Ensure the plan only forgets ghosts it declares (no random ForgetNode).
-	// A ForgetNode matches a ghost either by pod name or by lastKnownNodeId,
-	// because a topology refresh may drop the dead pod's name->nodeId mapping.
 	ghostPods := map[string]bool{}
 	ghostIDs := map[string]bool{}
 	for _, g := range h.ghosts {
@@ -633,19 +487,18 @@ func validateHealRepair(p *Plan, spec ClusterSpec, ctx *ValidationContext, ensur
 	return simulatePlan(p, *ctx)
 }
 
-func validateSameSpecRepair(ctx ValidationContext, ensurePods map[string]bool) error {
-	existingPods := topologyPods(ctx.Topology)
+func validateSameSpecRepair(ctx ValidationContext, topology *ClusterTopology, ensurePods map[string]bool) error {
+	existingPods := topologyPods(topology)
 	newPods := map[string]bool{}
 	for pod := range ensurePods {
 		if !existingPods[pod] {
 			newPods[pod] = true
 		}
 	}
-	return validateSequentialNewPods(existingPods, newPods, effectiveNextPodOrdinal(ctx))
+	return validateSequentialNewPods(existingPods, newPods, effectiveNextPodOrdinal(ctx, topology))
 }
 
-func validateReplicaScaleOut(p *Plan, spec ClusterSpec, ctx ValidationContext, ensurePods map[string]bool) error {
-	topology := ctx.Topology
+func validateReplicaScaleOut(p *Plan, spec ClusterSpec, ctx ValidationContext, topology *ClusterTopology, ensurePods map[string]bool) error {
 	currentShards := len(topology.Shards)
 	if int(spec.Shards) != currentShards {
 		return fmt.Errorf("only replica scaleout is supported for existing topology: spec.shards=%d current masters=%d", spec.Shards, currentShards)
@@ -676,50 +529,21 @@ func validateReplicaScaleOut(p *Plan, spec ClusterSpec, ctx ValidationContext, e
 	if len(newPods) != wantNewPods {
 		return fmt.Errorf("EnsureNode declared %d new pods, expected %d new replicas", len(newPods), wantNewPods)
 	}
-	if err := validateSequentialNewPods(existingPods, newPods, effectiveNextPodOrdinal(ctx)); err != nil {
+	if err := validateSequentialNewPods(existingPods, newPods, effectiveNextPodOrdinal(ctx, topology)); err != nil {
 		return err
 	}
 
-	replicasByMaster := map[string]int{}
-	replicaTargets := map[string]bool{}
-	for i, s := range p.Steps {
-		if s.Action != ActionReplicateNode {
-			continue
-		}
-		masterPod, ok := paramString(s.Params, "masterPod")
-		if !ok || !masterPodInTopology(topology, masterPod) {
-			return fmt.Errorf("step %q: masterPod %q is not an existing master", s.ID, masterPod)
-		}
-		replicaPod, ok := paramString(s.Params, "replicaPod")
-		if !ok || !newPods[replicaPod] {
-			return fmt.Errorf("step %q: replicaPod %q is not a new replica pod", s.ID, replicaPod)
-		}
-		if replicaTargets[replicaPod] {
-			return fmt.Errorf("step %q: replica pod %q is assigned more than once", s.ID, replicaPod)
-		}
-		if !precededAction(p, i, ActionEnsureNode, "pod", replicaPod) {
-			return fmt.Errorf("step %q: replica pod %q missing preceding EnsureNode", s.ID, replicaPod)
-		}
-		if !precededAction(p, i, ActionWaitNodeReady, "pod", replicaPod) {
-			return fmt.Errorf("step %q: replica pod %q missing preceding WaitNodeReady", s.ID, replicaPod)
-		}
-		replicaTargets[replicaPod] = true
-		replicasByMaster[masterPod]++
-	}
+	needByMaster := map[string]int{}
 	for _, sh := range topology.Shards {
-		need := int(spec.ReplicasPerShard) - currentReplicas
-		if replicasByMaster[sh.Master.Pod] != need {
-			return fmt.Errorf("master %q gets %d new replicas, expected %d", sh.Master.Pod, replicasByMaster[sh.Master.Pod], need)
-		}
+		needByMaster[sh.Master.Pod] = int(spec.ReplicasPerShard) - currentReplicas
 	}
-	if len(replicaTargets) != wantNewPods {
-		return fmt.Errorf("ReplicateNode assigned %d new replicas, expected %d", len(replicaTargets), wantNewPods)
+	if err := validateNewReplicaAssignments(p, needByMaster, newPods, "existing master", "new replica pod"); err != nil {
+		return err
 	}
 	return nil
 }
 
-func validateShardScaleOut(p *Plan, spec ClusterSpec, ctx ValidationContext, ensurePods map[string]bool) error {
-	topology := ctx.Topology
+func validateShardScaleOut(p *Plan, spec ClusterSpec, ctx ValidationContext, topology *ClusterTopology, ensurePods map[string]bool) error {
 	currentShards := len(topology.Shards)
 	currentReplicas, err := uniformReplicaCount(topology)
 	if err != nil {
@@ -760,7 +584,7 @@ func validateShardScaleOut(p *Plan, spec ClusterSpec, ctx ValidationContext, ens
 	if len(newPods) != wantNewPods {
 		return fmt.Errorf("EnsureNode declared %d new pods, expected %d new shard nodes", len(newPods), wantNewPods)
 	}
-	if err := validateSequentialNewPods(existingPods, newPods, effectiveNextPodOrdinal(ctx)); err != nil {
+	if err := validateSequentialNewPods(existingPods, newPods, effectiveNextPodOrdinal(ctx, topology)); err != nil {
 		return err
 	}
 	newMasters, err := shardScaleOutMasters(p, newPods, ensureOrder, int(spec.Shards)-currentShards)
@@ -851,10 +675,14 @@ func shardScaleOutMasters(p *Plan, newPods map[string]bool, ensureOrder []string
 }
 
 func validateShardScaleOutReplicas(p *Plan, spec ClusterSpec, newPods map[string]bool, newMasters []string) error {
-	masterSet := map[string]bool{}
+	needByMaster := map[string]int{}
 	for _, pod := range newMasters {
-		masterSet[pod] = true
+		needByMaster[pod] = int(spec.ReplicasPerShard)
 	}
+	return validateNewReplicaAssignments(p, needByMaster, newPods, "new shard master", "new replica pod")
+}
+
+func validateNewReplicaAssignments(p *Plan, needByMaster map[string]int, replicaPods map[string]bool, masterLabel, replicaLabel string) error {
 	replicaTargets := map[string]bool{}
 	replicasByMaster := map[string]int{}
 	for i, s := range p.Steps {
@@ -862,12 +690,13 @@ func validateShardScaleOutReplicas(p *Plan, spec ClusterSpec, newPods map[string
 			continue
 		}
 		masterPod, ok := paramString(s.Params, "masterPod")
-		if !ok || !masterSet[masterPod] {
-			return fmt.Errorf("step %q: masterPod %q is not a new shard master", s.ID, masterPod)
+		if !ok || needByMaster[masterPod] == 0 {
+			return fmt.Errorf("step %q: masterPod %q is not a %s", s.ID, masterPod, masterLabel)
 		}
 		replicaPod, ok := paramString(s.Params, "replicaPod")
-		if !ok || !newPods[replicaPod] || masterSet[replicaPod] {
-			return fmt.Errorf("step %q: replicaPod %q is not a new replica pod", s.ID, replicaPod)
+		_, isMaster := needByMaster[replicaPod]
+		if !ok || !replicaPods[replicaPod] || isMaster {
+			return fmt.Errorf("step %q: replicaPod %q is not a %s", s.ID, replicaPod, replicaLabel)
 		}
 		if replicaTargets[replicaPod] {
 			return fmt.Errorf("step %q: replica pod %q is assigned more than once", s.ID, replicaPod)
@@ -881,12 +710,13 @@ func validateShardScaleOutReplicas(p *Plan, spec ClusterSpec, newPods map[string
 		replicaTargets[replicaPod] = true
 		replicasByMaster[masterPod]++
 	}
-	for _, master := range newMasters {
-		if replicasByMaster[master] != int(spec.ReplicasPerShard) {
-			return fmt.Errorf("new master %q gets %d replicas, expected %d", master, replicasByMaster[master], spec.ReplicasPerShard)
+	wantReplicas := 0
+	for master, need := range needByMaster {
+		wantReplicas += need
+		if replicasByMaster[master] != need {
+			return fmt.Errorf("%s %q gets %d replicas, expected %d", masterLabel, master, replicasByMaster[master], need)
 		}
 	}
-	wantReplicas := len(newMasters) * int(spec.ReplicasPerShard)
 	if len(replicaTargets) != wantReplicas {
 		return fmt.Errorf("ReplicateNode assigned %d new replicas, expected %d", len(replicaTargets), wantReplicas)
 	}
@@ -1040,18 +870,6 @@ func topologyPods(topology *ClusterTopology) map[string]bool {
 	return out
 }
 
-func masterPodInTopology(topology *ClusterTopology, pod string) bool {
-	if pod == "" {
-		return false
-	}
-	for _, sh := range topology.Shards {
-		if sh.Master.Pod == pod {
-			return true
-		}
-	}
-	return false
-}
-
 func validateSequentialNewPods(existing, newPods map[string]bool, next int) error {
 	for pod := range existing {
 		if _, ok := redisPodOrdinal(pod); !ok {
@@ -1067,10 +885,10 @@ func validateSequentialNewPods(existing, newPods map[string]bool, next int) erro
 	return nil
 }
 
-func effectiveNextPodOrdinal(ctx ValidationContext) int {
+func effectiveNextPodOrdinal(ctx ValidationContext, topology *ClusterTopology) int {
 	next := ctx.NextPodOrdinal
-	if ctx.Topology != nil {
-		for pod := range topologyPods(ctx.Topology) {
+	if topology != nil {
+		for pod := range topologyPods(topology) {
 			n, ok := redisPodOrdinal(pod)
 			if ok && n >= next {
 				next = n + 1
@@ -1081,14 +899,11 @@ func effectiveNextPodOrdinal(ctx ValidationContext) int {
 }
 
 func redisPodOrdinal(pod string) (int, bool) {
-	i := strings.LastIndex(pod, "-")
-	if i < 0 || i == len(pod)-1 {
+	s, ok := strings.CutPrefix(pod, "redis-")
+	if !ok || s == "" {
 		return 0, false
 	}
-	if pod[:i+1] != "redis-" {
-		return 0, false
-	}
-	n, err := strconv.Atoi(pod[i+1:])
+	n, err := strconv.Atoi(s)
 	if err != nil || n < 0 {
 		return 0, false
 	}
@@ -1109,9 +924,6 @@ func precededAction(p *Plan, stepIndex int, action ActionType, paramKey, paramVa
 	return false
 }
 
-// paramString reads a string-typed param. Non-string values are treated as
-// absent: the DSL requires these fields to be strings, and the schema check is
-// the responsibility of per-action executors for non-string params.
 func paramString(params map[string]any, key string) (string, bool) {
 	if params == nil {
 		return "", false
@@ -1124,7 +936,6 @@ func paramString(params map[string]any, key string) (string, bool) {
 	return s, ok
 }
 
-// parseSlots parses a slot spec like "0-8191" or "0-100,200-300" into a set.
 func parseSlots(s string) (map[int]struct{}, error) {
 	out := map[int]struct{}{}
 	for _, part := range strings.Split(s, ",") {

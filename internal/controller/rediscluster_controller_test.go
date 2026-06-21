@@ -347,6 +347,7 @@ func TestReconcile_DeletesNamespaceOnDeletion(t *testing.T) {
 
 type recordingObserver struct {
 	called int
+	nodes  []plan.ObservedNode
 }
 
 func (o *recordingObserver) ObserveTopology(_ context.Context, _ *api.RedisCluster) error {
@@ -355,7 +356,21 @@ func (o *recordingObserver) ObserveTopology(_ context.Context, _ *api.RedisClust
 }
 
 func (o *recordingObserver) CollectObservedNodes(_ context.Context, _ *api.RedisCluster) ([]plan.ObservedNode, error) {
-	return nil, nil
+	return o.nodes, nil
+}
+
+func observedFromAPITopology(t *api.ClusterTopology) []plan.ObservedNode {
+	var out []plan.ObservedNode
+	if t == nil {
+		return out
+	}
+	for _, sh := range t.Shards {
+		out = append(out, plan.ObservedNode{Pod: sh.Master.Pod, PodExists: true, RedisSeen: true, NodeID: sh.Master.NodeID, Role: "master", Slots: sh.Master.Slots, Ready: sh.Master.Ready})
+		for _, r := range sh.Replicas {
+			out = append(out, plan.ObservedNode{Pod: r.Pod, PodExists: true, RedisSeen: true, NodeID: r.NodeID, Role: "replica", MasterPod: sh.Master.Pod, Ready: r.Ready})
+		}
+	}
+	return out
 }
 
 type recordingPlanner struct {
@@ -803,7 +818,7 @@ func TestReconcile_ReplansAfterStalePlanCleared(t *testing.T) {
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "example"}}).WithStatusSubresource(&api.RedisCluster{}).Build()
 	r := &RedisClusterReconciler{
 		Client: cl, Scheme: scheme, Planner: fp, Executor: NoopExecutor{},
-		Validator: plan.NewValidator(), Observer: &recordingObserver{},
+		Validator: plan.NewValidator(), Observer: &recordingObserver{nodes: observedFromAPITopology(cluster.Status.Topology)},
 		TopologyRefreshInterval: time.Minute, TopologyStaleThreshold: time.Hour,
 	}
 
@@ -894,7 +909,12 @@ func TestReconcile_MissingReplicaRequestsDriftPlan(t *testing.T) {
 	).WithStatusSubresource(&api.RedisCluster{}).Build()
 	r := &RedisClusterReconciler{
 		Client: cl, Scheme: scheme, Planner: fp, Executor: NoopExecutor{},
-		Validator: plan.NewValidator(), Observer: &recordingObserver{},
+		Validator: plan.NewValidator(), Observer: &recordingObserver{nodes: []plan.ObservedNode{
+			{Pod: "redis-0", PodExists: true, RedisSeen: true, NodeID: "master-0", Role: "master", Slots: "0-8191", Ready: true},
+			{Pod: "redis-2", PodExists: true, RedisSeen: true, NodeID: "master-2", Role: "master", Slots: "8192-16383", Ready: true},
+			{Pod: "redis-3", PodExists: true, RedisSeen: true, NodeID: "replica-3", Role: "replica", MasterPod: "redis-2", Ready: true},
+			{Pod: "redis-1", PodExists: false, RedisSeen: true, NodeID: "replica-1", Role: "replica", MasterPod: "redis-0", Flags: []string{"fail"}},
+		}},
 		TopologyRefreshInterval: time.Minute, TopologyStaleThreshold: time.Hour,
 	}
 	res, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "example"}})
@@ -907,8 +927,8 @@ func TestReconcile_MissingReplicaRequestsDriftPlan(t *testing.T) {
 	if fp.called != 1 {
 		t.Fatalf("expected planner call, got %d", fp.called)
 	}
-	if len(fp.lastReq.ObservedState.Nodes) != 0 {
-		t.Fatalf("recording observer should not add observed nodes, got %#v", fp.lastReq.ObservedState.Nodes)
+	if len(fp.lastReq.ObservedState.Nodes) != 4 {
+		t.Fatalf("observed nodes = %#v", fp.lastReq.ObservedState.Nodes)
 	}
 	var got api.RedisCluster
 	if err := cl.Get(ctx, client.ObjectKey{Name: "example"}, &got); err != nil {

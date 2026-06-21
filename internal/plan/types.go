@@ -79,11 +79,7 @@ type ValidationContext struct {
 	Topology       *ClusterTopology
 	NextPodOrdinal int
 	ObservedNodes  []ObservedNode
-	// HealMode relaxes the "slot-owning master must have a replica" invariant
-	// for intermediate steps. It is set only by the heal-repair path, where the
-	// cluster starts in a state that violates the invariant and the plan's job
-	// is to restore it. The final VerifyCluster still enforces the end state.
-	HealMode bool
+	healMode       bool
 }
 
 type ObservedNode struct {

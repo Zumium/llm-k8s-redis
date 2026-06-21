@@ -2,6 +2,10 @@ package plan
 
 import "testing"
 
+func validatePlan(p *Plan, ctx ValidationContext) error {
+	return NewValidator().Validate(p, ctx)
+}
+
 func validCreatePlan() *Plan {
 	return &Plan{
 		DSLVersion:       DSLVersion,
@@ -50,6 +54,21 @@ func topology() *ClusterTopology {
 		{ID: "shard-0", Master: NodeTopology{Pod: "redis-0", Slots: "0-8191", Ready: true}, Replicas: []NodeTopology{{Pod: "redis-1", Ready: true}}},
 		{ID: "shard-1", Master: NodeTopology{Pod: "redis-2", Slots: "8192-16383", Ready: true}, Replicas: []NodeTopology{{Pod: "redis-3", Ready: true}}},
 	}}
+}
+
+func observedFromTopology(t *ClusterTopology) []ObservedNode {
+	var out []ObservedNode
+	for _, sh := range t.Shards {
+		out = append(out, ObservedNode{Pod: sh.Master.Pod, PodExists: true, RedisSeen: true, NodeID: sh.Master.NodeID, Role: "master", Slots: sh.Master.Slots, Ready: sh.Master.Ready})
+		for _, r := range sh.Replicas {
+			out = append(out, ObservedNode{Pod: r.Pod, PodExists: true, RedisSeen: true, NodeID: r.NodeID, Role: "replica", MasterPod: sh.Master.Pod, Ready: r.Ready})
+		}
+	}
+	return out
+}
+
+func ctxWithObservedNodes(spec ClusterSpec, t *ClusterTopology) ValidationContext {
+	return ValidationContext{Spec: spec, ObservedNodes: observedFromTopology(t)}
 }
 
 func validReplicaScaleOutPlan() *Plan {
@@ -107,7 +126,7 @@ func stepIndex(t *testing.T, p *Plan, id string) int {
 }
 
 func TestValidate_ValidCreate(t *testing.T) {
-	if err := NewValidator().Validate(validCreatePlan(), spec()); err != nil {
+	if err := validatePlan(validCreatePlan(), ValidationContext{Spec: spec()}); err != nil {
 		t.Fatalf("expected no error, got %v", err)
 	}
 }
@@ -115,7 +134,7 @@ func TestValidate_ValidCreate(t *testing.T) {
 func TestValidate_CreateRejectsNonRedisPrefixedPods(t *testing.T) {
 	p := validCreatePlan()
 	p.Steps[0].Params["pod"] = "example-0"
-	if err := NewValidator().Validate(p, spec()); err == nil {
+	if err := validatePlan(p, ValidationContext{Spec: spec()}); err == nil {
 		t.Fatal("expected error for non-redis-prefixed pod name")
 	}
 }
@@ -123,7 +142,7 @@ func TestValidate_CreateRejectsNonRedisPrefixedPods(t *testing.T) {
 func TestValidate_CreateRejectsNonContiguousPods(t *testing.T) {
 	p := validCreatePlan()
 	p.Steps[3].Params["pod"] = "redis-4"
-	if err := NewValidator().Validate(p, spec()); err == nil {
+	if err := validatePlan(p, ValidationContext{Spec: spec()}); err == nil {
 		t.Fatal("expected error for non-contiguous pod names")
 	}
 }
@@ -134,7 +153,7 @@ func TestValidate_CreateRejectsPodsNotStartingFromZero(t *testing.T) {
 	p.Steps[1].Params["pod"] = "redis-2"
 	p.Steps[2].Params["pod"] = "redis-3"
 	p.Steps[3].Params["pod"] = "redis-4"
-	if err := NewValidator().Validate(p, spec()); err == nil {
+	if err := validatePlan(p, ValidationContext{Spec: spec()}); err == nil {
 		t.Fatal("expected error for pod names not starting from redis-0")
 	}
 }
@@ -142,21 +161,28 @@ func TestValidate_CreateRejectsPodsNotStartingFromZero(t *testing.T) {
 func TestValidate_CreateRejectsNegativeOrdinal(t *testing.T) {
 	p := validCreatePlan()
 	p.Steps[0].Params["pod"] = "redis--1"
-	if err := NewValidator().Validate(p, spec()); err == nil {
+	if err := validatePlan(p, ValidationContext{Spec: spec()}); err == nil {
 		t.Fatal("expected error for negative ordinal")
 	}
 }
 
 func TestValidate_ValidReplicaScaleOut(t *testing.T) {
-	ctx := ValidationContext{Spec: replicaScaleOutSpec(), Topology: topology()}
-	if err := NewValidator().Validate(validReplicaScaleOutPlan(), ctx); err != nil {
+	ctx := ctxWithObservedNodes(replicaScaleOutSpec(), topology())
+	if err := validatePlan(validReplicaScaleOutPlan(), ctx); err != nil {
 		t.Fatalf("expected no error, got %v", err)
 	}
 }
 
+func TestValidate_UsesTopologyWhenObservedNodesEmpty(t *testing.T) {
+	ctx := ValidationContext{Spec: replicaScaleOutSpec(), Topology: topology()}
+	if err := validatePlan(validReplicaScaleOutPlan(), ctx); err != nil {
+		t.Fatalf("expected topology fallback to pass, got %v", err)
+	}
+}
+
 func TestValidate_ValidShardScaleOut(t *testing.T) {
-	ctx := ValidationContext{Spec: shardScaleOutSpec(), Topology: topology()}
-	if err := NewValidator().Validate(validShardScaleOutPlan(), ctx); err != nil {
+	ctx := ctxWithObservedNodes(shardScaleOutSpec(), topology())
+	if err := validatePlan(validShardScaleOutPlan(), ctx); err != nil {
 		t.Fatalf("expected no error, got %v", err)
 	}
 }
@@ -164,8 +190,8 @@ func TestValidate_ValidShardScaleOut(t *testing.T) {
 func TestValidate_ShardScaleOutRejectsAddSlots(t *testing.T) {
 	p := validShardScaleOutPlan()
 	p.Steps = append(p.Steps[:len(p.Steps)-1], Step{ID: "bad-add-slots", Action: ActionAddSlots, Params: map[string]any{"namespace": "example", "pod": "redis-4", "slots": "10923-10924"}}, p.Steps[len(p.Steps)-1])
-	ctx := ValidationContext{Spec: shardScaleOutSpec(), Topology: topology()}
-	if err := NewValidator().Validate(p, ctx); err == nil {
+	ctx := ctxWithObservedNodes(shardScaleOutSpec(), topology())
+	if err := validatePlan(p, ctx); err == nil {
 		t.Fatal("expected error for AddSlots in shard scaleout")
 	}
 }
@@ -173,8 +199,8 @@ func TestValidate_ShardScaleOutRejectsAddSlots(t *testing.T) {
 func TestValidate_ShardScaleOutRejectsWrongMigrationSlots(t *testing.T) {
 	p := validShardScaleOutPlan()
 	p.Steps[stepIndex(t, p, "migrate-redis-2-redis-4")].Params["slots"] = "10924-16383"
-	ctx := ValidationContext{Spec: shardScaleOutSpec(), Topology: topology()}
-	if err := NewValidator().Validate(p, ctx); err == nil {
+	ctx := ctxWithObservedNodes(shardScaleOutSpec(), topology())
+	if err := validatePlan(p, ctx); err == nil {
 		t.Fatal("expected error for incomplete MigrateSlots matrix")
 	}
 }
@@ -182,8 +208,8 @@ func TestValidate_ShardScaleOutRejectsWrongMigrationSlots(t *testing.T) {
 func TestValidate_ShardScaleOutRejectsShardAndReplicaChange(t *testing.T) {
 	s := shardScaleOutSpec()
 	s.ReplicasPerShard = 2
-	ctx := ValidationContext{Spec: s, Topology: topology()}
-	if err := NewValidator().Validate(validShardScaleOutPlan(), ctx); err == nil {
+	ctx := ctxWithObservedNodes(s, topology())
+	if err := validatePlan(validShardScaleOutPlan(), ctx); err == nil {
 		t.Fatal("expected error when shards and replicasPerShard both change")
 	}
 }
@@ -191,8 +217,8 @@ func TestValidate_ShardScaleOutRejectsShardAndReplicaChange(t *testing.T) {
 func TestValidate_ReplicaScaleOutRejectsSlotActions(t *testing.T) {
 	p := validReplicaScaleOutPlan()
 	p.Steps = append(p.Steps[:len(p.Steps)-1], Step{ID: "bad-add-slots", Action: ActionAddSlots, Params: map[string]any{"namespace": "example", "pod": "redis-0", "slots": "0-1"}}, p.Steps[len(p.Steps)-1])
-	ctx := ValidationContext{Spec: replicaScaleOutSpec(), Topology: topology()}
-	if err := NewValidator().Validate(p, ctx); err == nil {
+	ctx := ctxWithObservedNodes(replicaScaleOutSpec(), topology())
+	if err := validatePlan(p, ctx); err == nil {
 		t.Fatal("expected error for AddSlots in replica scaleout")
 	}
 }
@@ -200,8 +226,8 @@ func TestValidate_ReplicaScaleOutRejectsSlotActions(t *testing.T) {
 func TestValidate_ReplicaScaleOutRejectsShardChange(t *testing.T) {
 	s := replicaScaleOutSpec()
 	s.Shards = 3
-	ctx := ValidationContext{Spec: s, Topology: topology()}
-	if err := NewValidator().Validate(validReplicaScaleOutPlan(), ctx); err == nil {
+	ctx := ctxWithObservedNodes(s, topology())
+	if err := validatePlan(validReplicaScaleOutPlan(), ctx); err == nil {
 		t.Fatal("expected error when shards changes")
 	}
 }
@@ -209,8 +235,8 @@ func TestValidate_ReplicaScaleOutRejectsShardChange(t *testing.T) {
 func TestValidate_ReplicaScaleOutRejectsNonContiguousNewPods(t *testing.T) {
 	p := validReplicaScaleOutPlan()
 	p.Steps[5].Params["pod"] = "redis-6"
-	ctx := ValidationContext{Spec: replicaScaleOutSpec(), Topology: topology()}
-	if err := NewValidator().Validate(p, ctx); err == nil {
+	ctx := ctxWithObservedNodes(replicaScaleOutSpec(), topology())
+	if err := validatePlan(p, ctx); err == nil {
 		t.Fatal("expected error for non-contiguous new pod names")
 	}
 }
@@ -218,8 +244,8 @@ func TestValidate_ReplicaScaleOutRejectsNonContiguousNewPods(t *testing.T) {
 func TestValidate_ReplicaScaleOutRejectsNonRedisPrefixedExistingPods(t *testing.T) {
 	topo := topology()
 	topo.Shards[1].Master.Pod = "redis-example-2"
-	ctx := ValidationContext{Spec: replicaScaleOutSpec(), Topology: topo}
-	if err := NewValidator().Validate(validReplicaScaleOutPlan(), ctx); err == nil {
+	ctx := ctxWithObservedNodes(replicaScaleOutSpec(), topo)
+	if err := validatePlan(validReplicaScaleOutPlan(), ctx); err == nil {
 		t.Fatal("expected error for non-redis-prefixed existing pod")
 	}
 }
@@ -242,7 +268,11 @@ func TestValidate_ReplicaScaleOutRejectsNonContiguousNewPodsDirect(t *testing.T)
 func TestValidate_ReplicaScaleOutUsesNextPodOrdinal(t *testing.T) {
 	topo := topology()
 	topo.Shards[0].Replicas[0].Pod = "redis-4"
-	ctx := ValidationContext{Spec: replicaScaleOutSpec(), Topology: topo, NextPodOrdinal: 5}
+	ctx := func() ValidationContext {
+		ctx := ctxWithObservedNodes(replicaScaleOutSpec(), topo)
+		ctx.NextPodOrdinal = 5
+		return ctx
+	}()
 	p := validReplicaScaleOutPlan()
 	p.Steps[4].Params["pod"] = "redis-5"
 	p.Steps[5].Params["pod"] = "redis-6"
@@ -252,11 +282,11 @@ func TestValidate_ReplicaScaleOutUsesNextPodOrdinal(t *testing.T) {
 	p.Steps[9].Params["targetPod"] = "redis-6"
 	p.Steps[10].Params["replicaPod"] = "redis-5"
 	p.Steps[11].Params["replicaPod"] = "redis-6"
-	if err := NewValidator().Validate(p, ctx); err != nil {
+	if err := validatePlan(p, ctx); err != nil {
 		t.Fatalf("expected next ordinal pods to pass, got %v", err)
 	}
 	p.Steps[4].Params["pod"] = "redis-1"
-	if err := NewValidator().Validate(p, ctx); err == nil {
+	if err := validatePlan(p, ctx); err == nil {
 		t.Fatal("expected reused ordinal to fail")
 	}
 }
@@ -288,21 +318,33 @@ func TestValidate_ForgetNodeRejectsSlotOwner(t *testing.T) {
 			{ID: "verify", Action: ActionVerifyCluster, Params: map[string]any{"expectedShards": 2, "expectedReplicasPerShard": 1, "requireClusterStateOk": true, "requireFullSlotCoverage": true, "requireAllSlotOwnersHaveReplicas": true}},
 		},
 	}
-	ctx := ValidationContext{Spec: spec(), Topology: topology(), NextPodOrdinal: 4}
-	if err := NewValidator().Validate(p, ctx); err == nil {
+	ctx := func() ValidationContext {
+		ctx := ctxWithObservedNodes(spec(), topology())
+		ctx.NextPodOrdinal = 4
+		return ctx
+	}()
+	if err := validatePlan(p, ctx); err == nil {
 		t.Fatal("expected ForgetNode to reject slot owner")
 	}
 }
 
 func TestValidate_ForgetNodeAcceptsNonSlotMember(t *testing.T) {
-	ctx := ValidationContext{Spec: spec(), Topology: topology(), NextPodOrdinal: 4}
-	if err := NewValidator().Validate(validReplicaReplacementPlan(), ctx); err != nil {
+	ctx := func() ValidationContext {
+		ctx := ctxWithObservedNodes(spec(), topology())
+		ctx.NextPodOrdinal = 4
+		return ctx
+	}()
+	if err := validatePlan(validReplicaReplacementPlan(), ctx); err != nil {
 		t.Fatalf("expected ForgetNode repair plan to pass, got %v", err)
 	}
 }
 
 func TestValidate_RepairRejectsSkippedNextPodOrdinal(t *testing.T) {
-	ctx := ValidationContext{Spec: spec(), Topology: topology(), NextPodOrdinal: 4}
+	ctx := func() ValidationContext {
+		ctx := ctxWithObservedNodes(spec(), topology())
+		ctx.NextPodOrdinal = 4
+		return ctx
+	}()
 	p := validReplicaReplacementPlan()
 	for i := range p.Steps {
 		for _, key := range []string{"pod", "targetPod", "replicaPod"} {
@@ -311,23 +353,22 @@ func TestValidate_RepairRejectsSkippedNextPodOrdinal(t *testing.T) {
 			}
 		}
 	}
-	if err := NewValidator().Validate(p, ctx); err == nil {
+	if err := validatePlan(p, ctx); err == nil {
 		t.Fatal("expected repair plan to reject skipped nextPodOrdinal")
 	}
 }
 
-func TestValidate_UsesObservedNodesOverStaleTopology(t *testing.T) {
+func TestValidate_UsesObservedNodes(t *testing.T) {
 	ctx := ValidationContext{
-		Spec:     spec(),
-		Topology: topology(),
+		Spec: spec(),
 		ObservedNodes: []ObservedNode{
 			{Pod: "redis-0", PodExists: true, RedisSeen: true, NodeID: "node-0", Role: "master", Slots: "0-8191", Ready: true},
 			{Pod: "redis-1", PodExists: true, RedisSeen: true, NodeID: "node-1", Role: "replica", MasterID: "node-0", MasterPod: "redis-0", Ready: true},
 		},
 		NextPodOrdinal: 4,
 	}
-	if err := NewValidator().Validate(validReplicaReplacementPlan(), ctx); err == nil {
-		t.Fatal("expected observed nodes to override stale two-shard topology")
+	if err := validatePlan(validReplicaReplacementPlan(), ctx); err == nil {
+		t.Fatal("expected observed nodes to reject mismatched topology")
 	}
 }
 
@@ -341,8 +382,12 @@ func TestValidate_DeleteNodeRejectsActiveMember(t *testing.T) {
 			{ID: "verify", Action: ActionVerifyCluster, Params: map[string]any{"expectedShards": 2, "expectedReplicasPerShard": 1, "requireClusterStateOk": true, "requireFullSlotCoverage": true, "requireAllSlotOwnersHaveReplicas": true}},
 		},
 	}
-	ctx := ValidationContext{Spec: spec(), Topology: topology(), NextPodOrdinal: 4}
-	if err := NewValidator().Validate(p, ctx); err == nil {
+	ctx := func() ValidationContext {
+		ctx := ctxWithObservedNodes(spec(), topology())
+		ctx.NextPodOrdinal = 4
+		return ctx
+	}()
+	if err := validatePlan(p, ctx); err == nil {
 		t.Fatal("expected DeleteNode to reject active Redis member")
 	}
 }
@@ -357,8 +402,12 @@ func TestValidate_DeleteNodeRejectsUnknownNode(t *testing.T) {
 			{ID: "verify", Action: ActionVerifyCluster, Params: map[string]any{"expectedShards": 2, "expectedReplicasPerShard": 1, "requireClusterStateOk": true, "requireFullSlotCoverage": true, "requireAllSlotOwnersHaveReplicas": true}},
 		},
 	}
-	ctx := ValidationContext{Spec: spec(), Topology: topology(), NextPodOrdinal: 4}
-	if err := NewValidator().Validate(p, ctx); err == nil {
+	ctx := func() ValidationContext {
+		ctx := ctxWithObservedNodes(spec(), topology())
+		ctx.NextPodOrdinal = 4
+		return ctx
+	}()
+	if err := validatePlan(p, ctx); err == nil {
 		t.Fatal("expected DeleteNode to reject unknown node")
 	}
 }
@@ -367,8 +416,12 @@ func TestValidate_DeleteNodeAcceptsForgottenNode(t *testing.T) {
 	p := validReplicaReplacementPlan()
 	verify := p.Steps[len(p.Steps)-1]
 	p.Steps = append(p.Steps[:len(p.Steps)-1], Step{ID: "delete", Action: ActionDeleteNode, Params: map[string]any{"namespace": "example", "pod": "redis-1"}}, verify)
-	ctx := ValidationContext{Spec: spec(), Topology: topology(), NextPodOrdinal: 4}
-	if err := NewValidator().Validate(p, ctx); err != nil {
+	ctx := func() ValidationContext {
+		ctx := ctxWithObservedNodes(spec(), topology())
+		ctx.NextPodOrdinal = 4
+		return ctx
+	}()
+	if err := validatePlan(p, ctx); err != nil {
 		t.Fatalf("expected DeleteNode after ForgetNode to pass, got %v", err)
 	}
 }
@@ -385,8 +438,12 @@ func TestValidate_DeleteNodeAcceptsNeverJoinedNode(t *testing.T) {
 			{ID: "verify", Action: ActionVerifyCluster, Params: map[string]any{"expectedShards": 2, "expectedReplicasPerShard": 1, "requireClusterStateOk": true, "requireFullSlotCoverage": true, "requireAllSlotOwnersHaveReplicas": true}},
 		},
 	}
-	ctx := ValidationContext{Spec: spec(), Topology: topology(), NextPodOrdinal: 4}
-	if err := NewValidator().Validate(p, ctx); err != nil {
+	ctx := func() ValidationContext {
+		ctx := ctxWithObservedNodes(spec(), topology())
+		ctx.NextPodOrdinal = 4
+		return ctx
+	}()
+	if err := validatePlan(p, ctx); err != nil {
 		t.Fatalf("expected DeleteNode of never-joined node to pass, got %v", err)
 	}
 }
@@ -402,8 +459,12 @@ func TestValidate_ForgetNodeRejectsLeavingSlotMasterWithoutReplica(t *testing.T)
 			{ID: "verify", Action: ActionVerifyCluster, Params: map[string]any{"expectedShards": 2, "expectedReplicasPerShard": 1, "requireClusterStateOk": true, "requireFullSlotCoverage": true, "requireAllSlotOwnersHaveReplicas": true}},
 		},
 	}
-	ctx := ValidationContext{Spec: spec(), Topology: topology(), NextPodOrdinal: 4}
-	if err := NewValidator().Validate(p, ctx); err == nil {
+	ctx := func() ValidationContext {
+		ctx := ctxWithObservedNodes(spec(), topology())
+		ctx.NextPodOrdinal = 4
+		return ctx
+	}()
+	if err := validatePlan(p, ctx); err == nil {
 		t.Fatal("expected deleting the last replica to fail")
 	}
 }
@@ -411,7 +472,7 @@ func TestValidate_ForgetNodeRejectsLeavingSlotMasterWithoutReplica(t *testing.T)
 func TestValidate_MeetNodeRejectsSelfMeet(t *testing.T) {
 	p := validCreatePlan()
 	p.Steps[stepIndex(t, p, "meet-redis-1")].Params["targetPod"] = "redis-0"
-	if err := NewValidator().Validate(p, spec()); err == nil {
+	if err := validatePlan(p, ValidationContext{Spec: spec()}); err == nil {
 		t.Fatal("expected self MeetNode to fail")
 	}
 }
@@ -419,7 +480,7 @@ func TestValidate_MeetNodeRejectsSelfMeet(t *testing.T) {
 func TestValidate_BadDSLVersion(t *testing.T) {
 	p := validCreatePlan()
 	p.DSLVersion = "wrong"
-	if err := NewValidator().Validate(p, spec()); err == nil {
+	if err := validatePlan(p, ValidationContext{Spec: spec()}); err == nil {
 		t.Fatal("expected error for bad dslVersion")
 	}
 }
@@ -427,7 +488,7 @@ func TestValidate_BadDSLVersion(t *testing.T) {
 func TestValidate_TargetGenerationMismatch(t *testing.T) {
 	p := validCreatePlan()
 	p.TargetGeneration = 2
-	if err := NewValidator().Validate(p, spec()); err == nil {
+	if err := validatePlan(p, ValidationContext{Spec: spec()}); err == nil {
 		t.Fatal("expected error for targetGeneration mismatch")
 	}
 }
@@ -435,7 +496,7 @@ func TestValidate_TargetGenerationMismatch(t *testing.T) {
 func TestValidate_UnknownAction(t *testing.T) {
 	p := validCreatePlan()
 	p.Steps[0].Action = "RunCommand"
-	if err := NewValidator().Validate(p, spec()); err == nil {
+	if err := validatePlan(p, ValidationContext{Spec: spec()}); err == nil {
 		t.Fatal("expected error for non-whitelisted action")
 	}
 }
@@ -443,7 +504,7 @@ func TestValidate_UnknownAction(t *testing.T) {
 func TestValidate_DuplicateStepID(t *testing.T) {
 	p := validCreatePlan()
 	p.Steps[1].ID = "ensure-redis-0"
-	if err := NewValidator().Validate(p, spec()); err == nil {
+	if err := validatePlan(p, ValidationContext{Spec: spec()}); err == nil {
 		t.Fatal("expected error for duplicate step id")
 	}
 }
@@ -451,7 +512,7 @@ func TestValidate_DuplicateStepID(t *testing.T) {
 func TestValidate_NamespaceMismatch(t *testing.T) {
 	p := validCreatePlan()
 	p.Steps[0].Params["namespace"] = "other"
-	if err := NewValidator().Validate(p, spec()); err == nil {
+	if err := validatePlan(p, ValidationContext{Spec: spec()}); err == nil {
 		t.Fatal("expected error for namespace mismatch")
 	}
 }
@@ -506,7 +567,7 @@ func TestValidate_RejectsActionSchemaErrors(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			p := validCreatePlan()
 			tt.edit(p)
-			if err := NewValidator().Validate(p, spec()); err == nil {
+			if err := validatePlan(p, ValidationContext{Spec: spec()}); err == nil {
 				t.Fatal("expected schema error")
 			}
 		})
@@ -576,7 +637,7 @@ func TestValidateStepSchema_ActionFailures(t *testing.T) {
 func TestValidate_EnsureNodeCount(t *testing.T) {
 	s := spec()
 	s.ReplicasPerShard = 2 // want 6 nodes, plan has 4
-	if err := NewValidator().Validate(validCreatePlan(), s); err == nil {
+	if err := validatePlan(validCreatePlan(), ValidationContext{Spec: s}); err == nil {
 		t.Fatal("expected error for EnsureNode count mismatch")
 	}
 }
@@ -584,7 +645,7 @@ func TestValidate_EnsureNodeCount(t *testing.T) {
 func TestValidate_ImageMismatch(t *testing.T) {
 	p := validCreatePlan()
 	p.Steps[0].Params["image"] = "redis:7.0"
-	if err := NewValidator().Validate(p, spec()); err == nil {
+	if err := validatePlan(p, ValidationContext{Spec: spec()}); err == nil {
 		t.Fatal("expected error for image mismatch")
 	}
 }
@@ -593,7 +654,7 @@ func TestValidate_AddSlotsIncompleteCoverage(t *testing.T) {
 	p := validCreatePlan()
 	p.Steps[14].Params["slots"] = "0-4095"
 	p.Steps[15].Params["slots"] = "8192-16383"
-	if err := NewValidator().Validate(p, spec()); err == nil {
+	if err := validatePlan(p, ValidationContext{Spec: spec()}); err == nil {
 		t.Fatal("expected error for incomplete slot coverage")
 	}
 }
@@ -602,7 +663,7 @@ func TestValidate_AddSlotsOverlap(t *testing.T) {
 	p := validCreatePlan()
 	p.Steps[14].Params["slots"] = "0-8192"
 	p.Steps[15].Params["slots"] = "8192-16383"
-	if err := NewValidator().Validate(p, spec()); err == nil {
+	if err := validatePlan(p, ValidationContext{Spec: spec()}); err == nil {
 		t.Fatal("expected error for overlapping slots")
 	}
 }
@@ -610,7 +671,7 @@ func TestValidate_AddSlotsOverlap(t *testing.T) {
 func TestValidate_AddSlotsUndeclaredPod(t *testing.T) {
 	p := validCreatePlan()
 	p.Steps[14].Params["pod"] = "redis-9"
-	if err := NewValidator().Validate(p, spec()); err == nil {
+	if err := validatePlan(p, ValidationContext{Spec: spec()}); err == nil {
 		t.Fatal("expected error for AddSlots targeting undeclared pod")
 	}
 }
@@ -620,7 +681,7 @@ func TestValidate_CreateRejectsAddSlotsBeforeReplica(t *testing.T) {
 	addSlots := p.Steps[stepIndex(t, p, "add-slots-redis-0")]
 	p.Steps = append(p.Steps[:11], append([]Step{addSlots}, p.Steps[11:13]...)...)
 	p.Steps = append(p.Steps, validCreatePlan().Steps[14:]...)
-	if err := NewValidator().Validate(p, spec()); err == nil {
+	if err := validatePlan(p, ValidationContext{Spec: spec()}); err == nil {
 		t.Fatal("expected error for AddSlots before ReplicateNode")
 	}
 }
@@ -629,7 +690,7 @@ func TestValidate_CreateRejectsReplicatingSlotOwner(t *testing.T) {
 	p := validCreatePlan()
 	verify := p.Steps[len(p.Steps)-1]
 	p.Steps = append(p.Steps[:len(p.Steps)-1], Step{ID: "bad-replicate-slot-owner", Action: ActionReplicateNode, Params: map[string]any{"namespace": "example", "masterPod": "redis-2", "replicaPod": "redis-0"}}, verify)
-	if err := NewValidator().Validate(p, spec()); err == nil {
+	if err := validatePlan(p, ValidationContext{Spec: spec()}); err == nil {
 		t.Fatal("expected error for ReplicateNode targeting a slot owner")
 	}
 }
@@ -637,7 +698,7 @@ func TestValidate_CreateRejectsReplicatingSlotOwner(t *testing.T) {
 func TestValidate_CreateRejectsAddSlotsToReplica(t *testing.T) {
 	p := validCreatePlan()
 	p.Steps[stepIndex(t, p, "add-slots-redis-0")].Params["pod"] = "redis-1"
-	if err := NewValidator().Validate(p, spec()); err == nil {
+	if err := validatePlan(p, ValidationContext{Spec: spec()}); err == nil {
 		t.Fatal("expected error for AddSlots targeting a replica")
 	}
 }
@@ -646,7 +707,7 @@ func TestValidate_CreateRejectsMeetBeforeReady(t *testing.T) {
 	p := validCreatePlan()
 	wait := stepIndex(t, p, "wait-redis-1")
 	p.Steps = append(p.Steps[:wait], p.Steps[wait+1:]...)
-	if err := NewValidator().Validate(p, spec()); err == nil {
+	if err := validatePlan(p, ValidationContext{Spec: spec()}); err == nil {
 		t.Fatal("expected error for MeetNode before WaitNodeReady")
 	}
 }
@@ -654,7 +715,7 @@ func TestValidate_CreateRejectsMeetBeforeReady(t *testing.T) {
 func TestValidate_LastStepNotVerify(t *testing.T) {
 	p := validCreatePlan()
 	p.Steps = append(p.Steps, Step{ID: "wait-again", Action: ActionWaitNodeReady, Params: map[string]any{"namespace": "example", "pod": "redis-0"}})
-	if err := NewValidator().Validate(p, spec()); err == nil {
+	if err := validatePlan(p, ValidationContext{Spec: spec()}); err == nil {
 		t.Fatal("expected error when last step is not VerifyCluster")
 	}
 }
@@ -690,8 +751,8 @@ func TestValidate_ReplicaScaleOutRejectsReplicateBeforeReady(t *testing.T) {
 	step := p.Steps[replicate]
 	p.Steps = append(p.Steps[:replicate], p.Steps[replicate+1:]...)
 	p.Steps = append(p.Steps[:wait], append([]Step{step}, p.Steps[wait:]...)...)
-	ctx := ValidationContext{Spec: replicaScaleOutSpec(), Topology: topology()}
-	if err := NewValidator().Validate(p, ctx); err == nil {
+	ctx := ctxWithObservedNodes(replicaScaleOutSpec(), topology())
+	if err := validatePlan(p, ctx); err == nil {
 		t.Fatal("expected error for ReplicateNode before WaitNodeReady")
 	}
 }
@@ -699,8 +760,8 @@ func TestValidate_ReplicaScaleOutRejectsReplicateBeforeReady(t *testing.T) {
 func TestValidate_ReplicaScaleOutRejectsReplicaAssignedToReplica(t *testing.T) {
 	p := validReplicaScaleOutPlan()
 	p.Steps[stepIndex(t, p, "replicate-redis-4")].Params["masterPod"] = "redis-1"
-	ctx := ValidationContext{Spec: replicaScaleOutSpec(), Topology: topology()}
-	if err := NewValidator().Validate(p, ctx); err == nil {
+	ctx := ctxWithObservedNodes(replicaScaleOutSpec(), topology())
+	if err := validatePlan(p, ctx); err == nil {
 		t.Fatal("expected error for assigning replica to non-master")
 	}
 }
@@ -708,8 +769,8 @@ func TestValidate_ReplicaScaleOutRejectsReplicaAssignedToReplica(t *testing.T) {
 func TestValidate_ReplicaScaleOutRejectsUnknownMaster(t *testing.T) {
 	p := validReplicaScaleOutPlan()
 	p.Steps[stepIndex(t, p, "replicate-redis-4")].Params["masterPod"] = "redis-9"
-	ctx := ValidationContext{Spec: replicaScaleOutSpec(), Topology: topology()}
-	if err := NewValidator().Validate(p, ctx); err == nil {
+	ctx := ctxWithObservedNodes(replicaScaleOutSpec(), topology())
+	if err := validatePlan(p, ctx); err == nil {
 		t.Fatal("expected error for assigning replica to unknown master")
 	}
 }
@@ -717,8 +778,8 @@ func TestValidate_ReplicaScaleOutRejectsUnknownMaster(t *testing.T) {
 func TestValidate_ReplicaScaleOutRejectsVerifyMismatch(t *testing.T) {
 	p := validReplicaScaleOutPlan()
 	p.Steps[stepIndex(t, p, "verify")].Params["expectedReplicasPerShard"] = 1
-	ctx := ValidationContext{Spec: replicaScaleOutSpec(), Topology: topology()}
-	if err := NewValidator().Validate(p, ctx); err == nil {
+	ctx := ctxWithObservedNodes(replicaScaleOutSpec(), topology())
+	if err := validatePlan(p, ctx); err == nil {
 		t.Fatal("expected error for VerifyCluster replica mismatch")
 	}
 }
@@ -726,13 +787,6 @@ func TestValidate_ReplicaScaleOutRejectsVerifyMismatch(t *testing.T) {
 // healTopology models a 2-shard cluster after redis-0 (master of shard-0) died
 // and Redis auto-promoted its replica redis-1 to master of slots 0-8191.
 // shard-0 is now under-replicated (0 replicas); redis-0 is a ghost.
-func healTopology() *ClusterTopology {
-	return &ClusterTopology{Shards: []ShardTopology{
-		{ID: "shard-0", Master: NodeTopology{Pod: "redis-1", NodeID: "node-1", Slots: "0-8191", Ready: true}},
-		{ID: "shard-1", Master: NodeTopology{Pod: "redis-2", NodeID: "node-2", Slots: "8192-16383", Ready: true}, Replicas: []NodeTopology{{Pod: "redis-3", NodeID: "node-3", Ready: true}}},
-	}}
-}
-
 // healObservedNodes includes redis-0 as a ghost: Redis still lists it, it owns
 // no slots, its pod is gone, and it carries the fail flag.
 func healObservedNodes() []ObservedNode {
@@ -745,7 +799,7 @@ func healObservedNodes() []ObservedNode {
 }
 
 func healCtx() ValidationContext {
-	return ValidationContext{Spec: spec(), Topology: healTopology(), ObservedNodes: healObservedNodes(), NextPodOrdinal: 4}
+	return ValidationContext{Spec: spec(), ObservedNodes: healObservedNodes(), NextPodOrdinal: 4}
 }
 
 // validHealPlan replenishes shard-0 with a new replica redis-4 and forgets the
@@ -768,7 +822,7 @@ func validHealPlan() *Plan {
 }
 
 func TestValidate_HealRepairAcceptsValidPlan(t *testing.T) {
-	if err := NewValidator().Validate(validHealPlan(), healCtx()); err != nil {
+	if err := validatePlan(validHealPlan(), healCtx()); err != nil {
 		t.Fatalf("expected heal plan to pass, got %v", err)
 	}
 }
@@ -778,7 +832,7 @@ func TestValidate_HealRepairRejectsMissingReplicaReplenish(t *testing.T) {
 	// Drop the EnsureNode/Wait/Meet/Replicate for redis-4 so shard-0 stays
 	// under-replicated.
 	p.Steps = p.Steps[4:]
-	if err := NewValidator().Validate(p, healCtx()); err == nil {
+	if err := validatePlan(p, healCtx()); err == nil {
 		t.Fatal("expected error when heal plan does not replenish under-replicated shard")
 	}
 }
@@ -788,7 +842,7 @@ func TestValidate_HealRepairRejectsMissingGhostForget(t *testing.T) {
 	// Drop the ForgetNode + DeleteNode steps; redis-0 ghost remains.
 	idx := stepIndex(t, p, "forget-redis-0")
 	p.Steps = append(p.Steps[:idx], p.Steps[idx+2:]...)
-	if err := NewValidator().Validate(p, healCtx()); err == nil {
+	if err := validatePlan(p, healCtx()); err == nil {
 		t.Fatal("expected error when heal plan does not forget ghost node")
 	}
 }
@@ -796,7 +850,7 @@ func TestValidate_HealRepairRejectsMissingGhostForget(t *testing.T) {
 func TestValidate_HealRepairRejectsForgetWithoutLastKnownNodeId(t *testing.T) {
 	p := validHealPlan()
 	delete(p.Steps[stepIndex(t, p, "forget-redis-0")].Params, "lastKnownNodeId")
-	if err := NewValidator().Validate(p, healCtx()); err == nil {
+	if err := validatePlan(p, healCtx()); err == nil {
 		t.Fatal("expected error when ForgetNode omits lastKnownNodeId for gone-pod ghost")
 	}
 }
@@ -807,7 +861,7 @@ func TestValidate_HealRepairRejectsAddSlots(t *testing.T) {
 		Step{ID: "addslots-bad", Action: ActionAddSlots, Params: map[string]any{"namespace": "example", "pod": "redis-1", "slots": "0-100"}},
 		p.Steps[len(p.Steps)-1],
 	)
-	if err := NewValidator().Validate(p, healCtx()); err == nil {
+	if err := validatePlan(p, healCtx()); err == nil {
 		t.Fatal("expected error when heal plan contains AddSlots")
 	}
 }
@@ -816,7 +870,7 @@ func TestValidate_HealRepairRejectsNonUniformShardCount(t *testing.T) {
 	// 3 shards in spec but only 2 in topology: not healable, must reject.
 	ctx := healCtx()
 	ctx.Spec = shardScaleOutSpec()
-	if err := NewValidator().Validate(validHealPlan(), ctx); err == nil {
+	if err := validatePlan(validHealPlan(), ctx); err == nil {
 		t.Fatal("expected error when shard count mismatches spec")
 	}
 }
@@ -831,7 +885,7 @@ func TestValidate_HealRepairMatchesGhostByNodeID(t *testing.T) {
 	ghosts[3].Pod = ""
 	ctx := healCtx()
 	ctx.ObservedNodes = ghosts
-	if err := NewValidator().Validate(validHealPlan(), ctx); err != nil {
+	if err := validatePlan(validHealPlan(), ctx); err != nil {
 		t.Fatalf("expected heal plan to pass when ghost matched by nodeId, got %v", err)
 	}
 }

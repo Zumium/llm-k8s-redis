@@ -38,16 +38,21 @@ func newPlanSimulator(ctx ValidationContext) *planSimulator {
 		spec:       ctx.Spec,
 		nodes:      map[string]*simulatedNode{},
 		slotOwners: map[int]string{},
-		healMode:   ctx.HealMode,
+		healMode:   ctx.healMode,
 	}
 	if len(ctx.ObservedNodes) > 0 {
 		s.addObservedNodes(ctx.ObservedNodes)
 		return s
 	}
-	if ctx.Topology == nil {
-		return s
+	s.addTopology(ctx.Topology)
+	return s
+}
+
+func (s *planSimulator) addTopology(topology *ClusterTopology) {
+	if topology == nil {
+		return
 	}
-	for _, sh := range ctx.Topology.Shards {
+	for _, sh := range topology.Shards {
 		m := s.ensureExistingNode(sh.Master.Pod)
 		m.ready = sh.Master.Ready
 		m.clusterMember = true
@@ -66,7 +71,6 @@ func newPlanSimulator(ctx ValidationContext) *planSimulator {
 			replica.replicaOf = sh.Master.Pod
 		}
 	}
-	return s
 }
 
 func (s *planSimulator) addObservedNodes(nodes []ObservedNode) {
