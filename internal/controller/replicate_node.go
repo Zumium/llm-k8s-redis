@@ -4,35 +4,10 @@ import (
 	"context"
 	"fmt"
 
-	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"sigs.k8s.io/controller-runtime/pkg/client"
-
 	v1alpha1 "github.com/example/llm-k8s-redis/api/v1alpha1"
 	"github.com/example/llm-k8s-redis/internal/plan"
 )
 
-// replicateNode is the executor for plan.ActionReplicateNode. It is idempotent
-// and re-derives state from K8S and Redis on every call.
-//
-// Completion criteria:
-//   - masterPod and replicaPod exist as K8S Pods with IPs
-//   - both have been declared by a preceding EnsureNode and passed
-//     WaitNodeReady
-//   - masterPod != replicaPod, namespace == cluster name
-//   - both are visible in the live CLUSTER NODES topology (i.e. MeetNode has
-//     brought them into the same gossip network)
-//   - the replica node currently replicates the target master, OR after
-//     issuing `CLUSTER REPLICATE <masterNodeID>` on the replica it does so
-//
-// Safety: a node that currently owns slots must not be turned into a replica
-// (Redis forbids it and it would lose data). Such a state returns Failed so
-// the plan halts for re-planning instead of silently dropping slots.
-//
-// Topology: replicateNode refreshes NodeID/Ready on any existing
-// status.topology entry that references the two pods, but does not rebuild
-// the shard structure. Topology reconstruction is left to AddSlots and
-// VerifyCluster.
 func (e *ActionExecutor) replicateNode(ctx context.Context, cluster *v1alpha1.RedisCluster, p *plan.Plan, stepIndex int) (StepOutcome, error) {
 	ns, outcome, err, ok := requireString(p.Steps[stepIndex].Params, "namespace")
 	if !ok {
@@ -53,8 +28,8 @@ func (e *ActionExecutor) replicateNode(ctx context.Context, cluster *v1alpha1.Re
 	if masterPod == replicaPod {
 		return paramErr("masterPod %q and replicaPod must differ", masterPod)
 	}
-	masterExists := podInExistingTopology(cluster, masterPod)
-	replicaExists := podInExistingTopology(cluster, replicaPod)
+	masterExists := podInTopology(cluster, masterPod)
+	replicaExists := podInTopology(cluster, replicaPod)
 	if !masterExists && !precededEnsureNode(p, stepIndex, ns, masterPod) {
 		return paramErr("master pod %s/%s was not declared by a preceding EnsureNode", ns, masterPod)
 	}
@@ -68,19 +43,13 @@ func (e *ActionExecutor) replicateNode(ctx context.Context, cluster *v1alpha1.Re
 		return paramErr("replica pod %s/%s has not completed a preceding WaitNodeReady", ns, replicaPod)
 	}
 
-	masterK8SPod := &corev1.Pod{}
-	if err := e.Get(ctx, client.ObjectKey{Namespace: ns, Name: masterPod}, masterK8SPod); err != nil {
-		if apierrors.IsNotFound(err) {
-			return paramErr("master pod %s/%s does not exist", ns, masterPod)
-		}
-		return StepOutcome{Status: plan.StepStateFailed, Message: fmt.Sprintf("get master pod: %v", err)}, err
+	masterK8SPod, outcome, err, ok := e.getPod(ctx, ns, masterPod)
+	if !ok {
+		return outcome, err
 	}
-	replicaK8SPod := &corev1.Pod{}
-	if err := e.Get(ctx, client.ObjectKey{Namespace: ns, Name: replicaPod}, replicaK8SPod); err != nil {
-		if apierrors.IsNotFound(err) {
-			return paramErr("replica pod %s/%s does not exist", ns, replicaPod)
-		}
-		return StepOutcome{Status: plan.StepStateFailed, Message: fmt.Sprintf("get replica pod: %v", err)}, err
+	replicaK8SPod, outcome, err, ok := e.getPod(ctx, ns, replicaPod)
+	if !ok {
+		return outcome, err
 	}
 
 	if masterK8SPod.Status.PodIP == "" {

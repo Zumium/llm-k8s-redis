@@ -5,35 +5,10 @@ import (
 	"fmt"
 	"strings"
 
-	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"sigs.k8s.io/controller-runtime/pkg/client"
-
 	v1alpha1 "github.com/example/llm-k8s-redis/api/v1alpha1"
 	"github.com/example/llm-k8s-redis/internal/plan"
 )
 
-// meetNode is the executor for plan.ActionMeetNode. It is idempotent and
-// re-derives state from K8S and Redis on every call.
-//
-// Completion criteria:
-//   - both sourcePod and targetPod exist as K8S Pods and have IPs
-//   - both have been declared by a preceding EnsureNode
-//   - both have passed a preceding WaitNodeReady (the step is present and
-//     completed earlier in the plan)
-//   - sourcePod != targetPod, namespace == cluster name
-//   - source Redis responds to PING
-//   - target Pod's IP appears in source's `CLUSTER NODES` output
-//
-// If target is already a member of source's gossip network the step is
-// Completed. Otherwise the executor issues `CLUSTER MEET targetIP 6379` on
-// the source node and re-queries `CLUSTER NODES` to confirm propagation. If
-// the target has not yet shown up the step stays Running for the next
-// reconcile.
-//
-// Topology: MeetNode deliberately does not rebuild status.topology. Cluster
-// topology reconstruction is the responsibility of later actions
-// (ReplicateNode/AddSlots/VerifyCluster) once roles and slot ownership exist.
 func (e *ActionExecutor) meetNode(ctx context.Context, cluster *v1alpha1.RedisCluster, p *plan.Plan, stepIndex int) (StepOutcome, error) {
 	ns, outcome, err, ok := requireString(p.Steps[stepIndex].Params, "namespace")
 	if !ok {
@@ -54,8 +29,8 @@ func (e *ActionExecutor) meetNode(ctx context.Context, cluster *v1alpha1.RedisCl
 	if sourcePod == targetPod {
 		return paramErr("sourcePod %q and targetPod must differ", sourcePod)
 	}
-	sourceExists := podInExistingTopology(cluster, sourcePod)
-	targetExists := podInExistingTopology(cluster, targetPod)
+	sourceExists := podInTopology(cluster, sourcePod)
+	targetExists := podInTopology(cluster, targetPod)
 	if !sourceExists && !precededEnsureNode(p, stepIndex, ns, sourcePod) {
 		return paramErr("source pod %s/%s was not declared by a preceding EnsureNode", ns, sourcePod)
 	}
@@ -69,19 +44,13 @@ func (e *ActionExecutor) meetNode(ctx context.Context, cluster *v1alpha1.RedisCl
 		return paramErr("target pod %s/%s has not completed a preceding WaitNodeReady", ns, targetPod)
 	}
 
-	srcPod := &corev1.Pod{}
-	if err := e.Get(ctx, client.ObjectKey{Namespace: ns, Name: sourcePod}, srcPod); err != nil {
-		if apierrors.IsNotFound(err) {
-			return paramErr("source pod %s/%s does not exist", ns, sourcePod)
-		}
-		return StepOutcome{Status: plan.StepStateFailed, Message: fmt.Sprintf("get source pod: %v", err)}, err
+	srcPod, outcome, err, ok := e.getPod(ctx, ns, sourcePod)
+	if !ok {
+		return outcome, err
 	}
-	tgtPod := &corev1.Pod{}
-	if err := e.Get(ctx, client.ObjectKey{Namespace: ns, Name: targetPod}, tgtPod); err != nil {
-		if apierrors.IsNotFound(err) {
-			return paramErr("target pod %s/%s does not exist", ns, targetPod)
-		}
-		return StepOutcome{Status: plan.StepStateFailed, Message: fmt.Sprintf("get target pod: %v", err)}, err
+	tgtPod, outcome, err, ok := e.getPod(ctx, ns, targetPod)
+	if !ok {
+		return outcome, err
 	}
 
 	if srcPod.Status.PodIP == "" {
@@ -124,15 +93,6 @@ func (e *ActionExecutor) meetNode(ctx context.Context, cluster *v1alpha1.RedisCl
 	return running("CLUSTER MEET issued; target %s/%s not yet visible in CLUSTER NODES", ns, targetPod), nil
 }
 
-// precededWaitNodeReady reports whether a WaitNodeReady step before stepIndex
-// in p targeted the same (namespace, pod) and is recorded as Completed. The
-// plan passed to executors carries step state via statusToPlan, but that
-// conversion strips status; the reconciler only calls ExecuteStep for the
-// first non-completed step, so a preceding WaitNodeReady that ran is already
-// Completed in status. To stay executor-side safe without depending on the
-// reconciler's selection, we treat presence of the step before stepIndex as
-// the precondition (matching the Validator's structural checks) and verify
-// reachability via K8S/Redis at runtime instead.
 func precededWaitNodeReady(p *plan.Plan, stepIndex int, ns, podName string) bool {
 	for i := 0; i < stepIndex; i++ {
 		s := p.Steps[i]
@@ -148,11 +108,7 @@ func precededWaitNodeReady(p *plan.Plan, stepIndex int, ns, podName string) bool
 	return false
 }
 
-// podInExistingTopology reports whether podName is already recorded in the
-// cluster's status.topology. Existing nodes do not need preceding EnsureNode or
-// WaitNodeReady steps in the current plan (e.g. when a scale-out plan uses an
-// existing master as the MeetNode source).
-func podInExistingTopology(cluster *v1alpha1.RedisCluster, podName string) bool {
+func podInTopology(cluster *v1alpha1.RedisCluster, podName string) bool {
 	topo := cluster.Status.Topology
 	if topo == nil {
 		return false
@@ -170,10 +126,6 @@ func podInExistingTopology(cluster *v1alpha1.RedisCluster, podName string) bool 
 	return false
 }
 
-// clusterNodesContainsIP reports whether the given IP appears in the
-// `CLUSTER NODES` output. CLUSTER NODES lists each member with its announced
-// host:port (or : port cluster-bus-port format), so matching on the IP string
-// is sufficient for membership detection.
 func clusterNodesContainsIP(nodesOut, ip string) bool {
 	if ip == "" {
 		return false

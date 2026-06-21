@@ -51,7 +51,7 @@ func (e *ActionExecutor) migrateSlots(ctx context.Context, cluster *v1alpha1.Red
 	if !podDeclaredOrInTopology(cluster, p, stepIndex, ns, targetPodName) {
 		return paramErr("target pod %s/%s was not declared by a preceding EnsureNode and is not in topology", ns, targetPodName)
 	}
-	if !precededWaitNodeReady(p, stepIndex, ns, targetPodName) && !podInStatusTopology(cluster, targetPodName) {
+	if !precededWaitNodeReady(p, stepIndex, ns, targetPodName) && !podInTopology(cluster, targetPodName) {
 		return paramErr("target pod %s/%s has not completed a preceding WaitNodeReady", ns, targetPodName)
 	}
 	desired, err := parseSlotSpec(slotsSpec)
@@ -62,11 +62,11 @@ func (e *ActionExecutor) migrateSlots(ctx context.Context, cluster *v1alpha1.Red
 		return paramErr("slots %q contains no slot numbers", slotsSpec)
 	}
 
-	sourcePod, outcome, err, ok := e.getActionPod(ctx, ns, sourcePodName)
+	sourcePod, outcome, err, ok := e.getPod(ctx, ns, sourcePodName)
 	if !ok {
 		return outcome, err
 	}
-	targetPod, outcome, err, ok := e.getActionPod(ctx, ns, targetPodName)
+	targetPod, outcome, err, ok := e.getPod(ctx, ns, targetPodName)
 	if !ok {
 		return outcome, err
 	}
@@ -192,7 +192,7 @@ func (e *ActionExecutor) migrateSlots(ctx context.Context, cluster *v1alpha1.Red
 	return completed("slots %s migrated from %s/%s to %s/%s", slotsSpec, ns, sourcePodName, ns, targetPodName), nil
 }
 
-func (e *ActionExecutor) getActionPod(ctx context.Context, ns, podName string) (*corev1.Pod, StepOutcome, error, bool) {
+func (e *ActionExecutor) getPod(ctx context.Context, ns, podName string) (*corev1.Pod, StepOutcome, error, bool) {
 	pod := &corev1.Pod{}
 	if err := e.Get(ctx, client.ObjectKey{Namespace: ns, Name: podName}, pod); err != nil {
 		if apierrors.IsNotFound(err) {
@@ -205,24 +205,7 @@ func (e *ActionExecutor) getActionPod(ctx context.Context, ns, podName string) (
 }
 
 func podDeclaredOrInTopology(cluster *v1alpha1.RedisCluster, p *plan.Plan, stepIndex int, ns, podName string) bool {
-	return precededEnsureNode(p, stepIndex, ns, podName) || podInStatusTopology(cluster, podName)
-}
-
-func podInStatusTopology(cluster *v1alpha1.RedisCluster, podName string) bool {
-	if cluster.Status.Topology == nil {
-		return false
-	}
-	for _, sh := range cluster.Status.Topology.Shards {
-		if sh.Master.Pod == podName {
-			return true
-		}
-		for _, r := range sh.Replicas {
-			if r.Pod == podName {
-				return true
-			}
-		}
-	}
-	return false
+	return precededEnsureNode(p, stepIndex, ns, podName) || podInTopology(cluster, podName)
 }
 
 type slotMigrationMarker struct {

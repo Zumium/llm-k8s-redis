@@ -11,30 +11,6 @@ import (
 	"github.com/example/llm-k8s-redis/internal/plan"
 )
 
-// verifyCluster is the executor for plan.ActionVerifyCluster. It does NOT
-// mutate the Redis Cluster topology; it only observes, validates and refreshes
-// status.topology + the Healthy condition.
-//
-// Completion criteria (all must hold):
-//   - params match the live RedisCluster spec: expectedShards == spec.shards,
-//     expectedReplicasPerShard == spec.replicasPerShard, and the three
-//     require* flags are all true
-//   - at least one managed Pod is Ready with a PodIP (a usable seed)
-//   - the seed Redis responds to PING
-//   - CLUSTER INFO reports cluster_state:ok
-//   - CLUSTER NODES can be parsed
-//   - the number of healthy masters equals expectedShards
-//   - every healthy master has exactly expectedReplicasPerShard healthy
-//     replicas
-//   - every slot 0..16383 is owned by exactly one healthy master
-//   - no slot is in a migrating/importing state
-//   - every Redis node can be mapped back to a managed K8S Pod by IP
-//
-// On success the executor rebuilds status.topology from the live Redis state
-// and sets the Healthy condition to True. Any transient observation failure
-// (no seed, PING fail, CLUSTER INFO/NODES error, non-ok cluster_state) keeps
-// the step Running so the reconciler retries; any structural invariant
-// violation fails the step.
 func (e *ActionExecutor) verifyCluster(ctx context.Context, cluster *v1alpha1.RedisCluster, _ *plan.Plan, step plan.Step) (StepOutcome, error) {
 	expectedShards, outcome, err, ok := paramInt(step.Params, "expectedShards")
 	if !ok {
@@ -119,10 +95,6 @@ func (e *ActionExecutor) verifyCluster(ctx context.Context, cluster *v1alpha1.Re
 	return completed("cluster verified: %d masters, %d replicas/master, full slot coverage", expectedShards, expectedReplicas), nil
 }
 
-// firstUnhealthyManagedNode returns a short description of the first entry
-// that is not in handshake state but is failed or disconnected, or "" if all
-// managed nodes are healthy. Handshake/noaddr nodes are ignored: they may
-// appear transiently and are not part of the cluster's persistent topology.
 func firstUnhealthyManagedNode(entries []clusterNodeEntry) string {
 	for _, e := range entries {
 		if e.hasFlag("handshake") || e.hasFlag("noaddr") {
@@ -135,9 +107,6 @@ func firstUnhealthyManagedNode(entries []clusterNodeEntry) string {
 	return ""
 }
 
-// verifyFullSlotCoverage checks that every slot 0..16383 is owned and that
-// the owner is a healthy master. It returns a non-empty violation message on
-// the first problem, or "" if coverage is complete.
 func verifyFullSlotCoverage(owner map[int]string, entries []clusterNodeEntry) string {
 	mastersByID := map[string]*clusterNodeEntry{}
 	for i := range entries {
@@ -161,9 +130,6 @@ func verifyFullSlotCoverage(owner map[int]string, entries []clusterNodeEntry) st
 	return ""
 }
 
-// firstUnmappedNode returns a description of the first non-handshake cluster
-// node whose IP does not correspond to any managed Pod, or "" if all are
-// mapped. This guards against foreign nodes leaking into the cluster.
 func firstUnmappedNode(entries []clusterNodeEntry, podsByIP map[string]*corev1.Pod) string {
 	for _, e := range entries {
 		if e.hasFlag("handshake") || e.hasFlag("noaddr") {

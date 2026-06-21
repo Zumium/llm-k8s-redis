@@ -1,11 +1,3 @@
-// Package controller implements the RedisCluster reconciler.
-//
-// The reconciler is intentionally agnostic of how plans are produced and how
-// steps are executed: it wires a Planner (LLM-backed), a deterministic
-// Validator, and an Executor (Redis action executors) through interfaces. This
-// file contains the reconciliation flow and the K8S-level housekeeping
-// (finalizer, namespace ownership, status persistence) that does not depend on
-// Redis specifics.
 package controller
 
 import (
@@ -36,7 +28,6 @@ import (
 )
 
 const (
-	// finalizer gates cluster deletion until the owned namespace is gone.
 	finalizer = "redis.example.com/redis-cluster-finalizer"
 
 	statusConflictRequeueAfter = time.Second
@@ -46,46 +37,29 @@ const (
 	ConditionHealthy = "Healthy"
 )
 
-// RedisClusterReconciler reconciles a RedisCluster object by requesting a plan
-// from the Planner, validating it, persisting it into status.activePlan, and
-// driving the Executor one pending step per reconcile.
 type RedisClusterReconciler struct {
 	client.Client
 	Scheme                  *runtime.Scheme
 	Planner                 planner.Planner
-	Executor                Executor
-	Observer                Observer
-	Validator               Validator
+	Driver                  Driver
+	ValidatePlan            func(*plan.Plan, any) error
 	Recorder                events.EventRecorder
 	TopologyRefreshInterval time.Duration
 	TopologyStaleThreshold  time.Duration
 	PlanValidationRetries   int
 }
 
-// Reconcile advances a RedisCluster by at most one plan step.
-//
-// Flow:
-//  1. Fetch the RedisCluster (cluster-scoped).
-//  2. If deleting, drain the owned namespace then remove the finalizer.
-//  3. Ensure the finalizer and the dedicated namespace (name == cluster name).
-//  4. If no active plan, ask the Planner, validate, persist activePlan.
-//  5. Otherwise execute the next pending step and record its outcome.
-//
-// Each reconcile performs at most one mutating K8S write plus one status write.
 func (r *RedisClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx).WithValues("rediscluster", req.NamespacedName)
 
 	if r.Planner == nil {
 		r.Planner = planner.NoopPlanner{}
 	}
-	if r.Executor == nil {
-		r.Executor = NoopExecutor{}
+	if r.Driver == nil {
+		r.Driver = &ActionExecutor{Client: r.Client, Scheme: r.Scheme}
 	}
-	if r.Observer == nil {
-		r.Observer = noopObserver{}
-	}
-	if r.Validator == nil {
-		r.Validator = plan.NewValidator()
+	if r.ValidatePlan == nil {
+		r.ValidatePlan = plan.NewValidator().Validate
 	}
 	if r.TopologyRefreshInterval <= 0 {
 		r.TopologyRefreshInterval = 60 * time.Second
@@ -121,7 +95,7 @@ func (r *RedisClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	bumpNextPodOrdinal(&cluster)
 
 	if r.shouldRefreshTopology(ctx, &cluster) {
-		if err := r.Observer.ObserveTopology(ctx, &cluster); err != nil {
+		if err := r.Driver.ObserveTopology(ctx, &cluster); err != nil {
 			logger.Error(err, "lazy topology refresh failed")
 		}
 	}
@@ -130,12 +104,10 @@ func (r *RedisClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 
 	active := cluster.Status.ActivePlan
 
-	// Running plan: execute one step and do not interfere.
 	if active != nil && planState(active) == plan.PlanStateRunning {
 		return r.executeNextStep(ctx, &cluster, active)
 	}
 
-	// Completed / Failed / absent plan: decide whether a new plan is needed.
 	if active != nil {
 		if active.TargetGeneration != cluster.Generation {
 			cluster.Status.ActivePlan = nil
@@ -171,7 +143,6 @@ func (r *RedisClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		}
 	}
 
-	// No active plan: produce, validate and persist one.
 	if cluster.Status.ActivePlan == nil {
 		return r.reconcilePlan(ctx, &cluster, spec)
 	}
@@ -179,13 +150,11 @@ func (r *RedisClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	return r.finish(ctx, &cluster, ctrl.Result{RequeueAfter: r.TopologyRefreshInterval}, nil)
 }
 
-// reconcilePlan produces, validates and persists a new active plan when none
-// exists. It is called only when cluster.Status.ActivePlan is nil.
 func (r *RedisClusterReconciler) reconcilePlan(ctx context.Context, cluster *v1alpha1.RedisCluster, spec plan.ClusterSpec) (ctrl.Result, error) {
 	logger := log.FromContext(ctx).WithValues("rediscluster", cluster.Name)
 
 	req := toPlannerRequest(cluster, spec)
-	nodes, err := r.Observer.CollectObservedNodes(ctx, cluster)
+	nodes, err := r.Driver.CollectObservedNodes(ctx, cluster)
 	if err != nil {
 		logger.Error(err, "collect observed nodes failed")
 		setCondition(cluster, ConditionPlanned, metav1.ConditionFalse, "ObservedNodesFailed", err.Error())
@@ -210,7 +179,7 @@ func (r *RedisClusterReconciler) reconcilePlan(ctx context.Context, cluster *v1a
 			setCondition(cluster, ConditionPlanned, metav1.ConditionFalse, "PlannerEmpty", "planner returned no plan")
 			return r.finish(ctx, cluster, ctrl.Result{RequeueAfter: 10 * time.Second}, nil)
 		}
-		if err := r.Validator.Validate(newPlan, validationContext(cluster, spec, nodes)); err != nil {
+		if err := r.ValidatePlan(newPlan, validationContext(cluster, spec, nodes)); err != nil {
 			if topologyMatchesSpec(cluster.Status.Topology, spec) {
 				logger.Info("plan rejected but topology already matches spec, marking ready")
 				cluster.Status.ObservedGeneration = cluster.Generation
@@ -239,11 +208,9 @@ func (r *RedisClusterReconciler) reconcilePlan(ctx context.Context, cluster *v1a
 		return r.finish(ctx, cluster, ctrl.Result{Requeue: true}, nil)
 	}
 
-	// The retry loop always returns; this line is unreachable.
 	return r.finish(ctx, cluster, ctrl.Result{RequeueAfter: r.TopologyRefreshInterval}, nil)
 }
 
-// executeNextStep drives the next pending step of a running plan.
 func (r *RedisClusterReconciler) executeNextStep(ctx context.Context, cluster *v1alpha1.RedisCluster, active *v1alpha1.PlanStatus) (ctrl.Result, error) {
 	idx := nextPendingStep(active)
 	if idx < 0 {
@@ -258,7 +225,7 @@ func (r *RedisClusterReconciler) executeNextStep(ctx context.Context, cluster *v
 		setCondition(cluster, ConditionReady, metav1.ConditionFalse, "PlanRestoreFailed", err.Error())
 		return r.finish(ctx, cluster, ctrl.Result{}, nil)
 	}
-	outcome, err := r.Executor.ExecuteStep(ctx, cluster, planModel, idx)
+	outcome, err := r.Driver.ExecuteStep(ctx, cluster, planModel, idx)
 	if err != nil {
 		setStep(active, idx, string(plan.StepStateFailed), err.Error())
 		active.CurrentStep = step.ID
@@ -281,8 +248,6 @@ func (r *RedisClusterReconciler) executeNextStep(ctx context.Context, cluster *v
 	}
 }
 
-// ensureNamespace makes sure a namespace named after the cluster exists and is
-// owned by the RedisCluster CR, so that K8S garbage-collects it on deletion.
 func (r *RedisClusterReconciler) ensureNamespace(ctx context.Context, cluster *v1alpha1.RedisCluster) error {
 	var ns corev1.Namespace
 	err := r.Get(ctx, client.ObjectKey{Name: cluster.Name}, &ns)
@@ -307,8 +272,6 @@ func (r *RedisClusterReconciler) ensureNamespace(ctx context.Context, cluster *v
 	return r.Create(ctx, nsObj)
 }
 
-// reconcileDelete waits for the dedicated namespace to be torn down, then
-// removes the finalizer so the RedisCluster CR itself can be collected.
 func (r *RedisClusterReconciler) reconcileDelete(ctx context.Context, cluster *v1alpha1.RedisCluster) (ctrl.Result, error) {
 	if !controllerutil.ContainsFinalizer(cluster, finalizer) {
 		return ctrl.Result{}, nil
@@ -333,7 +296,6 @@ func (r *RedisClusterReconciler) reconcileDelete(ctx context.Context, cluster *v
 	return ctrl.Result{}, nil
 }
 
-// finish persists status when dirty and returns the reconcile result.
 func (r *RedisClusterReconciler) finish(ctx context.Context, cluster *v1alpha1.RedisCluster, res ctrl.Result, err error) (ctrl.Result, error) {
 	if uerr := r.Status().Update(ctx, cluster); uerr != nil && err == nil {
 		if apierrors.IsConflict(uerr) {
@@ -350,8 +312,6 @@ func (r *RedisClusterReconciler) event(cluster *v1alpha1.RedisCluster, reason, m
 	}
 }
 
-// SetupWithManager registers the reconciler, watching the RedisCluster and the
-// namespace/pod resources it owns.
 func (r *RedisClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&v1alpha1.RedisCluster{}).
@@ -439,8 +399,6 @@ func setStep(ps *v1alpha1.PlanStatus, idx int, status, msg string) {
 	s.Message = msg
 }
 
-// nextPendingStep returns the index of the first non-completed step, or -1 if
-// the plan is complete or halted on a failed step.
 func nextPendingStep(ps *v1alpha1.PlanStatus) int {
 	for i, s := range ps.Steps {
 		if s.Status == string(plan.StepStateFailed) {
@@ -453,15 +411,6 @@ func nextPendingStep(ps *v1alpha1.PlanStatus) int {
 	return -1
 }
 
-// shouldRefreshTopology decides whether a lazy observe-only refresh of
-// status.topology is appropriate right now. It skips refresh when a plan is
-// actively executing, when the cluster has not yet bootstrapped a topology,
-// or when the last observation is still fresh enough.
-//
-// Pod-set drift bypasses the stale threshold: if the managed Pods (names or
-// Ready states) no longer match what status.topology recorded, the next
-// reconcile forces an immediate ObserveTopology so Pod deletion/status flips
-// are reflected without waiting for the stale gate or the slow requeue.
 func (r *RedisClusterReconciler) shouldRefreshTopology(ctx context.Context, c *v1alpha1.RedisCluster) bool {
 	if c.Status.Topology == nil {
 		return false
@@ -477,12 +426,6 @@ func (r *RedisClusterReconciler) shouldRefreshTopology(ctx context.Context, c *v
 	return elapsed >= r.TopologyStaleThreshold
 }
 
-// podSetDrifted reports whether the live managed Pod set (names + Ready
-// states) differs from what status.topology last recorded. A List error is
-// treated as "no drift" so a transient cache failure does not force a Redis
-// observe on every reconcile. A nil topology is treated as "no drift" so the
-// caller can delegate the nil-guard to shouldRefreshTopology without
-// duplicating it here.
 func (r *RedisClusterReconciler) podSetDrifted(ctx context.Context, c *v1alpha1.RedisCluster) bool {
 	if c.Status.Topology == nil {
 		return false
@@ -503,7 +446,6 @@ func (r *RedisClusterReconciler) podSetDrifted(ctx context.Context, c *v1alpha1.
 	return !maps.Equal(live, want)
 }
 
-// livePodSignature builds a {podName -> ready} signature from the live Pods.
 func livePodSignature(pods []corev1.Pod) map[string]bool {
 	out := map[string]bool{}
 	for i := range pods {
@@ -512,10 +454,6 @@ func livePodSignature(pods []corev1.Pod) map[string]bool {
 	return out
 }
 
-// topologyPodSignature builds a {podName -> ready} signature from the last
-// observed topology. Entries with an empty Pod name (e.g. a Redis node the
-// controller has not yet mapped to a K8S Pod) are skipped so they do not
-// mask a real drift.
 func topologyPodSignature(topo *v1alpha1.ClusterTopology) map[string]bool {
 	out := map[string]bool{}
 	if topo == nil {
@@ -543,7 +481,6 @@ func planState(ps *v1alpha1.PlanStatus) plan.PlanState {
 		case string(plan.StepStateFailed):
 			hasFailed, allDone = true, false
 		case string(plan.StepStateCompleted):
-			// completed
 		default:
 			allDone = false
 		}

@@ -34,17 +34,6 @@ const (
 	annMaxmemory  = "redis.example.com/maxmemory-bytes"
 )
 
-// ensureNode is the executor for plan.ActionEnsureNode. It is idempotent:
-//
-//  1. Validate params (namespace/pod/image/memorySize) and re-check the
-//     safety invariants against the live RedisCluster spec.
-//  2. Ensure the Pod exists with the desired spec (image, args, resources,
-//     ownerReference, labels, annotations). Missing metadata is patched in;
-//     immutable spec drift (image/args/resources) fails the step.
-//  3. Once the Pod has an IP and Redis responds to PING, ensure maxmemory
-//     matches spec.memorySize via CONFIG GET/SET.
-//
-// Until step 3 completes the step stays Running so the reconciler retries.
 func (e *ActionExecutor) ensureNode(ctx context.Context, cluster *v1alpha1.RedisCluster, step plan.Step) (StepOutcome, error) {
 	ns, outcome, err, ok := requireString(step.Params, "namespace")
 	if !ok {
@@ -90,8 +79,6 @@ func (e *ActionExecutor) ensureNode(ctx context.Context, cluster *v1alpha1.Redis
 	}
 }
 
-// createPod builds and creates the desired Pod, then returns Running because
-// the Pod has no IP yet; maxmemory is configured once Redis is reachable.
 func (e *ActionExecutor) createPod(ctx context.Context, cluster *v1alpha1.RedisCluster, ns, podName, image, memorySize string, wantBytes int64) (StepOutcome, error) {
 	pod := desiredPod(cluster, ns, podName, image, memorySize, wantBytes)
 	if err := ctrl.SetControllerReference(cluster, pod, e.Scheme); err != nil {
@@ -103,8 +90,6 @@ func (e *ActionExecutor) createPod(ctx context.Context, cluster *v1alpha1.RedisC
 	return running("pod %s/%s created; waiting for pod IP and redis", ns, podName), nil
 }
 
-// reconcileExistingPod verifies an existing Pod matches the desired state,
-// patches missing metadata, then drives the Redis maxmemory check.
 func (e *ActionExecutor) reconcileExistingPod(ctx context.Context, cluster *v1alpha1.RedisCluster, pod *corev1.Pod, image, memorySize string, wantBytes int64) (StepOutcome, error) {
 	if !metav1.IsControlledBy(pod, cluster) {
 		patched := pod.DeepCopy()
@@ -128,8 +113,6 @@ func (e *ActionExecutor) reconcileExistingPod(ctx context.Context, cluster *v1al
 	return e.ensureMaxmemory(ctx, pod, wantBytes)
 }
 
-// ensureMaxmemory waits for the Pod to have an IP and for Redis to respond,
-// then makes sure CONFIG maxmemory equals wantBytes.
 func (e *ActionExecutor) ensureMaxmemory(ctx context.Context, pod *corev1.Pod, wantBytes int64) (StepOutcome, error) {
 	addr := podRedisAddr(pod)
 	if addr == "" {
@@ -172,7 +155,6 @@ func (e *ActionExecutor) ensureMaxmemory(ctx context.Context, pod *corev1.Pod, w
 	return completed("pod %s/%s ready; maxmemory set to %d", pod.Namespace, pod.Name, wantBytes), nil
 }
 
-// desiredPod builds the Pod object the controller manages for a Redis node.
 func desiredPod(cluster *v1alpha1.RedisCluster, ns, podName, image, memorySize string, wantBytes int64) *corev1.Pod {
 	labels := nodeLabels(cluster.Name, podName)
 	annotations := nodeAnnotations(image, memorySize, wantBytes)
@@ -252,9 +234,6 @@ func nodeAnnotations(image, memorySize string, wantBytes int64) map[string]strin
 	}
 }
 
-// podSpecDrift returns a non-empty message describing immutable spec drift
-// (image, command, args, resources) that EnsureNode will not auto-fix, or ""
-// if the spec matches.
 func podSpecDrift(pod *corev1.Pod, image, memorySize string) string {
 	c := containerOf(pod)
 	if c == nil {
@@ -279,9 +258,6 @@ func podSpecDrift(pod *corev1.Pod, image, memorySize string) string {
 	return ""
 }
 
-// ensurePodMetadata returns "" when labels/annotations are already complete,
-// otherwise a short description of what was missing. It mutates pod in place
-// to fill the gaps.
 func ensurePodMetadata(pod *corev1.Pod, clusterName, podName, image, memorySize string, wantBytes int64) string {
 	want := nodeLabels(clusterName, podName)
 	missing := false
@@ -319,8 +295,6 @@ func containerOf(pod *corev1.Pod) *corev1.Container {
 	return nil
 }
 
-// podRedisAddr returns host:port for the Pod's Redis client port, or "" if
-// the Pod has no IP yet.
 func podRedisAddr(pod *corev1.Pod) string {
 	if pod.Status.PodIP == "" {
 		return ""
@@ -328,7 +302,6 @@ func podRedisAddr(pod *corev1.Pod) string {
 	return fmt.Sprintf("%s:%d", pod.Status.PodIP, redisClientPort)
 }
 
-// memoryBytes parses a Kubernetes quantity string (e.g. "2Gi") into bytes.
 func memoryBytes(s string) (int64, error) {
 	q, err := resource.ParseQuantity(s)
 	if err != nil {

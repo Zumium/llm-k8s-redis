@@ -79,7 +79,7 @@ func TestReconcile_EnsuresFinalizerNamespaceAndPlans(t *testing.T) {
 
 	r := &RedisClusterReconciler{
 		Client: cl, Scheme: scheme,
-		Planner: planner.NoopPlanner{}, Executor: NoopExecutor{}, Validator: plan.NewValidator(),
+		Planner: planner.NoopPlanner{}, ValidatePlan: plan.NewValidator().Validate,
 	}
 	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "example"}}
 
@@ -142,7 +142,7 @@ func TestReconcile_PassesObservedNodesToPlanner(t *testing.T) {
 	exec := &ActionExecutor{Client: cl, Scheme: scheme, RedisFactory: fakeFactory(fc)}
 	r := &RedisClusterReconciler{
 		Client: cl, Scheme: scheme,
-		Planner: fp, Executor: NoopExecutor{}, Observer: exec, Validator: plan.NewValidator(),
+		Planner: fp, Driver: exec, ValidatePlan: plan.NewValidator().Validate,
 		TopologyRefreshInterval: time.Minute, TopologyStaleThreshold: time.Hour,
 	}
 
@@ -180,7 +180,7 @@ func TestReconcile_RetriesRejectedPlanWithValidatorFeedback(t *testing.T) {
 		Build()
 	r := &RedisClusterReconciler{
 		Client: cl, Scheme: scheme,
-		Planner: fp, Executor: NoopExecutor{}, Observer: &recordingObserver{}, Validator: validator,
+		Planner: fp, Driver: &recordingObserver{}, ValidatePlan: validator.Validate,
 		TopologyRefreshInterval: time.Minute, TopologyStaleThreshold: time.Hour,
 		PlanValidationRetries: 1,
 	}
@@ -219,7 +219,7 @@ func TestReconcile_PlanValidationRetriesZeroRejectsOnce(t *testing.T) {
 		Build()
 	r := &RedisClusterReconciler{
 		Client: cl, Scheme: scheme,
-		Planner: fp, Executor: NoopExecutor{}, Observer: &recordingObserver{}, Validator: &recordingValidator{err: errors.New("no")},
+		Planner: fp, Driver: &recordingObserver{}, ValidatePlan: (&recordingValidator{err: errors.New("no")}).Validate,
 		TopologyRefreshInterval: time.Minute, TopologyStaleThreshold: time.Hour,
 		PlanValidationRetries: 0,
 	}
@@ -319,7 +319,7 @@ func TestReconcile_DeletesNamespaceOnDeletion(t *testing.T) {
 		WithObjects(cluster, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "example"}}).
 		WithStatusSubresource(&api.RedisCluster{}).
 		Build()
-	r := &RedisClusterReconciler{Client: cl, Scheme: scheme, Validator: plan.NewValidator()}
+	r := &RedisClusterReconciler{Client: cl, Scheme: scheme, ValidatePlan: plan.NewValidator().Validate}
 	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "example"}}
 
 	// 1st delete reconcile: deletes namespace, requeues.
@@ -357,6 +357,10 @@ func (o *recordingObserver) ObserveTopology(_ context.Context, _ *api.RedisClust
 
 func (o *recordingObserver) CollectObservedNodes(_ context.Context, _ *api.RedisCluster) ([]plan.ObservedNode, error) {
 	return o.nodes, nil
+}
+
+func (o *recordingObserver) ExecuteStep(_ context.Context, _ *api.RedisCluster, _ *plan.Plan, _ int) (StepOutcome, error) {
+	return StepOutcome{Status: plan.StepStateCompleted, Message: "done"}, nil
 }
 
 func observedFromAPITopology(t *api.ClusterTopology) []plan.ObservedNode {
@@ -403,6 +407,14 @@ func (e *recordingExecutor) ExecuteStep(_ context.Context, _ *api.RedisCluster, 
 	e.called++
 	e.index = stepIndex
 	return StepOutcome{Status: plan.StepStateCompleted, Message: "done"}, nil
+}
+
+func (e *recordingExecutor) ObserveTopology(_ context.Context, _ *api.RedisCluster) error {
+	return nil
+}
+
+func (e *recordingExecutor) CollectObservedNodes(_ context.Context, _ *api.RedisCluster) ([]plan.ObservedNode, error) {
+	return nil, nil
 }
 
 type recordingValidator struct {
@@ -520,8 +532,8 @@ func TestReconcile_LazyRefreshSkipsWhenTopologyNil(t *testing.T) {
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster).WithStatusSubresource(&api.RedisCluster{}).Build()
 	obs := &recordingObserver{}
 	r := &RedisClusterReconciler{
-		Client: cl, Scheme: scheme, Planner: planner.NoopPlanner{}, Executor: NoopExecutor{},
-		Validator: plan.NewValidator(), Observer: obs,
+		Client: cl, Scheme: scheme, Planner: planner.NoopPlanner{}, Driver: obs,
+		ValidatePlan:            plan.NewValidator().Validate,
 		TopologyRefreshInterval: time.Minute, TopologyStaleThreshold: time.Second,
 	}
 
@@ -553,8 +565,8 @@ func TestReconcile_LazyRefreshSkipsWhenPlanRunning(t *testing.T) {
 	).WithStatusSubresource(&api.RedisCluster{}).Build()
 	obs := &recordingObserver{}
 	r := &RedisClusterReconciler{
-		Client: cl, Scheme: scheme, Planner: planner.NoopPlanner{}, Executor: NoopExecutor{},
-		Validator: plan.NewValidator(), Observer: obs,
+		Client: cl, Scheme: scheme, Planner: planner.NoopPlanner{}, Driver: obs,
+		ValidatePlan:            plan.NewValidator().Validate,
 		TopologyRefreshInterval: time.Minute, TopologyStaleThreshold: time.Nanosecond,
 	}
 
@@ -583,8 +595,8 @@ func TestReconcile_LazyRefreshRunsWhenStale(t *testing.T) {
 	).WithStatusSubresource(&api.RedisCluster{}).Build()
 	obs := &recordingObserver{}
 	r := &RedisClusterReconciler{
-		Client: cl, Scheme: scheme, Planner: planner.NoopPlanner{}, Executor: NoopExecutor{},
-		Validator: plan.NewValidator(), Observer: obs,
+		Client: cl, Scheme: scheme, Planner: planner.NoopPlanner{}, Driver: obs,
+		ValidatePlan:            plan.NewValidator().Validate,
 		TopologyRefreshInterval: time.Minute, TopologyStaleThreshold: time.Second,
 	}
 
@@ -606,8 +618,8 @@ func TestReconcile_LazyRefreshSkipsWhenFresh(t *testing.T) {
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "example"}}).WithStatusSubresource(&api.RedisCluster{}).Build()
 	obs := &recordingObserver{}
 	r := &RedisClusterReconciler{
-		Client: cl, Scheme: scheme, Planner: planner.NoopPlanner{}, Executor: NoopExecutor{},
-		Validator: plan.NewValidator(), Observer: obs,
+		Client: cl, Scheme: scheme, Planner: planner.NoopPlanner{}, Driver: obs,
+		ValidatePlan:            plan.NewValidator().Validate,
 		TopologyRefreshInterval: time.Minute, TopologyStaleThreshold: time.Hour,
 	}
 
@@ -637,8 +649,8 @@ func TestReconcile_CompletedPlanRequeuesForRefresh(t *testing.T) {
 	}
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "example"}}).WithStatusSubresource(&api.RedisCluster{}).Build()
 	r := &RedisClusterReconciler{
-		Client: cl, Scheme: scheme, Planner: planner.NoopPlanner{}, Executor: NoopExecutor{},
-		Validator: plan.NewValidator(), Observer: &recordingObserver{},
+		Client: cl, Scheme: scheme, Planner: planner.NoopPlanner{}, Driver: &recordingObserver{},
+		ValidatePlan:            plan.NewValidator().Validate,
 		TopologyRefreshInterval: 77 * time.Second, TopologyStaleThreshold: time.Hour,
 	}
 
@@ -669,8 +681,8 @@ func TestReconcile_FailedPlanRequeuesForRefresh(t *testing.T) {
 	}
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "example"}}).WithStatusSubresource(&api.RedisCluster{}).Build()
 	r := &RedisClusterReconciler{
-		Client: cl, Scheme: scheme, Planner: planner.NoopPlanner{}, Executor: NoopExecutor{},
-		Validator: plan.NewValidator(), Observer: &recordingObserver{},
+		Client: cl, Scheme: scheme, Planner: planner.NoopPlanner{}, Driver: &recordingObserver{},
+		ValidatePlan:            plan.NewValidator().Validate,
 		TopologyRefreshInterval: 88 * time.Second, TopologyStaleThreshold: time.Hour,
 	}
 
@@ -712,8 +724,8 @@ func TestReconcile_FailedPlanClearsWhenTopologyMatchesSpec(t *testing.T) {
 		vcPod("redis-3", "10.0.0.4", true),
 	).WithStatusSubresource(&api.RedisCluster{}).Build()
 	r := &RedisClusterReconciler{
-		Client: cl, Scheme: scheme, Planner: planner.NoopPlanner{}, Executor: NoopExecutor{},
-		Validator: plan.NewValidator(), Observer: &recordingObserver{},
+		Client: cl, Scheme: scheme, Planner: planner.NoopPlanner{}, Driver: &recordingObserver{},
+		ValidatePlan:            plan.NewValidator().Validate,
 		TopologyRefreshInterval: 99 * time.Second, TopologyStaleThreshold: time.Hour,
 	}
 
@@ -751,8 +763,8 @@ func TestReconcile_StaleCompletedPlanIsSuperseded(t *testing.T) {
 	cluster.Status.TopologyObservedAt = metav1.Now()
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "example"}}).WithStatusSubresource(&api.RedisCluster{}).Build()
 	r := &RedisClusterReconciler{
-		Client: cl, Scheme: scheme, Planner: planner.NoopPlanner{}, Executor: NoopExecutor{},
-		Validator: plan.NewValidator(), Observer: &recordingObserver{},
+		Client: cl, Scheme: scheme, Planner: planner.NoopPlanner{}, Driver: &recordingObserver{},
+		ValidatePlan:            plan.NewValidator().Validate,
 		TopologyRefreshInterval: time.Minute, TopologyStaleThreshold: time.Hour,
 	}
 
@@ -817,8 +829,8 @@ func TestReconcile_ReplansAfterStalePlanCleared(t *testing.T) {
 	fp := &recordingPlanner{plan: p}
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "example"}}).WithStatusSubresource(&api.RedisCluster{}).Build()
 	r := &RedisClusterReconciler{
-		Client: cl, Scheme: scheme, Planner: fp, Executor: NoopExecutor{},
-		Validator: plan.NewValidator(), Observer: &recordingObserver{nodes: observedFromAPITopology(cluster.Status.Topology)},
+		Client: cl, Scheme: scheme, Planner: fp, Driver: &recordingObserver{nodes: observedFromAPITopology(cluster.Status.Topology)},
+		ValidatePlan:            plan.NewValidator().Validate,
 		TopologyRefreshInterval: time.Minute, TopologyStaleThreshold: time.Hour,
 	}
 
@@ -862,8 +874,8 @@ func TestReconcile_LazyRefreshForcedOnPodDelete(t *testing.T) {
 	).WithStatusSubresource(&api.RedisCluster{}).Build()
 	obs := &recordingObserver{}
 	r := &RedisClusterReconciler{
-		Client: cl, Scheme: scheme, Planner: planner.NoopPlanner{}, Executor: NoopExecutor{},
-		Validator: plan.NewValidator(), Observer: obs,
+		Client: cl, Scheme: scheme, Planner: planner.NoopPlanner{}, Driver: obs,
+		ValidatePlan:            plan.NewValidator().Validate,
 		TopologyRefreshInterval: time.Minute, TopologyStaleThreshold: time.Hour,
 	}
 
@@ -908,8 +920,8 @@ func TestReconcile_MissingReplicaRequestsDriftPlan(t *testing.T) {
 		vcPod("redis-3", "10.0.0.3", true),
 	).WithStatusSubresource(&api.RedisCluster{}).Build()
 	r := &RedisClusterReconciler{
-		Client: cl, Scheme: scheme, Planner: fp, Executor: NoopExecutor{},
-		Validator: plan.NewValidator(), Observer: &recordingObserver{nodes: []plan.ObservedNode{
+		Client: cl, Scheme: scheme, Planner: fp, ValidatePlan: plan.NewValidator().Validate,
+		Driver: &recordingObserver{nodes: []plan.ObservedNode{
 			{Pod: "redis-0", PodExists: true, RedisSeen: true, NodeID: "master-0", Role: "master", Slots: "0-8191", Ready: true},
 			{Pod: "redis-2", PodExists: true, RedisSeen: true, NodeID: "master-2", Role: "master", Slots: "8192-16383", Ready: true},
 			{Pod: "redis-3", PodExists: true, RedisSeen: true, NodeID: "replica-3", Role: "replica", MasterPod: "redis-2", Ready: true},
@@ -961,8 +973,8 @@ func TestReconcile_ActiveDriftPlanExecutesWhenDriftStillObserved(t *testing.T) {
 		vcPod("redis-3", "10.0.0.3", true),
 	).WithStatusSubresource(&api.RedisCluster{}).Build()
 	r := &RedisClusterReconciler{
-		Client: cl, Scheme: scheme, Planner: fp, Executor: exec,
-		Validator: plan.NewValidator(), Observer: &recordingObserver{},
+		Client: cl, Scheme: scheme, Planner: fp, Driver: exec,
+		ValidatePlan:            plan.NewValidator().Validate,
 		TopologyRefreshInterval: time.Minute, TopologyStaleThreshold: time.Hour,
 	}
 
@@ -1016,8 +1028,8 @@ func TestReconcile_InvalidActiveDriftPlanStillExecutesWhenRunning(t *testing.T) 
 		vcPod("redis-3", "10.0.0.3", true),
 	).WithStatusSubresource(&api.RedisCluster{}).Build()
 	r := &RedisClusterReconciler{
-		Client: cl, Scheme: scheme, Planner: fp, Executor: exec,
-		Validator: plan.NewValidator(), Observer: &recordingObserver{},
+		Client: cl, Scheme: scheme, Planner: fp, Driver: exec,
+		ValidatePlan:            plan.NewValidator().Validate,
 		TopologyRefreshInterval: time.Minute, TopologyStaleThreshold: time.Hour,
 	}
 
@@ -1063,8 +1075,8 @@ func TestReconcile_LazyRefreshSkipsWhenPodSetMatches(t *testing.T) {
 	).WithStatusSubresource(&api.RedisCluster{}).Build()
 	obs := &recordingObserver{}
 	r := &RedisClusterReconciler{
-		Client: cl, Scheme: scheme, Planner: planner.NoopPlanner{}, Executor: NoopExecutor{},
-		Validator: plan.NewValidator(), Observer: obs,
+		Client: cl, Scheme: scheme, Planner: planner.NoopPlanner{}, Driver: obs,
+		ValidatePlan:            plan.NewValidator().Validate,
 		TopologyRefreshInterval: time.Minute, TopologyStaleThreshold: time.Hour,
 	}
 
@@ -1087,8 +1099,8 @@ func TestReconcile_CompletedPlan_TopologyMismatchTriggersReplan(t *testing.T) {
 	fp := &recordingPlanner{err: errors.New("expected planner call")}
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "example"}}).WithStatusSubresource(&api.RedisCluster{}).Build()
 	r := &RedisClusterReconciler{
-		Client: cl, Scheme: scheme, Planner: fp, Executor: NoopExecutor{},
-		Validator: plan.NewValidator(), Observer: &recordingObserver{},
+		Client: cl, Scheme: scheme, Planner: fp, Driver: &recordingObserver{},
+		ValidatePlan:            plan.NewValidator().Validate,
 		TopologyRefreshInterval: time.Minute, TopologyStaleThreshold: time.Hour,
 	}
 
@@ -1132,8 +1144,8 @@ func TestReconcile_FailedPlan_TopologyMismatchTriggersReplan(t *testing.T) {
 	fp := &recordingPlanner{err: errors.New("expected planner call")}
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "example"}}).WithStatusSubresource(&api.RedisCluster{}).Build()
 	r := &RedisClusterReconciler{
-		Client: cl, Scheme: scheme, Planner: fp, Executor: NoopExecutor{},
-		Validator: plan.NewValidator(), Observer: &recordingObserver{},
+		Client: cl, Scheme: scheme, Planner: fp, Driver: &recordingObserver{},
+		ValidatePlan:            plan.NewValidator().Validate,
 		TopologyRefreshInterval: time.Minute, TopologyStaleThreshold: time.Hour,
 	}
 

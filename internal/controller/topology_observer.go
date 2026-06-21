@@ -17,32 +17,6 @@ import (
 	"github.com/example/llm-k8s-redis/internal/redis"
 )
 
-// Observer is a minimal read-only surface for refreshing the observed Redis
-// Cluster topology. It is separate from Executor so the reconciler can ask for
-// a topology snapshot without executing a plan step.
-type Observer interface {
-	ObserveTopology(ctx context.Context, cluster *v1alpha1.RedisCluster) error
-	CollectObservedNodes(ctx context.Context, cluster *v1alpha1.RedisCluster) ([]plan.ObservedNode, error)
-}
-
-// noopObserver is the default Observer used when none is wired. It performs no
-// Redis calls and leaves status untouched.
-type noopObserver struct{}
-
-func (noopObserver) ObserveTopology(_ context.Context, _ *v1alpha1.RedisCluster) error {
-	return nil
-}
-
-func (noopObserver) CollectObservedNodes(_ context.Context, _ *v1alpha1.RedisCluster) ([]plan.ObservedNode, error) {
-	return nil, nil
-}
-
-// compile-time check that ActionExecutor satisfies Observer.
-var _ Observer = &ActionExecutor{}
-
-// clusterObservation is the result of a single observeTopology call. It holds
-// both the rebuilt topology and the raw intermediate state needed by callers
-// that perform additional validation (VerifyCluster).
 type clusterObservation struct {
 	entries  []clusterNodeEntry
 	topology *v1alpha1.ClusterTopology
@@ -52,10 +26,6 @@ type clusterObservation struct {
 	message  string
 }
 
-// ObserveTopology is the public entry point for lazy topology refresh. It
-// mutates cluster.Status to reflect the latest observed topology and the
-// Healthy condition. Transient observation failures keep the previous topology
-// intact so the last known state is not erased.
 func (e *ActionExecutor) ObserveTopology(ctx context.Context, cluster *v1alpha1.RedisCluster) error {
 	obs, err := e.observeTopology(ctx, cluster)
 	if err != nil {
@@ -75,12 +45,6 @@ func (e *ActionExecutor) ObserveTopology(ctx context.Context, cluster *v1alpha1.
 	return nil
 }
 
-// observeTopology queries a live Redis node and rebuilds ClusterTopology from
-// CLUSTER INFO / CLUSTER NODES plus the managed K8S Pods. It is intentionally
-// lenient: transient problems (no seed, network blip, cluster_state not ok)
-// return healthy=false with a reason message rather than an error. Only
-// non-transient failures (e.g. unable to build the Redis client or list Pods)
-// are returned as errors.
 func (e *ActionExecutor) observeTopology(ctx context.Context, cluster *v1alpha1.RedisCluster) (clusterObservation, error) {
 	if e.RedisFactory == nil {
 		e.RedisFactory = redis.DefaultFactory
@@ -177,9 +141,6 @@ func (e *ActionExecutor) CollectObservedNodes(ctx context.Context, cluster *v1al
 	return observedNodes(cluster, pods, entries), nil
 }
 
-// listManagedPods lists all Pods in the cluster's namespace labeled as
-// belonging to this RedisCluster. It returns a Failed outcome if the list
-// call errors for a non-transient reason.
 func (e *ActionExecutor) listManagedPods(ctx context.Context, cluster *v1alpha1.RedisCluster) ([]corev1.Pod, StepOutcome, bool) {
 	var podList corev1.PodList
 	selector, err := labels.Parse(labelCluster + "=" + cluster.Name)
@@ -200,7 +161,6 @@ func (e *ActionExecutor) listManagedPods(ctx context.Context, cluster *v1alpha1.
 	return podList.Items, StepOutcome{}, true
 }
 
-// pickSeedPod returns the first managed Pod that is Ready and has a PodIP.
 func pickSeedPod(pods []corev1.Pod) (corev1.Pod, bool) {
 	for _, p := range pods {
 		if podReady(&p) && p.Status.PodIP != "" {
@@ -330,7 +290,6 @@ func lastKnownNodeMaps(cluster *v1alpha1.RedisCluster) (map[string]string, map[s
 	return podToNodeID, nodeIDToPod
 }
 
-// mapPodsByIP indexes ready pods by their PodIP for Redis-node -> Pod lookup.
 func mapPodsByIP(pods []corev1.Pod) map[string]*corev1.Pod {
 	out := map[string]*corev1.Pod{}
 	for i := range pods {
@@ -342,8 +301,6 @@ func mapPodsByIP(pods []corev1.Pod) map[string]*corev1.Pod {
 	return out
 }
 
-// healthyMasters returns the entries that are masters and healthy, sorted by
-// node id for deterministic shard numbering.
 func healthyMasters(entries []clusterNodeEntry) []clusterNodeEntry {
 	var out []clusterNodeEntry
 	for _, e := range entries {
@@ -355,8 +312,6 @@ func healthyMasters(entries []clusterNodeEntry) []clusterNodeEntry {
 	return out
 }
 
-// healthyReplicasOf returns the entries that are healthy replicas of the
-// given master id, sorted by node id for deterministic ordering.
 func healthyReplicasOf(entries []clusterNodeEntry, masterID string) []clusterNodeEntry {
 	var out []clusterNodeEntry
 	for _, e := range entries {
@@ -368,11 +323,6 @@ func healthyReplicasOf(entries []clusterNodeEntry, masterID string) []clusterNod
 	return out
 }
 
-// rebuildTopology reconstructs ClusterTopology from live Redis CLUSTER NODES
-// plus the managed K8S Pods. Masters are sorted by node id to give stable
-// shard indexes; replicas are sorted by node id within each shard. Slot
-// tokens are joined with "," so the Slots field reads like "0-8191" or
-// "0-100,5000".
 func rebuildTopology(entries []clusterNodeEntry, pods []corev1.Pod, podsByIP map[string]*corev1.Pod) *v1alpha1.ClusterTopology {
 	masters := healthyMasters(entries)
 	shards := make([]v1alpha1.ShardTopology, 0, len(masters))
@@ -413,7 +363,6 @@ func podReadyForIP(podsByIP map[string]*corev1.Pod, ip string) bool {
 	return false
 }
 
-// ipFromAddr extracts the host portion of an "ip:port@cport" address.
 func ipFromAddr(addr string) string {
 	if i := strings.Index(addr, ":"); i >= 0 {
 		return addr[:i]
