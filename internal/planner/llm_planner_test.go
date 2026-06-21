@@ -109,6 +109,34 @@ func TestLLMPlanner_ValidPlan(t *testing.T) {
 	}
 }
 
+func TestLLMPlanner_PassesRuntimeConfig(t *testing.T) {
+	fake := &fakeLLMClient{resp: &llm.Response{Text: validCreatePlanJSON()}}
+	p := NewLLMPlanner(fake, "deepseek-v4-flash")
+	p.MaxTokens = 2048
+	p.Temperature = 0.1
+	p.ReasoningEffort = "max"
+
+	_, err := p.Plan(context.Background(), Request{
+		Cluster: sampleCluster(),
+		Spec:    sampleSpec(),
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if fake.lastReq.Model != "deepseek-v4-flash" {
+		t.Errorf("model = %q", fake.lastReq.Model)
+	}
+	if fake.lastReq.MaxTokens != 2048 {
+		t.Errorf("maxTokens = %d", fake.lastReq.MaxTokens)
+	}
+	if fake.lastReq.Temperature != 0.1 {
+		t.Errorf("temperature = %v", fake.lastReq.Temperature)
+	}
+	if fake.lastReq.ReasoningEffort != "max" {
+		t.Errorf("reasoningEffort = %q", fake.lastReq.ReasoningEffort)
+	}
+}
+
 func TestLLMPlanner_InvalidJSON(t *testing.T) {
 	fake := &fakeLLMClient{resp: &llm.Response{Text: "not json at all"}}
 	p := NewLLMPlanner(fake, "test-model")
@@ -193,18 +221,63 @@ func TestLLMPlanner_PromptContainsSpec(t *testing.T) {
 	_, _ = p.Plan(context.Background(), Request{
 		Cluster: sampleCluster(),
 		Spec:    sampleSpec(),
+		ObservedState: ObservedState{LiveContext: &LiveContext{
+			SeedPod:      "redis-0",
+			SeedAddr:     "10.0.0.1:6379",
+			ClusterInfo:  "cluster_state:ok\r\ncluster_slots_assigned:16384\r\n",
+			ClusterNodes: "node-a 10.0.0.1:6379@16379 master - 0 0 1 connected 0-16383\n",
+			Pods: []PodContext{{
+				Namespace: "example",
+				Name:      "redis-0",
+				IP:        "10.0.0.1",
+				Phase:     "Running",
+				Ready:     true,
+				NodeName:  "kind-worker",
+				Labels:    map[string]string{"redis.example.com/cluster": "example"},
+			}},
+		}},
 	})
 
 	if fake.lastReq.System == "" {
 		t.Error("system prompt should not be empty")
 	}
+	for _, want := range []string{"spec is the desired count/config", "live Pods are the Kubernetes truth", "CLUSTER NODES is the Redis truth"} {
+		if !contains(fake.lastReq.System, want) {
+			t.Errorf("system prompt missing %q", want)
+		}
+	}
 	if fake.lastText == "" {
 		t.Error("user prompt should not be empty")
 	}
 	// The user prompt should contain the spec fields.
-	for _, want := range []string{"example", "redis:7.2", "2Gi", "Create"} {
+	for _, want := range []string{"example", "redis:7.2", "2Gi", "Create", "CLUSTER INFO", "cluster_state:ok", "CLUSTER NODES", "node-a", "name=redis-0"} {
 		if !contains(fake.lastText, want) {
 			t.Errorf("user prompt missing %q", want)
+		}
+	}
+}
+
+func TestUserPrompt_DriftRequiresKnownNodeForget(t *testing.T) {
+	text := buildUserPrompt(Request{
+		Spec: sampleSpec(),
+		ObservedState: ObservedState{
+			Drift: &plan.DriftContext{
+				MissingPod:       "redis-1",
+				LastKnownNodeID:  "node-1",
+				Role:             "replica",
+				ReplacementPod:   "redis-4",
+				TargetMasterPod:  "redis-0",
+				BaselineShards:   2,
+				BaselineReplicas: 1,
+			},
+			LiveContext: &LiveContext{
+				ClusterNodes: "node-1 10.0.0.2:6379@16379 slave node-0 0 0 2 connected\n",
+			},
+		},
+	})
+	for _, want := range []string{"include exactly one ForgetNode for missingPod before VerifyCluster", "Do not invent node IDs", "lastKnownNodeId or IDs visible in CLUSTER NODES"} {
+		if !contains(text, want) {
+			t.Errorf("drift prompt missing %q", want)
 		}
 	}
 }

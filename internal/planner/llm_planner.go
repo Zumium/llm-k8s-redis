@@ -2,6 +2,8 @@ package planner
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 
 	"github.com/example/llm-k8s-redis/internal/llm"
 	"github.com/example/llm-k8s-redis/internal/plan"
@@ -37,7 +39,45 @@ func NewLLMPlanner(client llm.Client, model string) *LLMPlanner {
 
 // Plan implements Planner.
 func (p *LLMPlanner) Plan(ctx context.Context, req Request) (*plan.Plan, error) {
-	return planWithClient(ctx, p.Client, p.Model, p.MaxTokens, p.Temperature, p.ReasoningEffort, req)
+	if p.Client == nil {
+		return nil, fmt.Errorf("llm planner: client is nil")
+	}
+
+	llmReq := llm.Request{
+		Model:  p.Model,
+		System: buildSystemPrompt(),
+		Messages: []llm.Message{
+			{
+				Role: llm.RoleUser,
+				Content: []llm.ContentPart{
+					{Type: "text", Text: buildUserPrompt(req)},
+				},
+			},
+		},
+		ResponseFormat: llm.ResponseFormat{
+			Type: llm.ResponseFormatJSONObject,
+		},
+		MaxTokens:       p.MaxTokens,
+		Temperature:     p.Temperature,
+		ReasoningEffort: p.ReasoningEffort,
+	}
+
+	resp, err := p.Client.Complete(ctx, llmReq)
+	if err != nil {
+		return nil, fmt.Errorf("llm complete: %w", err)
+	}
+	if resp == nil || resp.Text == "" {
+		return nil, fmt.Errorf("llm returned empty response")
+	}
+
+	var p2 plan.Plan
+	if err := json.Unmarshal([]byte(resp.Text), &p2); err != nil {
+		return nil, fmt.Errorf("unmarshal plan json: %w (response: %s)", err, truncate(resp.Text, 500))
+	}
+
+	p2.DSLVersion = plan.DSLVersion
+	p2.TargetGeneration = req.Spec.Generation
+	return &p2, nil
 }
 
 func truncate(s string, n int) string {
@@ -50,5 +90,4 @@ func truncate(s string, n int) string {
 // compile-time checks that both planners satisfy Planner.
 var (
 	_ Planner = (*LLMPlanner)(nil)
-	_ Planner = (*DynamicPlanner)(nil)
 )

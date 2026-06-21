@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"os"
 	"time"
@@ -11,6 +12,7 @@ import (
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
@@ -72,13 +74,15 @@ func main() {
 
 	var p planner.Planner = planner.NoopPlanner{}
 	if !disableLLMPlanner {
-		src := llm.NewConfigMapSource(mgr.GetClient(), types.NamespacedName{Name: llmConfigMapName, Namespace: llmConfigMapNS})
-		if err := mgr.Add(src); err != nil {
-			setupLog.Error(err, "unable to register llm config source")
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		lp, cfg, err := newLLMPlannerFromConfigMap(ctx, mgr.GetAPIReader(), types.NamespacedName{Name: llmConfigMapName, Namespace: llmConfigMapNS})
+		if err != nil {
+			setupLog.Error(err, "unable to load llm config")
 			os.Exit(1)
 		}
-		p = planner.NewDynamicPlanner(src)
-		setupLog.Info("using llm planner backed by configmap", "name", llmConfigMapName, "namespace", llmConfigMapNS)
+		p = lp
+		setupLog.Info("using fixed llm planner backed by configmap", "name", llmConfigMapName, "namespace", llmConfigMapNS, "model", cfg.Model)
 	} else {
 		setupLog.Info("llm planner disabled; using NoopPlanner")
 	}
@@ -113,4 +117,16 @@ func main() {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
 	}
+}
+
+func newLLMPlannerFromConfigMap(ctx context.Context, reader client.Reader, key types.NamespacedName) (*planner.LLMPlanner, llm.Config, error) {
+	cfg, llmClient, err := llm.LoadConfigMap(ctx, reader, key)
+	if err != nil {
+		return nil, llm.Config{}, err
+	}
+	p := planner.NewLLMPlanner(llmClient, cfg.Model)
+	p.MaxTokens = cfg.MaxTokens
+	p.Temperature = cfg.Temperature
+	p.ReasoningEffort = cfg.ReasoningEffort
+	return p, cfg, nil
 }

@@ -18,8 +18,7 @@ import (
 // vLLM, Ollama, and Anthropic's OpenAI-compatible layer.
 //
 // The underlying openai.Client is configured from a Config (baseUrl, apiKey,
-// model). Callers should rebuild the client when the ConfigMap changes — see
-// ConfigMapSource.
+// model). Callers should rebuild the client when the config changes.
 type OpenAIClient struct {
 	client openai.Client
 	cfg    Config
