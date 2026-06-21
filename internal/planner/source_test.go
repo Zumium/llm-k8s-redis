@@ -1,4 +1,4 @@
-package llm
+package planner
 
 import (
 	"context"
@@ -47,23 +47,23 @@ func TestLoadConfigMap(t *testing.T) {
 		WithObjects(makeConfigMap("llm-config", "redis-cluster-system", validConfigData())).
 		Build()
 
-	cfg, c, err := LoadConfigMap(context.Background(), cl, types.NamespacedName{Name: "llm-config", Namespace: "redis-cluster-system"})
+	config, llmClient, err := LoadConfigMap(context.Background(), cl, types.NamespacedName{Name: "llm-config", Namespace: "redis-cluster-system"})
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	if cfg.Model != "gpt-4o" {
-		t.Errorf("model = %q", cfg.Model)
+	if config.Model != "gpt-4o" {
+		t.Errorf("model = %q", config.Model)
 	}
-	if cfg.MaxTokens != 4096 {
-		t.Errorf("maxTokens = %d", cfg.MaxTokens)
+	if config.MaxTokens != 4096 {
+		t.Errorf("maxTokens = %d", config.MaxTokens)
 	}
-	if cfg.Temperature != 0.2 {
-		t.Errorf("temperature = %v", cfg.Temperature)
+	if config.Temperature != 0.2 {
+		t.Errorf("temperature = %v", config.Temperature)
 	}
-	if cfg.ReasoningEffort != "max" {
-		t.Errorf("reasoningEffort = %q", cfg.ReasoningEffort)
+	if config.ReasoningEffort != "max" {
+		t.Errorf("reasoningEffort = %q", config.ReasoningEffort)
 	}
-	if c == nil {
+	if llmClient == nil {
 		t.Error("client should not be nil")
 	}
 }

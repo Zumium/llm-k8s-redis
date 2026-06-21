@@ -31,23 +31,23 @@ func TestNewLLMPlannerFromConfigMap(t *testing.T) {
 	}
 	cl := fake.NewClientBuilder().WithScheme(s).WithObjects(cm).Build()
 
-	p, cfg, err := newLLMPlannerFromConfigMap(context.Background(), cl, types.NamespacedName{Name: "llm-config", Namespace: "ns"})
+	p, config, err := newLLMPlannerFromConfigMap(context.Background(), cl, types.NamespacedName{Name: "llm-config", Namespace: "ns"})
 	if err != nil {
 		t.Fatalf("new planner: %v", err)
 	}
-	if p.Model != "deepseek-v4-flash" || cfg.Model != p.Model {
-		t.Errorf("model cfg=%q planner=%q", cfg.Model, p.Model)
+	if config.Model != "deepseek-v4-flash" {
+		t.Errorf("model = %q", config.Model)
 	}
-	if p.MaxTokens != 2048 {
-		t.Errorf("maxTokens = %d", p.MaxTokens)
+	if config.MaxTokens != 2048 {
+		t.Errorf("maxTokens = %d", config.MaxTokens)
 	}
-	if p.Temperature != 0.1 {
-		t.Errorf("temperature = %v", p.Temperature)
+	if config.Temperature != 0.1 {
+		t.Errorf("temperature = %v", config.Temperature)
 	}
-	if p.ReasoningEffort != "max" {
-		t.Errorf("reasoningEffort = %q", p.ReasoningEffort)
+	if config.ReasoningEffort != "max" {
+		t.Errorf("reasoningEffort = %q", config.ReasoningEffort)
 	}
-	if p.Client == nil {
+	if p.LLMClient == nil {
 		t.Fatal("client is nil")
 	}
 }

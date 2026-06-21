@@ -19,7 +19,6 @@ import (
 
 	api "github.com/example/llm-k8s-redis/api/v1alpha1"
 	"github.com/example/llm-k8s-redis/internal/controller"
-	"github.com/example/llm-k8s-redis/internal/llm"
 	"github.com/example/llm-k8s-redis/internal/plan"
 	"github.com/example/llm-k8s-redis/internal/planner"
 	"github.com/example/llm-k8s-redis/internal/redis"
@@ -76,13 +75,13 @@ func main() {
 	if !disableLLMPlanner {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		lp, cfg, err := newLLMPlannerFromConfigMap(ctx, mgr.GetAPIReader(), types.NamespacedName{Name: llmConfigMapName, Namespace: llmConfigMapNS})
+		llmPlanner, config, err := newLLMPlannerFromConfigMap(ctx, mgr.GetAPIReader(), types.NamespacedName{Name: llmConfigMapName, Namespace: llmConfigMapNS})
 		if err != nil {
 			setupLog.Error(err, "unable to load llm config")
 			os.Exit(1)
 		}
-		p = lp
-		setupLog.Info("using fixed llm planner backed by configmap", "name", llmConfigMapName, "namespace", llmConfigMapNS, "model", cfg.Model)
+		p = llmPlanner
+		setupLog.Info("using fixed llm planner backed by configmap", "name", llmConfigMapName, "namespace", llmConfigMapNS, "model", config.Model)
 	} else {
 		setupLog.Info("llm planner disabled; using NoopPlanner")
 	}
@@ -119,14 +118,10 @@ func main() {
 	}
 }
 
-func newLLMPlannerFromConfigMap(ctx context.Context, reader client.Reader, key types.NamespacedName) (*planner.LLMPlanner, llm.Config, error) {
-	cfg, llmClient, err := llm.LoadConfigMap(ctx, reader, key)
+func newLLMPlannerFromConfigMap(ctx context.Context, reader client.Reader, key types.NamespacedName) (*planner.LLMPlanner, planner.Config, error) {
+	config, llmClient, err := planner.LoadConfigMap(ctx, reader, key)
 	if err != nil {
-		return nil, llm.Config{}, err
+		return nil, planner.Config{}, err
 	}
-	p := planner.NewLLMPlanner(llmClient, cfg.Model)
-	p.MaxTokens = cfg.MaxTokens
-	p.Temperature = cfg.Temperature
-	p.ReasoningEffort = cfg.ReasoningEffort
-	return p, cfg, nil
+	return planner.NewLLMPlanner(llmClient), config, nil
 }

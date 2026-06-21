@@ -7,9 +7,6 @@ import (
 	"github.com/example/llm-k8s-redis/internal/plan"
 )
 
-// buildSystemPrompt constructs the system prompt that tells the LLM its role,
-// the DSL schema, the available actions, and the safety invariants it must
-// respect. The prompt is provider-agnostic: it works with any chat model.
 func buildSystemPrompt() string {
 	var b strings.Builder
 	b.WriteString("You are a Redis Cluster operations planner for a Kubernetes controller.\n")
@@ -53,14 +50,13 @@ func buildSystemPrompt() string {
 	return b.String()
 }
 
-// actionReference returns the per-action param reference table.
 func actionReference() string {
 	var b strings.Builder
-	type actionDoc struct {
+	type actionPromptLine struct {
 		name   plan.ActionType
 		params string
 	}
-	docs := []actionDoc{
+	lines := []actionPromptLine{
 		{plan.ActionEnsureNode, `{"namespace":"<cluster>","pod":"<name>","image":"<image>","memorySize":"<size>"}`},
 		{plan.ActionWaitNodeReady, `{"namespace":"<cluster>","pod":"<name>"}`},
 		{plan.ActionMeetNode, `{"namespace":"<cluster>","sourcePod":"<name>","targetPod":"<name>"}`},
@@ -71,13 +67,12 @@ func actionReference() string {
 		{plan.ActionDeleteNode, `{"namespace":"<cluster>","pod":"<name>"}`},
 		{plan.ActionVerifyCluster, `{"expectedShards":<n>,"expectedReplicasPerShard":<n>,"requireClusterStateOk":true,"requireFullSlotCoverage":true,"requireAllSlotOwnersHaveReplicas":true}`},
 	}
-	for _, d := range docs {
-		fmt.Fprintf(&b, "- %s: %s\n", d.name, d.params)
+	for _, line := range lines {
+		fmt.Fprintf(&b, "- %s: %s\n", line.name, line.params)
 	}
 	return b.String()
 }
 
-// safetyInvariants lists the hard constraints the Validator enforces.
 func safetyInvariants() string {
 	return strings.TrimSpace(`- The cluster must never have a shard with zero replicas for a slot-owning master, not even transiently.
 - AddSlots must run only after the target master has at least one replica.
@@ -90,8 +85,6 @@ func safetyInvariants() string {
 - sourcePod and targetPod (or masterPod and replicaPod) must not be the same pod.`)
 }
 
-// buildUserPrompt constructs the per-cluster user prompt with the concrete spec
-// and observed state.
 func buildUserPrompt(req Request) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "RedisCluster name: %s\n", req.Spec.Name)
@@ -105,7 +98,7 @@ func buildUserPrompt(req Request) string {
 	fmt.Fprintf(&b, "nextPodOrdinal: %d\n\n", req.ObservedState.NextPodOrdinal)
 
 	b.WriteString("## Observed state\n")
-	writeObservedNodes(&b, req.ObservedState.Nodes)
+	writeObservedNodesTable(&b, req.ObservedState.Nodes)
 	b.WriteString("\n")
 
 	b.WriteString("## Task\n")
@@ -114,7 +107,7 @@ func buildUserPrompt(req Request) string {
 	return b.String()
 }
 
-func writeObservedNodes(b *strings.Builder, nodes []ObservedNode) {
+func writeObservedNodesTable(b *strings.Builder, nodes []ObservedNode) {
 	if len(nodes) == 0 {
 		b.WriteString("No observed nodes.\n")
 		return
@@ -122,46 +115,14 @@ func writeObservedNodes(b *strings.Builder, nodes []ObservedNode) {
 	b.WriteString("pod | podExists | redisSeen | nodeId | role | slots | masterId | masterPod | ready | deleting | flags | linkState\n")
 	for _, n := range nodes {
 		fmt.Fprintf(b, "%s | %v | %v | %s | %s | %s | %s | %s | %v | %v | %s | %s\n",
-			dash(n.Pod), n.PodExists, n.RedisSeen, dash(n.NodeID), dash(n.Role), dash(n.Slots),
-			dash(n.MasterID), dash(n.MasterPod), n.Ready, n.Deleting, dash(strings.Join(n.Flags, ",")), dash(n.LinkState))
+			dashIfEmpty(n.Pod), n.PodExists, n.RedisSeen, dashIfEmpty(n.NodeID), dashIfEmpty(n.Role), dashIfEmpty(n.Slots),
+			dashIfEmpty(n.MasterID), dashIfEmpty(n.MasterPod), n.Ready, n.Deleting, dashIfEmpty(strings.Join(n.Flags, ",")), dashIfEmpty(n.LinkState))
 	}
 }
 
-func dash(s string) string {
+func dashIfEmpty(s string) string {
 	if s == "" {
 		return "-"
 	}
 	return s
-}
-
-// planJSONSchema returns a minimal JSON Schema for the Plan object. Providers
-// that support structured output (OpenAI json_schema, Anthropic tools) can use
-// it to constrain the model's output. It is intentionally permissive on params
-// (additionalProperties: true) because action params vary by action type.
-func planJSONSchema() map[string]any {
-	stepSchema := map[string]any{
-		"type": "object",
-		"properties": map[string]any{
-			"id":     map[string]any{"type": "string"},
-			"action": map[string]any{"type": "string"},
-			"params": map[string]any{"type": "object"},
-		},
-		"required":             []string{"id", "action", "params"},
-		"additionalProperties": false,
-	}
-	return map[string]any{
-		"type": "object",
-		"properties": map[string]any{
-			"dslVersion":       map[string]any{"type": "string"},
-			"planId":           map[string]any{"type": "string"},
-			"targetGeneration": map[string]any{"type": "integer"},
-			"summary":          map[string]any{"type": "string"},
-			"steps": map[string]any{
-				"type":  "array",
-				"items": stepSchema,
-			},
-		},
-		"required":             []string{"dslVersion", "planId", "targetGeneration", "steps"},
-		"additionalProperties": false,
-	}
 }

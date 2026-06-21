@@ -1,4 +1,4 @@
-package llm
+package planner
 
 import (
 	"context"
@@ -11,7 +11,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
-func LoadConfigMap(ctx context.Context, reader client.Reader, key types.NamespacedName) (Config, Client, error) {
+func LoadConfigMap(ctx context.Context, reader client.Reader, key types.NamespacedName) (Config, LLMClient, error) {
 	var cm corev1.ConfigMap
 	if err := reader.Get(ctx, key, &cm); err != nil {
 		if apierrors.IsNotFound(err) {
@@ -19,14 +19,14 @@ func LoadConfigMap(ctx context.Context, reader client.Reader, key types.Namespac
 		}
 		return Config{}, nil, fmt.Errorf("get llm configmap: %w", err)
 	}
-	cfg, err := ParseConfig(cm.Data)
+	config, err := ParseConfig(cm.Data)
 	if err != nil {
 		return Config{}, nil, fmt.Errorf("parse llm configmap %s: %w", key, err)
 	}
-	c, err := NewOpenAIClient(cfg)
+	llmClient, err := NewOpenAIClient(config)
 	if err != nil {
 		return Config{}, nil, fmt.Errorf("build llm client from configmap %s: %w", key, err)
 	}
-	log.FromContext(ctx).Info("llm config loaded", "configmap", key, "provider", cfg.Provider, "model", cfg.Model)
-	return cfg, c, nil
+	log.FromContext(ctx).Info("llm config loaded", "configmap", key, "model", config.Model)
+	return config, llmClient, nil
 }

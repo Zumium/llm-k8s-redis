@@ -7,8 +7,7 @@ metadata:
     app.kubernetes.io/name: llm-k8s-redis
     app.kubernetes.io/component: llm-config
 data:
-  # provider selects the backend; "openai" and "anthropic" are recognized.
-  # The HTTP client is OpenAI chat-completions compatible.
+  # provider is kept for config compatibility; the controller uses the OpenAI-compatible client.
   provider: "openai"
   # baseUrl is the API root without /chat/completions, e.g.
   #   OpenAI:    https://api.openai.com/v1
@@ -32,6 +31,3 @@ data:
   # Leave unset for providers/models that do not support this parameter.
   # Test env uses max 思考力度.
   reasoningEffort: "max"
-  # tlsInsecureSkipVerify skips TLS certificate verification. Only for testing
-  # environments (e.g. KIND clusters with network restrictions).
-  # tlsInsecureSkipVerify: "true"

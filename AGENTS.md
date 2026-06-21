@@ -4,6 +4,11 @@ K8S controller for Redis Cluster lifecycle management. An LLM-generated plan
 (DSL) drives reconciliation; the controller validates plans deterministically
 and executes one step per reconcile. Go + controller-runtime, cluster-scoped CRD.
 
+## Philosophy
+
+Simpler code is better code. Code that a junior SDE can understand easily is
+good code.
+
 ## Commands
 
 ```bash
@@ -36,21 +41,20 @@ Layering (each arrow is a compile-time interface boundary):
 ```
 controller.RedisClusterReconciler
   -> planner.Planner          (domain interface, internal/planner/types.go)
-       -> planner.DynamicPlanner  (resolves client/model per call from a source)
-            -> llm.Client         (provider-agnostic, internal/llm/types.go)
-                 -> llm.OpenAIClient (official OpenAI Go SDK, internal/llm/openai_client.go)
-                 -> llm.ConfigMapSource (loads baseUrl/apiKey/model from a ConfigMap, hot-reloads)
+       -> planner.LLMPlanner
+            -> planner.Client
+                 -> planner.OpenAIClient (official OpenAI Go SDK, internal/planner/openai_client.go)
 plan.Validator                (deterministic safety gate, internal/plan/validator.go)
 ```
 
-- **LLM config is ConfigMap-driven.** `llm.ConfigMapSource` (a manager.Runnable)
-  reads `provider`/`baseUrl`/`apiKey`/`model`/`maxTokens`/`temperature` from a
-  ConfigMap (default `llm-config` in the controller's namespace) and builds an
-  `llm.OpenAIClient` (backed by `github.com/openai/openai-go/v3`). It polls every
-  15s for hot-reload. `planner.DynamicPlanner` reads the current client/model on
-  every `Plan()` call. Flags: `--llm-configmap-name`, `--llm-configmap-namespace`,
-  `--disable-llm-planner`.
-- **`llm.Client` is the provider-agnostic interface; `llm.OpenAIClient` is the
+- **LLM config is ConfigMap-driven at startup.** `planner.LoadConfigMap` reads
+  `baseUrl`/`apiKey`/`model`/`maxTokens`/`temperature`/`reasoningEffort` from a ConfigMap
+  (default `llm-config` in the controller's namespace) and builds a
+  `planner.OpenAIClient` (backed by `github.com/openai/openai-go/v3`). It does
+  not hot-reload; rotate model/baseUrl/apiKey by restarting the controller after
+  editing the ConfigMap. Flags: `--llm-configmap-name`,
+  `--llm-configmap-namespace`, `--disable-llm-planner`.
+- **`planner.Client` is the provider-agnostic interface; `planner.OpenAIClient` is the
   only implementation.** The OpenAI SDK is OpenAI-compatible, so `baseUrl` can
   point at Azure OpenAI, vLLM, Ollama, or Anthropic's OpenAI-compatible endpoint.
   A native Anthropic Messages API adapter is not yet built.
@@ -127,8 +131,8 @@ with `cluster-configs/` and the live `llm-config` ConfigMap.
   - `model: deepseek-v4-flash`
   - `reasoningEffort: max`  (DeepSeek's "max 思考力度"; controller maps to top-level `reasoning_effort=max`)
   - `apiKey`: **not committed**. Stored only in the live cluster ConfigMap;
-    the controller hot-reloads it every 15s, so no restart is needed when rotated.
-    Inspect/rotate with `kubectl -n redis-cluster-system edit cm llm-config`.
+    restart the controller after rotating it.
+    Inspect with `kubectl -n redis-cluster-system edit cm llm-config`.
 
 ## Module path caveat
 
@@ -138,9 +142,8 @@ rewrite imports to a different path without user instruction.
 
 ## What is NOT implemented yet
 
-- Anthropic-native `llm.Client` adapter (the OpenAI SDK `OpenAIClient` works
-  with Anthropic's OpenAI-compatible endpoint via `provider: anthropic`; a
-  native Messages API adapter is not yet built).
+- Anthropic-native `planner.Client` adapter. `OpenAIClient` can still use an
+  Anthropic OpenAI-compatible `baseUrl`; the `provider` key is ignored.
 - Executor actions for `MigrateSlots`, `ForgetNode`, and `DeleteNode`.
   `ActionExecutor` dispatches six of the nine whitelisted actions (EnsureNode,
   WaitNodeReady, MeetNode, ReplicateNode, AddSlots, VerifyCluster). The
