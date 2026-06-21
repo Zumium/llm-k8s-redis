@@ -53,6 +53,8 @@ func (e *ActionExecutor) ExecuteStep(ctx context.Context, cluster *v1alpha1.Redi
 		return e.migrateSlots(ctx, cluster, p, stepIndex)
 	case plan.ActionForgetNode:
 		return e.forgetNode(ctx, cluster, step)
+	case plan.ActionDeleteNode:
+		return e.deleteNode(ctx, cluster, step)
 	case plan.ActionVerifyCluster:
 		return e.verifyCluster(ctx, cluster, p, step)
 	default:
