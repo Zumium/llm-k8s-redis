@@ -34,6 +34,7 @@ const (
 
 type RedisClusterReconciler struct {
 	client.Client
+	APIReader               client.Reader
 	Scheme                  *runtime.Scheme
 	Planner                 planner.Planner
 	Driver                  Driver
@@ -56,6 +57,10 @@ func (r *RedisClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	if r.Planner == nil {
 		r.Planner = planner.NoopPlanner{}
 		logger.Info("default planner initialized")
+	}
+	if r.APIReader == nil {
+		r.APIReader = r.Client
+		logger.Info("default api reader initialized")
 	}
 	if r.Driver == nil {
 		r.Driver = &ActionExecutor{Client: r.Client, Scheme: r.Scheme}
@@ -127,58 +132,94 @@ func (r *RedisClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	spec := toClusterSpec(&cluster)
 	logger.Info("desired spec converted", "shards", spec.Shards, "replicasPerShard", spec.ReplicasPerShard, "image", spec.Image, "memorySize", spec.MemorySize)
 
-	active := cluster.Status.ActivePlan
-
-	if active != nil && planState(active) == plan.PlanStateRunning {
-		logger.Info("running active plan found", "planID", active.ID, "steps", len(active.Steps), "currentStep", active.CurrentStep)
-		return r.executeNextStep(ctx, &cluster, active)
-	}
-
-	if active != nil {
-		state := planState(active)
-		logger.Info("active plan found", "planID", active.ID, "planState", state, "targetGeneration", active.TargetGeneration, "steps", len(active.Steps))
-		if active.TargetGeneration != cluster.Generation {
-			cluster.Status.ActivePlan = nil
-			setCondition(&cluster, ConditionReady, metav1.ConditionFalse, "Replanning", "active plan targets an older generation")
-			setCondition(&cluster, ConditionPlanned, metav1.ConditionFalse, "PlanSuperseded", "active plan targets an older generation")
-			logger.Info("active plan superseded by generation", "planID", active.ID, "targetGeneration", active.TargetGeneration, "generation", cluster.Generation)
-			return r.finish(ctx, &cluster, ctrl.Result{Requeue: true}, nil)
-		}
-		switch state {
-		case plan.PlanStateCompleted:
-			if topologyMatchesSpec(cluster.Status.Topology, spec) {
-				active.Status = string(plan.PlanStateCompleted)
-				markNoPlanNeeded(&cluster, "topology already matches spec")
-				logger.Info("completed plan still matches spec", "planID", active.ID)
-				return r.finish(ctx, &cluster, ctrl.Result{RequeueAfter: r.TopologyRefreshInterval}, nil)
-			}
-			cluster.Status.ActivePlan = nil
-			setCondition(&cluster, ConditionReady, metav1.ConditionFalse, "Replanning", "topology drifted")
-			setCondition(&cluster, ConditionPlanned, metav1.ConditionFalse, "PlanSuperseded", "existing plan no longer valid")
-			logger.Info("completed plan drifted, replanning", "planID", active.ID)
-			return r.finish(ctx, &cluster, ctrl.Result{Requeue: true}, nil)
-		case plan.PlanStateFailed:
-			if topologyMatchesSpec(cluster.Status.Topology, spec) {
-				cluster.Status.ActivePlan = nil
-				markNoPlanNeeded(&cluster, "topology already matches spec")
-				logger.Info("failed plan cleared because topology matches spec", "planID", active.ID)
-				return r.finish(ctx, &cluster, ctrl.Result{RequeueAfter: r.TopologyRefreshInterval}, nil)
-			}
-			cluster.Status.ActivePlan = nil
-			setCondition(&cluster, ConditionReady, metav1.ConditionFalse, "Replanning", "topology drifted")
-			setCondition(&cluster, ConditionPlanned, metav1.ConditionFalse, "PlanSuperseded", "existing plan no longer valid")
-			logger.Info("failed plan cleared, replanning", "planID", active.ID)
-			return r.finish(ctx, &cluster, ctrl.Result{Requeue: true}, nil)
-		}
+	if res, err, handled := r.handleActivePlan(ctx, &cluster, spec); handled {
+		return res, err
 	}
 
 	if cluster.Status.ActivePlan == nil {
 		logger.Info("no active plan, reconciling plan")
-		return r.reconcilePlan(ctx, &cluster, spec)
+		return r.reconcilePlanIfStillNeeded(ctx, &cluster)
 	}
 
 	logger.Info("no work this reconcile")
 	return r.finish(ctx, &cluster, ctrl.Result{RequeueAfter: r.TopologyRefreshInterval}, nil)
+}
+
+func (r *RedisClusterReconciler) handleActivePlan(ctx context.Context, cluster *v1alpha1.RedisCluster, spec plan.ClusterSpec) (ctrl.Result, error, bool) {
+	logger := log.FromContext(ctx)
+	active := cluster.Status.ActivePlan
+	if active == nil {
+		return ctrl.Result{}, nil, false
+	}
+	if planState(active) == plan.PlanStateRunning {
+		logger.Info("running active plan found", "planID", active.ID, "steps", len(active.Steps), "currentStep", active.CurrentStep)
+		res, err := r.executeNextStep(ctx, cluster, active)
+		return res, err, true
+	}
+	state := planState(active)
+	logger.Info("active plan found", "planID", active.ID, "planState", state, "targetGeneration", active.TargetGeneration, "steps", len(active.Steps))
+	if active.TargetGeneration != cluster.Generation {
+		cluster.Status.ActivePlan = nil
+		setCondition(cluster, ConditionReady, metav1.ConditionFalse, "Replanning", "active plan targets an older generation")
+		setCondition(cluster, ConditionPlanned, metav1.ConditionFalse, "PlanSuperseded", "active plan targets an older generation")
+		logger.Info("active plan superseded by generation", "planID", active.ID, "targetGeneration", active.TargetGeneration, "generation", cluster.Generation)
+		res, err := r.finish(ctx, cluster, ctrl.Result{Requeue: true}, nil)
+		return res, err, true
+	}
+	switch state {
+	case plan.PlanStateCompleted:
+		if topologyMatchesSpec(cluster.Status.Topology, spec) {
+			active.Status = string(plan.PlanStateCompleted)
+			markNoPlanNeeded(cluster, "topology already matches spec")
+			logger.Info("completed plan still matches spec", "planID", active.ID)
+			res, err := r.finish(ctx, cluster, ctrl.Result{RequeueAfter: r.TopologyRefreshInterval}, nil)
+			return res, err, true
+		}
+		cluster.Status.ActivePlan = nil
+		setCondition(cluster, ConditionReady, metav1.ConditionFalse, "Replanning", "topology drifted")
+		setCondition(cluster, ConditionPlanned, metav1.ConditionFalse, "PlanSuperseded", "existing plan no longer valid")
+		logger.Info("completed plan drifted, replanning", "planID", active.ID)
+		res, err := r.finish(ctx, cluster, ctrl.Result{Requeue: true}, nil)
+		return res, err, true
+	case plan.PlanStateFailed:
+		if topologyMatchesSpec(cluster.Status.Topology, spec) {
+			cluster.Status.ActivePlan = nil
+			markNoPlanNeeded(cluster, "topology already matches spec")
+			logger.Info("failed plan cleared because topology matches spec", "planID", active.ID)
+			res, err := r.finish(ctx, cluster, ctrl.Result{RequeueAfter: r.TopologyRefreshInterval}, nil)
+			return res, err, true
+		}
+		cluster.Status.ActivePlan = nil
+		setCondition(cluster, ConditionReady, metav1.ConditionFalse, "Replanning", "topology drifted")
+		setCondition(cluster, ConditionPlanned, metav1.ConditionFalse, "PlanSuperseded", "existing plan no longer valid")
+		logger.Info("failed plan cleared, replanning", "planID", active.ID)
+		res, err := r.finish(ctx, cluster, ctrl.Result{Requeue: true}, nil)
+		return res, err, true
+	default:
+		logger.Info("no work this reconcile")
+		res, err := r.finish(ctx, cluster, ctrl.Result{RequeueAfter: r.TopologyRefreshInterval}, nil)
+		return res, err, true
+	}
+}
+
+func (r *RedisClusterReconciler) reconcilePlanIfStillNeeded(ctx context.Context, cluster *v1alpha1.RedisCluster) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+	var latest v1alpha1.RedisCluster
+	if err := r.APIReader.Get(ctx, client.ObjectKeyFromObject(cluster), &latest); err != nil {
+		if apierrors.IsNotFound(err) {
+			logger.Info("rediscluster not found before planning")
+			return ctrl.Result{}, nil
+		}
+		logger.Error(err, "fresh rediscluster get before planning failed")
+		return ctrl.Result{}, err
+	}
+	spec := toClusterSpec(&latest)
+	if res, err, handled := r.handleActivePlan(ctx, &latest, spec); handled {
+		logger.Info("fresh active plan found before planning")
+		return res, err
+	}
+	logger.Info("fresh read confirmed no active plan, reconciling plan")
+	return r.reconcilePlan(ctx, cluster, toClusterSpec(cluster))
 }
 
 func (r *RedisClusterReconciler) reconcilePlan(ctx context.Context, cluster *v1alpha1.RedisCluster, spec plan.ClusterSpec) (ctrl.Result, error) {

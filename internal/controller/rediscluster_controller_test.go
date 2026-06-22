@@ -41,6 +41,23 @@ type statusUpdateErrorClient struct {
 	err error
 }
 
+type staleFirstGetClient struct {
+	client.Client
+	stale *api.RedisCluster
+	gets  int
+}
+
+func (c *staleFirstGetClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if got, ok := obj.(*api.RedisCluster); ok && key.Name == c.stale.Name && key.Namespace == c.stale.Namespace {
+		c.gets++
+		if c.gets == 1 {
+			c.stale.DeepCopyInto(got)
+			return nil
+		}
+	}
+	return c.Client.Get(ctx, key, obj, opts...)
+}
+
 func (c statusUpdateErrorClient) Status() client.SubResourceWriter {
 	return statusUpdateErrorWriter{err: c.err}
 }
@@ -1168,6 +1185,40 @@ func TestReconcile_ActiveDriftPlanExecutesWhenDriftStillObserved(t *testing.T) {
 	}
 	if got.Status.NextPodOrdinal != 5 {
 		t.Fatalf("expected nextPodOrdinal to stay 5, got %d", got.Status.NextPodOrdinal)
+	}
+}
+
+func TestReconcile_FreshActivePlanSkipsStalePlanning(t *testing.T) {
+	ctx := context.Background()
+	scheme := newScheme(t)
+	stale := missingReplicaCluster(5)
+	fresh := stale.DeepCopy()
+	fresh.Status.ActivePlan = runningPlan()
+	base := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
+		fresh,
+		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "example"}},
+	).WithStatusSubresource(&api.RedisCluster{}).Build()
+	cl := &staleFirstGetClient{Client: base, stale: stale}
+	fp := &recordingPlanner{err: errors.New("unexpected planner call")}
+	exec := &recordingExecutor{}
+	r := &RedisClusterReconciler{
+		Client: cl, APIReader: base, Scheme: scheme, Planner: fp, Driver: exec,
+		ValidatePlan:            plan.NewValidator().Validate,
+		TopologyRefreshInterval: time.Minute, TopologyStaleThreshold: time.Hour,
+	}
+
+	res, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "example"}})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if !res.Requeue {
+		t.Fatal("expected requeue after completing first step")
+	}
+	if fp.called != 0 {
+		t.Fatalf("expected no planner call, got %d", fp.called)
+	}
+	if exec.called != 1 || exec.index != 0 {
+		t.Fatalf("expected executor step 0 once, got calls=%d index=%d", exec.called, exec.index)
 	}
 }
 

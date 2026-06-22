@@ -91,6 +91,7 @@ func main() {
 	executor := &controller.ActionExecutor{Client: mgr.GetClient(), Scheme: scheme, RedisFactory: redis.DefaultFactory}
 	if err = (&controller.RedisClusterReconciler{
 		Client:                  mgr.GetClient(),
+		APIReader:               mgr.GetAPIReader(),
 		Scheme:                  scheme,
 		Planner:                 p,
 		Driver:                  executor,
