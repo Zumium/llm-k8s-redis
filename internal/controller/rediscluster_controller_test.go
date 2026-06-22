@@ -207,6 +207,53 @@ func TestReconcile_RetriesRejectedPlanWithValidatorFeedback(t *testing.T) {
 	}
 }
 
+func TestReconcile_RechecksObservedNodesBeforeValidationRetry(t *testing.T) {
+	ctx := context.Background()
+	scheme := newScheme(t)
+	cluster := clusterWithTopology()
+	cluster.Finalizers = []string{finalizer}
+	mismatch := []plan.ObservedNode{
+		{Pod: "redis-0", PodExists: true, RedisSeen: true, NodeID: "master-0", Role: "master", Slots: "0-8191", Ready: true},
+		{Pod: "redis-2", PodExists: true, RedisSeen: true, NodeID: "master-2", Role: "master", Slots: "8192-16383", Ready: true},
+	}
+	match := []plan.ObservedNode{
+		{Pod: "redis-0", PodExists: true, RedisSeen: true, NodeID: "master-0", Role: "master", Slots: "0-8191", Ready: true},
+		{Pod: "redis-1", PodExists: true, RedisSeen: true, NodeID: "replica-1", Role: "replica", MasterPod: "redis-0", Ready: true},
+		{Pod: "redis-2", PodExists: true, RedisSeen: true, NodeID: "master-2", Role: "master", Slots: "8192-16383", Ready: true},
+		{Pod: "redis-3", PodExists: true, RedisSeen: true, NodeID: "replica-3", Role: "replica", MasterPod: "redis-2", Ready: true},
+	}
+	fp := &recordingPlanner{plan: &plan.Plan{DSLVersion: plan.DSLVersion, PlanID: "bad", TargetGeneration: 1, Steps: []plan.Step{{ID: "bad", Action: plan.ActionVerifyCluster}}}}
+	validator := &recordingValidator{err: errors.New("validator says no")}
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "example"}}).
+		WithStatusSubresource(&api.RedisCluster{}).
+		Build()
+	r := &RedisClusterReconciler{
+		Client: cl, Scheme: scheme,
+		Planner: fp, Driver: &recordingObserver{nodeSets: [][]plan.ObservedNode{mismatch, match}}, ValidatePlan: validator.Validate,
+		TopologyRefreshInterval: time.Minute, TopologyStaleThreshold: time.Hour,
+		PlanValidationRetries: 1,
+	}
+
+	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "example"}}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if fp.called != 1 {
+		t.Fatalf("planner calls = %d", fp.called)
+	}
+	var got api.RedisCluster
+	if err := cl.Get(ctx, types.NamespacedName{Name: "example"}, &got); err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.Status.ActivePlan != nil {
+		t.Fatalf("activePlan = %#v", got.Status.ActivePlan)
+	}
+	if !hasCondition(got.Status.Conditions, ConditionReady, metav1.ConditionTrue, "ClusterReady") {
+		t.Fatalf("expected Ready=True/ClusterReady, got %#v", got.Status.Conditions)
+	}
+}
+
 func TestReconcile_PlanValidationRetriesZeroRejectsOnce(t *testing.T) {
 	ctx := context.Background()
 	scheme := newScheme(t)
@@ -347,8 +394,9 @@ func TestReconcile_DeletesNamespaceOnDeletion(t *testing.T) {
 }
 
 type recordingObserver struct {
-	called int
-	nodes  []plan.ObservedNode
+	called   int
+	nodes    []plan.ObservedNode
+	nodeSets [][]plan.ObservedNode
 }
 
 func (o *recordingObserver) ObserveTopology(_ context.Context, _ *api.RedisCluster) error {
@@ -357,6 +405,11 @@ func (o *recordingObserver) ObserveTopology(_ context.Context, _ *api.RedisClust
 }
 
 func (o *recordingObserver) CollectObservedNodes(_ context.Context, _ *api.RedisCluster) ([]plan.ObservedNode, error) {
+	if len(o.nodeSets) > 0 {
+		nodes := o.nodeSets[0]
+		o.nodeSets = o.nodeSets[1:]
+		return nodes, nil
+	}
 	return o.nodes, nil
 }
 

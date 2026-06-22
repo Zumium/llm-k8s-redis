@@ -186,28 +186,28 @@ func (r *RedisClusterReconciler) reconcilePlan(ctx context.Context, cluster *v1a
 
 	logger.Info("planning started")
 	req := toPlannerRequest(cluster, spec)
-	collectStart := time.Now()
-	nodes, err := r.Driver.CollectObservedNodes(ctx, cluster)
-	if err != nil {
-		logger.Error(err, "collect observed nodes failed", "duration", time.Since(collectStart))
-		setCondition(cluster, ConditionPlanned, metav1.ConditionFalse, "ObservedNodesFailed", err.Error())
-		cluster.Status.ObservedGeneration = cluster.Generation
-		return r.finish(ctx, cluster, ctrl.Result{RequeueAfter: 10 * time.Second}, nil)
-	}
-	logger.Info("observed nodes collected", "nodes", len(nodes), "duration", time.Since(collectStart))
-	req.ObservedState.Nodes = nodes
-	if observedNodesMatchSpec(nodes, spec) {
-		cluster.Status.ActivePlan = nil
-		markNoPlanNeeded(cluster, "live topology already matches spec")
-		logger.Info("live topology already matches spec, skipping planner")
-		return r.finish(ctx, cluster, ctrl.Result{RequeueAfter: r.TopologyRefreshInterval}, nil)
-	}
-
 	validationRetries := r.PlanValidationRetries
 	if validationRetries < 0 {
 		validationRetries = 0
 	}
 	for attempt := 0; attempt <= validationRetries; attempt++ {
+		collectStart := time.Now()
+		nodes, err := r.Driver.CollectObservedNodes(ctx, cluster)
+		if err != nil {
+			logger.Error(err, "collect observed nodes failed", "attempt", attempt, "duration", time.Since(collectStart))
+			setCondition(cluster, ConditionPlanned, metav1.ConditionFalse, "ObservedNodesFailed", err.Error())
+			cluster.Status.ObservedGeneration = cluster.Generation
+			return r.finish(ctx, cluster, ctrl.Result{RequeueAfter: 10 * time.Second}, nil)
+		}
+		logger.Info("observed nodes collected", "attempt", attempt, "nodes", len(nodes), "duration", time.Since(collectStart))
+		req.ObservedState.Nodes = nodes
+		if observedNodesMatchSpec(nodes, spec) {
+			cluster.Status.ActivePlan = nil
+			markNoPlanNeeded(cluster, "live topology already matches spec")
+			logger.Info("live topology already matches spec, skipping planner", "attempt", attempt)
+			return r.finish(ctx, cluster, ctrl.Result{RequeueAfter: r.TopologyRefreshInterval}, nil)
+		}
+
 		attemptStart := time.Now()
 		logger.Info("planner attempt started", "attempt", attempt, "maxAttempts", validationRetries+1, "feedback", len(req.ValidationFeedback))
 		newPlan, err := r.Planner.Plan(ctx, req)
