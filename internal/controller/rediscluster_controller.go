@@ -173,7 +173,7 @@ func (r *RedisClusterReconciler) reconcilePlan(ctx context.Context, cluster *v1a
 			logger.Error(err, "planner returned an error")
 			setCondition(cluster, ConditionPlanned, metav1.ConditionFalse, "PlannerFailed", err.Error())
 			cluster.Status.ObservedGeneration = cluster.Generation
-			return r.finish(ctx, cluster, ctrl.Result{}, nil)
+			return r.finish(ctx, cluster, ctrl.Result{RequeueAfter: 10 * time.Second}, nil)
 		}
 		if newPlan == nil {
 			setCondition(cluster, ConditionPlanned, metav1.ConditionFalse, "PlannerEmpty", "planner returned no plan")
@@ -194,14 +194,14 @@ func (r *RedisClusterReconciler) reconcilePlan(ctx context.Context, cluster *v1a
 			setCondition(cluster, ConditionPlanned, metav1.ConditionFalse, "PlanRejected", err.Error())
 			cluster.Status.ObservedGeneration = cluster.Generation
 			r.event(cluster, "PlanRejected", err.Error())
-			return r.finish(ctx, cluster, ctrl.Result{}, nil)
+			return r.finish(ctx, cluster, ctrl.Result{RequeueAfter: 10 * time.Second}, nil)
 		}
 		advanceNextPodOrdinalFromPlan(cluster, newPlan)
 		cluster.Status.ActivePlan, err = planToStatus(newPlan)
 		if err != nil {
 			setCondition(cluster, ConditionPlanned, metav1.ConditionFalse, "PlanPersistFailed", err.Error())
 			cluster.Status.ObservedGeneration = cluster.Generation
-			return r.finish(ctx, cluster, ctrl.Result{}, nil)
+			return r.finish(ctx, cluster, ctrl.Result{RequeueAfter: 10 * time.Second}, nil)
 		}
 		cluster.Status.ObservedGeneration = cluster.Generation
 		setCondition(cluster, ConditionPlanned, metav1.ConditionTrue, "PlanAccepted", "plan passed validation")
