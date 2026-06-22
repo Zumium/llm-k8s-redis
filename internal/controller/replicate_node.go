@@ -6,6 +6,7 @@ import (
 
 	v1alpha1 "github.com/example/llm-k8s-redis/api/v1alpha1"
 	"github.com/example/llm-k8s-redis/internal/plan"
+	"github.com/example/llm-k8s-redis/internal/rediscluster"
 )
 
 func (e *ActionExecutor) replicateNode(ctx context.Context, cluster *v1alpha1.RedisCluster, p *plan.Plan, stepIndex int) (StepOutcome, error) {
@@ -74,19 +75,19 @@ func (e *ActionExecutor) replicateNode(ctx context.Context, cluster *v1alpha1.Re
 	if err != nil {
 		return running("replica redis at %s CLUSTER NODES failed: %v", replicaAddr, err), nil
 	}
-	entries := parseClusterNodes(nodesOut)
-	masterEntry := findByIP(entries, masterK8SPod.Status.PodIP)
+	entries := rediscluster.ParseNodes(nodesOut)
+	masterEntry := rediscluster.FindByIP(entries, masterK8SPod.Status.PodIP)
 	if masterEntry == nil {
 		return running("master %s/%s (ip %s) not yet visible in CLUSTER NODES", ns, masterPod, masterK8SPod.Status.PodIP), nil
 	}
-	if !masterEntry.isMaster() {
+	if !masterEntry.IsMaster() {
 		return paramErr("pod %s/%s is not a master (flags=%v)", ns, masterPod, masterEntry.Flags)
 	}
-	replicaEntry := findByIP(entries, replicaK8SPod.Status.PodIP)
+	replicaEntry := rediscluster.FindByIP(entries, replicaK8SPod.Status.PodIP)
 	if replicaEntry == nil {
 		return running("replica %s/%s (ip %s) not yet visible in CLUSTER NODES", ns, replicaPod, replicaK8SPod.Status.PodIP), nil
 	}
-	if replicaEntry.hasFlag("fail") || replicaEntry.hasFlag("fail?") {
+	if replicaEntry.HasFlag("fail") || replicaEntry.HasFlag("fail?") {
 		return paramErr("replica %s/%s is in a failed state (flags=%v)", ns, replicaPod, replicaEntry.Flags)
 	}
 
@@ -96,7 +97,7 @@ func (e *ActionExecutor) replicateNode(ctx context.Context, cluster *v1alpha1.Re
 		return completed("replica %s/%s already replicates master %s/%s", ns, replicaPod, ns, masterPod), nil
 	}
 
-	if replicaEntry.hasSlots() {
+	if replicaEntry.HasSlots() {
 		return paramErr("replica %s/%s owns slots and cannot be turned into a replica", ns, replicaPod)
 	}
 
@@ -108,8 +109,8 @@ func (e *ActionExecutor) replicateNode(ctx context.Context, cluster *v1alpha1.Re
 	if err != nil {
 		return running("replica redis at %s CLUSTER NODES after replicate failed: %v", replicaAddr, err), nil
 	}
-	entries = parseClusterNodes(nodesOut)
-	replicaEntry = findByIP(entries, replicaK8SPod.Status.PodIP)
+	entries = rediscluster.ParseNodes(nodesOut)
+	replicaEntry = rediscluster.FindByIP(entries, replicaK8SPod.Status.PodIP)
 	if replicaEntry == nil {
 		return running("replica %s/%s disappeared after CLUSTER REPLICATE", ns, replicaPod), nil
 	}

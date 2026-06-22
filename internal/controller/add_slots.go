@@ -6,6 +6,7 @@ import (
 
 	v1alpha1 "github.com/example/llm-k8s-redis/api/v1alpha1"
 	"github.com/example/llm-k8s-redis/internal/plan"
+	"github.com/example/llm-k8s-redis/internal/rediscluster"
 )
 
 const addSlotsBatchSize = 512
@@ -33,7 +34,7 @@ func (e *ActionExecutor) addSlots(ctx context.Context, cluster *v1alpha1.RedisCl
 	if !precededWaitNodeReady(p, stepIndex, ns, podName) {
 		return paramErr("pod %s/%s has not completed a preceding WaitNodeReady", ns, podName)
 	}
-	desired, err := parseSlotSpec(slotsSpec)
+	desired, err := rediscluster.ParseSlotSpec(slotsSpec)
 	if err != nil {
 		return paramErr("invalid slots %q: %v", slotsSpec, err)
 	}
@@ -67,23 +68,23 @@ func (e *ActionExecutor) addSlots(ctx context.Context, cluster *v1alpha1.RedisCl
 	if err != nil {
 		return running("redis at %s CLUSTER NODES failed: %v", addr, err), nil
 	}
-	entries := parseClusterNodes(nodesOut)
-	target := findByIP(entries, pod.Status.PodIP)
+	entries := rediscluster.ParseNodes(nodesOut)
+	target := rediscluster.FindByIP(entries, pod.Status.PodIP)
 	if target == nil {
 		return running("target %s/%s (ip %s) not yet visible in CLUSTER NODES", ns, podName, pod.Status.PodIP), nil
 	}
-	if !target.isMaster() {
+	if !target.IsMaster() {
 		return paramErr("target %s/%s is not a master (flags=%v)", ns, podName, target.Flags)
 	}
-	if !target.healthy() {
+	if !target.Healthy() {
 		return paramErr("target master %s/%s is not healthy (flags=%v link=%q)", ns, podName, target.Flags, target.LinkState)
 	}
-	if !masterHasHealthyReplica(entries, target.ID) {
+	if !rediscluster.MasterHasHealthyReplica(entries, target.ID) {
 		return running("master %s/%s has no healthy replica yet; waiting before AddSlots", ns, podName), nil
 	}
 
-	migrating := migratingSlots(entries)
-	owner, err := slotOwnership(entries)
+	migrating := rediscluster.MigratingSlots(entries)
+	owner, err := rediscluster.SlotOwnership(entries)
 	if err != nil {
 		return StepOutcome{Status: plan.StepStateFailed, Message: fmt.Sprintf("parse slot ownership: %v", err)}, err
 	}
@@ -122,12 +123,12 @@ func (e *ActionExecutor) addSlots(ctx context.Context, cluster *v1alpha1.RedisCl
 	if err != nil {
 		return running("redis at %s CLUSTER NODES after addslots failed: %v", addr, err), nil
 	}
-	entries = parseClusterNodes(nodesOut)
-	target = findByIP(entries, pod.Status.PodIP)
+	entries = rediscluster.ParseNodes(nodesOut)
+	target = rediscluster.FindByIP(entries, pod.Status.PodIP)
 	if target == nil {
 		return running("target %s/%s disappeared after CLUSTER ADDSLOTS", ns, podName), nil
 	}
-	owner, err = slotOwnership(entries)
+	owner, err = rediscluster.SlotOwnership(entries)
 	if err != nil {
 		return StepOutcome{Status: plan.StepStateFailed, Message: fmt.Sprintf("parse slot ownership after addslots: %v", err)}, err
 	}
@@ -151,7 +152,7 @@ func precedingAddSlotsOverlap(p *plan.Plan, stepIndex int, ns string, _ string, 
 		if !ok1 || ens != ns {
 			continue
 		}
-		prev, err := parseSlotSpec(stringOrEmpty(s.Params, "slots"))
+		prev, err := rediscluster.ParseSlotSpec(stringOrEmpty(s.Params, "slots"))
 		if err != nil {
 			continue
 		}
@@ -173,15 +174,6 @@ func stringOrEmpty(params map[string]any, key string) string {
 		return ""
 	}
 	return v
-}
-
-func masterHasHealthyReplica(entries []clusterNodeEntry, masterID string) bool {
-	for _, e := range entries {
-		if e.isReplica() && e.MasterID == masterID && e.healthy() {
-			return true
-		}
-	}
-	return false
 }
 
 func refreshExistingTopologySlots(cluster *v1alpha1.RedisCluster, podName, nodeID, slots string) {

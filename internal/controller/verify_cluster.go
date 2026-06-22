@@ -9,6 +9,7 @@ import (
 
 	v1alpha1 "github.com/example/llm-k8s-redis/api/v1alpha1"
 	"github.com/example/llm-k8s-redis/internal/plan"
+	"github.com/example/llm-k8s-redis/internal/rediscluster"
 )
 
 func (e *ActionExecutor) verifyCluster(ctx context.Context, cluster *v1alpha1.RedisCluster, _ *plan.Plan, step plan.Step) (StepOutcome, error) {
@@ -63,11 +64,11 @@ func (e *ActionExecutor) verifyCluster(ctx context.Context, cluster *v1alpha1.Re
 	if bad := firstUnhealthyManagedNode(obs.entries); bad != "" {
 		return paramErr("cluster node not healthy: %s", bad)
 	}
-	if migrating := migratingSlots(obs.entries); len(migrating) > 0 {
+	if migrating := rediscluster.MigratingSlots(obs.entries); len(migrating) > 0 {
 		return paramErr("cluster has %d slots in migrating/importing state", len(migrating))
 	}
 
-	owner, err := slotOwnership(obs.entries)
+	owner, err := rediscluster.SlotOwnership(obs.entries)
 	if err != nil {
 		return StepOutcome{Status: plan.StepStateFailed, Message: fmt.Sprintf("slot ownership inconsistent: %v", err)}, err
 	}
@@ -75,12 +76,12 @@ func (e *ActionExecutor) verifyCluster(ctx context.Context, cluster *v1alpha1.Re
 		return paramErr("slot coverage violation: %s", viol)
 	}
 
-	masters := healthyMasters(obs.entries)
+	masters := rediscluster.HealthyMasters(obs.entries)
 	if len(masters) != expectedShards {
 		return paramErr("expected %d masters, found %d", expectedShards, len(masters))
 	}
 	for _, m := range masters {
-		replicas := healthyReplicasOf(obs.entries, m.ID)
+		replicas := rediscluster.HealthyReplicasOf(obs.entries, m.ID)
 		if len(replicas) != expectedReplicas {
 			return paramErr("master %s has %d healthy replicas, expected %d", m.ID, len(replicas), expectedReplicas)
 		}
@@ -95,26 +96,26 @@ func (e *ActionExecutor) verifyCluster(ctx context.Context, cluster *v1alpha1.Re
 	return completed("cluster verified: %d masters, %d replicas/master, full slot coverage", expectedShards, expectedReplicas), nil
 }
 
-func firstUnhealthyManagedNode(entries []clusterNodeEntry) string {
+func firstUnhealthyManagedNode(entries []rediscluster.Entry) string {
 	for _, e := range entries {
-		if e.hasFlag("handshake") || e.hasFlag("noaddr") {
+		if e.HasFlag("handshake") || e.HasFlag("noaddr") {
 			continue
 		}
-		if !e.healthy() {
+		if !e.Healthy() {
 			return fmt.Sprintf("id=%s addr=%s flags=%v link=%s", e.ID, e.Addr, e.Flags, e.LinkState)
 		}
 	}
 	return ""
 }
 
-func verifyFullSlotCoverage(owner map[int]string, entries []clusterNodeEntry) string {
-	mastersByID := map[string]*clusterNodeEntry{}
+func verifyFullSlotCoverage(owner map[int]string, entries []rediscluster.Entry) string {
+	mastersByID := map[string]*rediscluster.Entry{}
 	for i := range entries {
-		if entries[i].isMaster() {
+		if entries[i].IsMaster() {
 			mastersByID[entries[i].ID] = &entries[i]
 		}
 	}
-	for s := 0; s <= slotRangeBound; s++ {
+	for s := 0; s <= rediscluster.SlotRangeBound; s++ {
 		nodeID, ok := owner[s]
 		if !ok {
 			return fmt.Sprintf("slot %d unassigned", s)
@@ -123,19 +124,19 @@ func verifyFullSlotCoverage(owner map[int]string, entries []clusterNodeEntry) st
 		if !ok {
 			return fmt.Sprintf("slot %d owner %s is not a master", s, nodeID)
 		}
-		if !m.healthy() {
+		if !m.Healthy() {
 			return fmt.Sprintf("slot %d owner %s is not healthy", s, nodeID)
 		}
 	}
 	return ""
 }
 
-func firstUnmappedNode(entries []clusterNodeEntry, podsByIP map[string]*corev1.Pod) string {
+func firstUnmappedNode(entries []rediscluster.Entry, podsByIP map[string]*corev1.Pod) string {
 	for _, e := range entries {
-		if e.hasFlag("handshake") || e.hasFlag("noaddr") {
+		if e.HasFlag("handshake") || e.HasFlag("noaddr") {
 			continue
 		}
-		ip := ipFromAddr(e.Addr)
+		ip := rediscluster.IPFromAddr(e.Addr)
 		if ip == "" {
 			return fmt.Sprintf("id=%s has unparseable addr %q", e.ID, e.Addr)
 		}

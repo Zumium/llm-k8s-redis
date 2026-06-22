@@ -3,8 +3,6 @@ package controller
 import (
 	"context"
 	"fmt"
-	"strconv"
-	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -14,6 +12,7 @@ import (
 	v1alpha1 "github.com/example/llm-k8s-redis/api/v1alpha1"
 	"github.com/example/llm-k8s-redis/internal/plan"
 	"github.com/example/llm-k8s-redis/internal/redis"
+	"github.com/example/llm-k8s-redis/internal/rediscluster"
 )
 
 const (
@@ -54,7 +53,7 @@ func (e *ActionExecutor) migrateSlots(ctx context.Context, cluster *v1alpha1.Red
 	if !precededWaitNodeReady(p, stepIndex, ns, targetPodName) && !podInTopology(cluster, targetPodName) {
 		return paramErr("target pod %s/%s has not completed a preceding WaitNodeReady", ns, targetPodName)
 	}
-	desired, err := parseSlotSpec(slotsSpec)
+	desired, err := rediscluster.ParseSlotSpec(slotsSpec)
 	if err != nil {
 		return paramErr("invalid slots %q: %v", slotsSpec, err)
 	}
@@ -102,33 +101,33 @@ func (e *ActionExecutor) migrateSlots(ctx context.Context, cluster *v1alpha1.Red
 	if err != nil {
 		return running("source redis at %s CLUSTER NODES failed: %v", podRedisAddr(sourcePod), err), nil
 	}
-	entries := parseClusterNodes(nodesOut)
-	source := findByIP(entries, sourcePod.Status.PodIP)
+	entries := rediscluster.ParseNodes(nodesOut)
+	source := rediscluster.FindByIP(entries, sourcePod.Status.PodIP)
 	if source == nil {
 		return running("source %s/%s (ip %s) not yet visible in CLUSTER NODES", ns, sourcePodName, sourcePod.Status.PodIP), nil
 	}
-	target := findByIP(entries, targetPod.Status.PodIP)
+	target := rediscluster.FindByIP(entries, targetPod.Status.PodIP)
 	if target == nil {
 		return running("target %s/%s (ip %s) not yet visible in CLUSTER NODES", ns, targetPodName, targetPod.Status.PodIP), nil
 	}
-	if !source.isMaster() || !source.healthy() {
+	if !source.IsMaster() || !source.Healthy() {
 		return paramErr("source %s/%s is not a healthy master (flags=%v link=%q)", ns, sourcePodName, source.Flags, source.LinkState)
 	}
-	if !target.isMaster() || !target.healthy() {
+	if !target.IsMaster() || !target.Healthy() {
 		return paramErr("target %s/%s is not a healthy master (flags=%v link=%q)", ns, targetPodName, target.Flags, target.LinkState)
 	}
-	if !masterHasHealthyReplica(entries, target.ID) {
+	if !rediscluster.MasterHasHealthyReplica(entries, target.ID) {
 		return running("target master %s/%s has no healthy replica yet; waiting before MigrateSlots", ns, targetPodName), nil
 	}
 
-	owner, err := slotOwnership(entries)
+	owner, err := rediscluster.SlotOwnership(entries)
 	if err != nil {
 		return StepOutcome{Status: plan.StepStateFailed, Message: fmt.Sprintf("parse slot ownership: %v", err)}, err
 	}
-	markers := slotMigrationMarkers(entries)
+	markers := rediscluster.SlotMigrationMarkers(entries)
 	for _, slot := range desired {
-		if marker, ok := markers[slot]; ok && (marker.sourceID != source.ID || marker.targetID != target.ID) {
-			return paramErr("slot %d is migrating/importing between %s and %s, not requested %s->%s", slot, marker.sourceID, marker.targetID, source.ID, target.ID)
+		if marker, ok := markers[slot]; ok && (marker.SourceID != source.ID || marker.TargetID != target.ID) {
+			return paramErr("slot %d is migrating/importing between %s and %s, not requested %s->%s", slot, marker.SourceID, marker.TargetID, source.ID, target.ID)
 		}
 		cur, ok := owner[slot]
 		if !ok {
@@ -158,7 +157,7 @@ func (e *ActionExecutor) migrateSlots(ctx context.Context, cluster *v1alpha1.Red
 			return StepOutcome{Status: plan.StepStateFailed, Message: fmt.Sprintf("GETKEYSINSLOT slot %d: %v", slot, err)}, err
 		}
 		if len(keys) > 0 {
-			host, port := redisHostPortFromAddr(target.Addr)
+			host, port := rediscluster.RedisHostPortFromAddr(target.Addr)
 			if err := sourceRC.MigrateKeys(ctx, host, port, keys, migrateKeyTimeout); err != nil {
 				return StepOutcome{Status: plan.StepStateFailed, Message: fmt.Sprintf("MIGRATE slot %d keys: %v", slot, err)}, err
 			}
@@ -174,12 +173,12 @@ func (e *ActionExecutor) migrateSlots(ctx context.Context, cluster *v1alpha1.Red
 	if err != nil {
 		return running("source redis at %s CLUSTER NODES after migration failed: %v", podRedisAddr(sourcePod), err), nil
 	}
-	entries = parseClusterNodes(nodesOut)
-	owner, err = slotOwnership(entries)
+	entries = rediscluster.ParseNodes(nodesOut)
+	owner, err = rediscluster.SlotOwnership(entries)
 	if err != nil {
 		return StepOutcome{Status: plan.StepStateFailed, Message: fmt.Sprintf("parse slot ownership after migration: %v", err)}, err
 	}
-	target = findByIP(entries, targetPod.Status.PodIP)
+	target = rediscluster.FindByIP(entries, targetPod.Status.PodIP)
 	if target == nil {
 		return running("target %s/%s disappeared after migration", ns, targetPodName), nil
 	}
@@ -208,56 +207,12 @@ func podDeclaredOrInTopology(cluster *v1alpha1.RedisCluster, p *plan.Plan, stepI
 	return precededEnsureNode(p, stepIndex, ns, podName) || podInTopology(cluster, podName)
 }
 
-type slotMigrationMarker struct {
-	sourceID string
-	targetID string
-}
-
-func slotMigrationMarkers(entries []clusterNodeEntry) map[int]slotMigrationMarker {
-	out := map[int]slotMigrationMarker{}
+func setSlotNodeOnHealthyMasters(ctx context.Context, factory redis.Factory, entries []rediscluster.Entry, slot int, targetID string) error {
 	for _, entry := range entries {
-		for _, tok := range entry.Slots {
-			if !strings.ContainsAny(tok, "[]") {
-				continue
-			}
-			inner := strings.Trim(tok, "[]")
-			if idx := strings.Index(inner, "->-"); idx >= 0 {
-				slot, ok := migrationMarkerSlot(inner[:idx])
-				if !ok {
-					continue
-				}
-				out[slot] = slotMigrationMarker{sourceID: entry.ID, targetID: strings.TrimSpace(inner[idx+3:])}
-				continue
-			}
-			if idx := strings.Index(inner, "<-"); idx >= 0 {
-				slot, ok := migrationMarkerSlot(inner[:idx])
-				if !ok {
-					continue
-				}
-				m := out[slot]
-				m.sourceID = strings.TrimSpace(inner[idx+2:])
-				m.targetID = entry.ID
-				out[slot] = m
-			}
-		}
-	}
-	return out
-}
-
-func migrationMarkerSlot(raw string) (int, bool) {
-	n, err := strconv.Atoi(strings.TrimSuffix(strings.TrimSpace(raw), "-"))
-	if err != nil || n < 0 || n > slotRangeBound {
-		return 0, false
-	}
-	return n, true
-}
-
-func setSlotNodeOnHealthyMasters(ctx context.Context, factory redis.Factory, entries []clusterNodeEntry, slot int, targetID string) error {
-	for _, entry := range entries {
-		if !entry.isMaster() || !entry.healthy() {
+		if !entry.IsMaster() || !entry.Healthy() {
 			continue
 		}
-		addr := redisAddrFromClusterAddr(entry.Addr)
+		addr := rediscluster.RedisAddrFromClusterAddr(entry.Addr)
 		rc, err := factory(addr)
 		if err != nil {
 			return fmt.Errorf("build redis client for %s: %w", addr, err)
@@ -271,27 +226,4 @@ func setSlotNodeOnHealthyMasters(ctx context.Context, factory redis.Factory, ent
 		}
 	}
 	return nil
-}
-
-func redisAddrFromClusterAddr(addr string) string {
-	if i := strings.Index(addr, "@"); i >= 0 {
-		return addr[:i]
-	}
-	return addr
-}
-
-func redisHostPortFromAddr(addr string) (string, int) {
-	addr = redisAddrFromClusterAddr(addr)
-	host := addr
-	port := 6379
-	if i := strings.LastIndex(addr, ":"); i >= 0 {
-		host = addr[:i]
-		if n, err := strconv.Atoi(addr[i+1:]); err == nil && n > 0 {
-			port = n
-		}
-	}
-	if host == "" {
-		host = "127.0.0.1"
-	}
-	return host, port
 }

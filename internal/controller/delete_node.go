@@ -10,6 +10,7 @@ import (
 
 	v1alpha1 "github.com/example/llm-k8s-redis/api/v1alpha1"
 	"github.com/example/llm-k8s-redis/internal/plan"
+	"github.com/example/llm-k8s-redis/internal/rediscluster"
 )
 
 func (e *ActionExecutor) deleteNode(ctx context.Context, cluster *v1alpha1.RedisCluster, step plan.Step) (StepOutcome, error) {
@@ -53,16 +54,16 @@ func (e *ActionExecutor) deleteNode(ctx context.Context, cluster *v1alpha1.Redis
 	if err != nil {
 		return running("CLUSTER NODES failed before DeleteNode: %v", err), nil
 	}
-	entries := parseClusterNodes(nodesOut)
-	if target.Status.PodIP != "" && findByIP(entries, target.Status.PodIP) != nil {
+	entries := rediscluster.ParseNodes(nodesOut)
+	if target.Status.PodIP != "" && rediscluster.FindByIP(entries, target.Status.PodIP) != nil {
 		return paramErr("cannot delete pod %s/%s because it is still a Redis Cluster member", ns, podName)
 	}
 	podToNodeID, _ := lastKnownNodeMaps(cluster)
-	if nodeID := podToNodeID[podName]; nodeID != "" && findByID(entries, nodeID) != nil {
+	if nodeID := podToNodeID[podName]; nodeID != "" && rediscluster.FindByID(entries, nodeID) != nil {
 		return paramErr("cannot delete pod %s/%s because node %s is still a Redis Cluster member", ns, podName, nodeID)
 	}
 	for _, entry := range entries {
-		if entry.isMaster() && entry.hasSlots() && len(healthyReplicasOf(entries, entry.ID)) == 0 {
+		if entry.IsMaster() && entry.HasSlots() && len(rediscluster.HealthyReplicasOf(entries, entry.ID)) == 0 {
 			return paramErr("cannot delete pod %s/%s because master %s has no healthy replica", ns, podName, entry.ID)
 		}
 	}

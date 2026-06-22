@@ -15,10 +15,11 @@ import (
 	v1alpha1 "github.com/example/llm-k8s-redis/api/v1alpha1"
 	"github.com/example/llm-k8s-redis/internal/plan"
 	"github.com/example/llm-k8s-redis/internal/redis"
+	"github.com/example/llm-k8s-redis/internal/rediscluster"
 )
 
 type clusterObservation struct {
-	entries  []clusterNodeEntry
+	entries  []rediscluster.Entry
 	topology *v1alpha1.ClusterTopology
 	pods     []corev1.Pod
 	podsByIP map[string]*corev1.Pod
@@ -86,8 +87,8 @@ func (e *ActionExecutor) observeTopology(ctx context.Context, cluster *v1alpha1.
 		obs.message = fmt.Sprintf("seed redis at %s CLUSTER INFO failed: %v", addr, err)
 		return obs, nil
 	}
-	info := parseClusterInfo(infoRaw)
-	if !clusterStateOk(info) {
+	info := rediscluster.ParseInfo(infoRaw)
+	if !rediscluster.StateOK(info) {
 		obs.message = fmt.Sprintf("cluster_state is %q, expected ok", info["cluster_state"])
 		return obs, nil
 	}
@@ -97,7 +98,7 @@ func (e *ActionExecutor) observeTopology(ctx context.Context, cluster *v1alpha1.
 		obs.message = fmt.Sprintf("seed redis at %s CLUSTER NODES failed: %v", addr, err)
 		return obs, nil
 	}
-	entries := parseClusterNodes(nodesRaw)
+	entries := rediscluster.ParseNodes(nodesRaw)
 	if len(entries) == 0 {
 		obs.message = fmt.Sprintf("seed redis at %s returned no CLUSTER NODES entries", addr)
 		return obs, nil
@@ -118,7 +119,7 @@ func (e *ActionExecutor) CollectObservedNodes(ctx context.Context, cluster *v1al
 		return nil, fmt.Errorf("%s", outcome.Message)
 	}
 
-	entries := []clusterNodeEntry{}
+	entries := []rediscluster.Entry{}
 	seed, ok := pickObservationSeedPod(cluster, pods)
 	if !ok {
 		return observedNodes(cluster, pods, entries), nil
@@ -136,7 +137,7 @@ func (e *ActionExecutor) CollectObservedNodes(ctx context.Context, cluster *v1al
 	if raw, err := rc.ClusterNodes(ctx); err != nil {
 		return nil, fmt.Errorf("seed redis at %s CLUSTER NODES failed: %w", addr, err)
 	} else {
-		entries = parseClusterNodes(raw)
+		entries = rediscluster.ParseNodes(raw)
 	}
 	return observedNodes(cluster, pods, entries), nil
 }
@@ -186,11 +187,11 @@ func pickObservationSeedPod(cluster *v1alpha1.RedisCluster, pods []corev1.Pod) (
 	return pickSeedPod(pods)
 }
 
-func observedNodes(cluster *v1alpha1.RedisCluster, pods []corev1.Pod, entries []clusterNodeEntry) []plan.ObservedNode {
+func observedNodes(cluster *v1alpha1.RedisCluster, pods []corev1.Pod, entries []rediscluster.Entry) []plan.ObservedNode {
 	podToNodeID, nodeIDToPod := lastKnownNodeMaps(cluster)
 	podsByIP := mapPodsByIP(pods)
 	for _, entry := range entries {
-		if pod := podNameForIP(podsByIP, ipFromAddr(entry.Addr)); pod != "" {
+		if pod := podNameForIP(podsByIP, rediscluster.IPFromAddr(entry.Addr)); pod != "" {
 			podToNodeID[pod] = entry.ID
 			nodeIDToPod[entry.ID] = pod
 		}
@@ -207,9 +208,9 @@ func observedNodes(cluster *v1alpha1.RedisCluster, pods []corev1.Pod, entries []
 			Deleting:  p.DeletionTimestamp != nil,
 			Role:      "unknown",
 		}
-		entry := findByIP(entries, p.Status.PodIP)
+		entry := rediscluster.FindByIP(entries, p.Status.PodIP)
 		if entry == nil && n.NodeID != "" {
-			entry = findByID(entries, n.NodeID)
+			entry = rediscluster.FindByID(entries, n.NodeID)
 		}
 		if entry != nil {
 			fillObservedNode(&n, *entry, nodeIDToPod)
@@ -244,7 +245,7 @@ func observedNodes(cluster *v1alpha1.RedisCluster, pods []corev1.Pod, entries []
 	return out
 }
 
-func fillObservedNode(n *plan.ObservedNode, entry clusterNodeEntry, nodeIDToPod map[string]string) {
+func fillObservedNode(n *plan.ObservedNode, entry rediscluster.Entry, nodeIDToPod map[string]string) {
 	n.RedisSeen = true
 	n.NodeID = entry.ID
 	n.Role = redisRole(entry)
@@ -257,11 +258,11 @@ func fillObservedNode(n *plan.ObservedNode, entry clusterNodeEntry, nodeIDToPod 
 	n.LinkState = entry.LinkState
 }
 
-func redisRole(entry clusterNodeEntry) string {
+func redisRole(entry rediscluster.Entry) string {
 	switch {
-	case entry.isMaster():
+	case entry.IsMaster():
 		return "master"
-	case entry.isReplica():
+	case entry.IsReplica():
 		return "replica"
 	default:
 		return "unknown"
@@ -301,43 +302,21 @@ func mapPodsByIP(pods []corev1.Pod) map[string]*corev1.Pod {
 	return out
 }
 
-func healthyMasters(entries []clusterNodeEntry) []clusterNodeEntry {
-	var out []clusterNodeEntry
-	for _, e := range entries {
-		if e.isMaster() && e.healthy() {
-			out = append(out, e)
-		}
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
-	return out
-}
-
-func healthyReplicasOf(entries []clusterNodeEntry, masterID string) []clusterNodeEntry {
-	var out []clusterNodeEntry
-	for _, e := range entries {
-		if e.isReplica() && e.MasterID == masterID && e.healthy() {
-			out = append(out, e)
-		}
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
-	return out
-}
-
-func rebuildTopology(entries []clusterNodeEntry, pods []corev1.Pod, podsByIP map[string]*corev1.Pod) *v1alpha1.ClusterTopology {
-	masters := healthyMasters(entries)
+func rebuildTopology(entries []rediscluster.Entry, pods []corev1.Pod, podsByIP map[string]*corev1.Pod) *v1alpha1.ClusterTopology {
+	masters := rediscluster.HealthyMasters(entries)
 	shards := make([]v1alpha1.ShardTopology, 0, len(masters))
 	for idx, m := range masters {
 		shard := v1alpha1.ShardTopology{
 			ID: fmt.Sprintf("shard-%d", idx),
 			Master: v1alpha1.NodeTopology{
-				Pod:    podNameForIP(podsByIP, ipFromAddr(m.Addr)),
+				Pod:    podNameForIP(podsByIP, rediscluster.IPFromAddr(m.Addr)),
 				NodeID: m.ID,
 				Slots:  strings.Join(m.Slots, ","),
-				Ready:  podReadyForIP(podsByIP, ipFromAddr(m.Addr)),
+				Ready:  podReadyForIP(podsByIP, rediscluster.IPFromAddr(m.Addr)),
 			},
 		}
-		for _, r := range healthyReplicasOf(entries, m.ID) {
-			ip := ipFromAddr(r.Addr)
+		for _, r := range rediscluster.HealthyReplicasOf(entries, m.ID) {
+			ip := rediscluster.IPFromAddr(r.Addr)
 			shard.Replicas = append(shard.Replicas, v1alpha1.NodeTopology{
 				Pod:    podNameForIP(podsByIP, ip),
 				NodeID: r.ID,
@@ -361,11 +340,4 @@ func podReadyForIP(podsByIP map[string]*corev1.Pod, ip string) bool {
 		return podReady(p)
 	}
 	return false
-}
-
-func ipFromAddr(addr string) string {
-	if i := strings.Index(addr, ":"); i >= 0 {
-		return addr[:i]
-	}
-	return addr
 }

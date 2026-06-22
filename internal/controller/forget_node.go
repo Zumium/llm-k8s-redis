@@ -9,6 +9,7 @@ import (
 
 	v1alpha1 "github.com/example/llm-k8s-redis/api/v1alpha1"
 	"github.com/example/llm-k8s-redis/internal/plan"
+	"github.com/example/llm-k8s-redis/internal/rediscluster"
 )
 
 func (e *ActionExecutor) forgetNode(ctx context.Context, cluster *v1alpha1.RedisCluster, step plan.Step) (StepOutcome, error) {
@@ -41,16 +42,16 @@ func (e *ActionExecutor) forgetNode(ctx context.Context, cluster *v1alpha1.Redis
 	if err != nil {
 		return running("CLUSTER NODES failed before ForgetNode: %v", err), nil
 	}
-	entries := parseClusterNodes(nodesOut)
+	entries := rediscluster.ParseNodes(nodesOut)
 	nodeID, outcome, err, ok := e.forgetTargetNodeID(step, podName, pods, entries)
 	if !ok {
 		return outcome, err
 	}
-	target := findByID(entries, nodeID)
+	target := rediscluster.FindByID(entries, nodeID)
 	if target == nil {
 		return completed("node %s already forgotten", nodeID), nil
 	}
-	if target.hasSlots() {
+	if target.HasSlots() {
 		return paramErr("cannot forget node %s because it still owns slots", nodeID)
 	}
 
@@ -73,7 +74,7 @@ func (e *ActionExecutor) forgetNode(ctx context.Context, cluster *v1alpha1.Redis
 	if err != nil {
 		return running("CLUSTER NODES failed after ForgetNode: %v", err), nil
 	}
-	if findByID(parseClusterNodes(nodesOut), nodeID) != nil {
+	if rediscluster.FindByID(rediscluster.ParseNodes(nodesOut), nodeID) != nil {
 		return running("node %s still visible after CLUSTER FORGET", nodeID), nil
 	}
 	return completed("node %s forgotten", nodeID), nil
@@ -86,7 +87,7 @@ func isUnknownNodeErr(err error) bool {
 	return strings.Contains(strings.ToLower(err.Error()), "unknown node")
 }
 
-func (e *ActionExecutor) forgetTargetNodeID(step plan.Step, podName string, pods []corev1.Pod, entries []clusterNodeEntry) (string, StepOutcome, error, bool) {
+func (e *ActionExecutor) forgetTargetNodeID(step plan.Step, podName string, pods []corev1.Pod, entries []rediscluster.Entry) (string, StepOutcome, error, bool) {
 	if nodeID, ok := paramString(step.Params, "lastKnownNodeId"); ok && nodeID != "" {
 		return nodeID, StepOutcome{}, nil, true
 	}
@@ -94,7 +95,7 @@ func (e *ActionExecutor) forgetTargetNodeID(step plan.Step, podName string, pods
 		if pods[i].Name != podName {
 			continue
 		}
-		entry := findByIP(entries, pods[i].Status.PodIP)
+		entry := rediscluster.FindByIP(entries, pods[i].Status.PodIP)
 		if entry == nil {
 			return "", running("pod %s is not visible in CLUSTER NODES yet", podName), nil, false
 		}
@@ -104,14 +105,14 @@ func (e *ActionExecutor) forgetTargetNodeID(step plan.Step, podName string, pods
 	return "", o, e2, false
 }
 
-func forgetPeers(entries []clusterNodeEntry, pods []corev1.Pod, targetNodeID string) []*corev1.Pod {
+func forgetPeers(entries []rediscluster.Entry, pods []corev1.Pod, targetNodeID string) []*corev1.Pod {
 	out := []*corev1.Pod{}
 	for i := range pods {
 		if !podReady(&pods[i]) || pods[i].Status.PodIP == "" {
 			continue
 		}
-		entry := findByIP(entries, pods[i].Status.PodIP)
-		if entry == nil || entry.ID == targetNodeID || !entry.healthy() {
+		entry := rediscluster.FindByIP(entries, pods[i].Status.PodIP)
+		if entry == nil || entry.ID == targetNodeID || !entry.Healthy() {
 			continue
 		}
 		out = append(out, &pods[i])
