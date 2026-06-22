@@ -3,9 +3,11 @@ package controller
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	v1alpha1 "github.com/example/llm-k8s-redis/api/v1alpha1"
 	"github.com/example/llm-k8s-redis/internal/plan"
@@ -20,13 +22,20 @@ type ActionExecutor struct {
 
 var _ Driver = &ActionExecutor{}
 
-func (e *ActionExecutor) ExecuteStep(ctx context.Context, cluster *v1alpha1.RedisCluster, p *plan.Plan, stepIndex int) (StepOutcome, error) {
+func (e *ActionExecutor) ExecuteStep(ctx context.Context, cluster *v1alpha1.RedisCluster, p *plan.Plan, stepIndex int) (outcome StepOutcome, err error) {
+	start := time.Now()
 	if p == nil || stepIndex < 0 || stepIndex >= len(p.Steps) {
 		return StepOutcome{Status: plan.StepStateFailed, Message: "invalid step index"}, fmt.Errorf("invalid step index %d", stepIndex)
 	}
 	step := p.Steps[stepIndex]
+	logger := log.FromContext(ctx).WithValues("planID", p.PlanID, "stepIndex", stepIndex, "stepID", step.ID, "action", step.Action)
+	logger.Info("action started")
+	defer func() {
+		logger.Info("action finished", "duration", time.Since(start), "status", outcome.Status, "message", outcome.Message, "error", err)
+	}()
 	if e.RedisFactory == nil {
 		e.RedisFactory = redis.DefaultFactory
+		logger.Info("default redis factory initialized")
 	}
 	switch step.Action {
 	case plan.ActionEnsureNode:

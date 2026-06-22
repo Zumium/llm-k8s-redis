@@ -42,84 +42,120 @@ type RedisClusterReconciler struct {
 	PlanValidationRetries   int
 }
 
-func (r *RedisClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *RedisClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (res ctrl.Result, err error) {
+	start := time.Now()
 	logger := log.FromContext(ctx).WithValues("rediscluster", req.NamespacedName)
+	ctx = log.IntoContext(ctx, logger)
+	defer func() {
+		logger.Info("reconcile finished", "duration", time.Since(start), "requeue", res.Requeue, "requeueAfter", res.RequeueAfter, "error", err)
+	}()
+	logger.Info("reconcile started")
 
 	if r.Planner == nil {
 		r.Planner = planner.NoopPlanner{}
+		logger.Info("default planner initialized")
 	}
 	if r.Driver == nil {
 		r.Driver = &ActionExecutor{Client: r.Client, Scheme: r.Scheme}
+		logger.Info("default driver initialized")
 	}
 	if r.ValidatePlan == nil {
 		r.ValidatePlan = plan.NewValidator().Validate
+		logger.Info("default plan validator initialized")
 	}
 	if r.TopologyRefreshInterval <= 0 {
 		r.TopologyRefreshInterval = 60 * time.Second
+		logger.Info("default topology refresh interval initialized", "interval", r.TopologyRefreshInterval)
 	}
 	if r.TopologyStaleThreshold <= 0 {
 		r.TopologyStaleThreshold = 10 * time.Second
+		logger.Info("default topology stale threshold initialized", "threshold", r.TopologyStaleThreshold)
 	}
 
 	var cluster v1alpha1.RedisCluster
 	if err := r.Get(ctx, req.NamespacedName, &cluster); err != nil {
 		if apierrors.IsNotFound(err) {
+			logger.Info("rediscluster not found")
 			return ctrl.Result{}, nil
 		}
+		logger.Error(err, "get rediscluster failed")
 		return ctrl.Result{}, err
 	}
+	logger.Info("rediscluster loaded", "generation", cluster.Generation, "observedGeneration", cluster.Status.ObservedGeneration)
 
 	if !cluster.DeletionTimestamp.IsZero() {
+		logger.Info("rediscluster deleting")
 		return r.reconcileDelete(ctx, &cluster)
 	}
 
 	if !controllerutil.ContainsFinalizer(&cluster, finalizer) {
+		logger.Info("adding finalizer", "finalizer", finalizer)
 		controllerutil.AddFinalizer(&cluster, finalizer)
 		if err := r.Update(ctx, &cluster); err != nil {
+			logger.Error(err, "add finalizer failed")
 			return ctrl.Result{}, err
 		}
+		logger.Info("finalizer added", "finalizer", finalizer)
 		return ctrl.Result{Requeue: true}, nil
 	}
 
+	nsStart := time.Now()
 	if err := r.ensureNamespace(ctx, &cluster); err != nil {
+		logger.Error(err, "ensure namespace failed", "duration", time.Since(nsStart))
 		return ctrl.Result{}, fmt.Errorf("ensure namespace: %w", err)
 	}
+	logger.Info("namespace ensured", "namespace", cluster.Name, "duration", time.Since(nsStart))
 
-	bumpNextPodOrdinal(&cluster)
+	if bumpNextPodOrdinal(&cluster) {
+		logger.Info("next pod ordinal advanced", "nextPodOrdinal", cluster.Status.NextPodOrdinal)
+	}
 
 	if r.shouldRefreshTopology(ctx, &cluster) {
+		refreshStart := time.Now()
+		logger.Info("lazy topology refresh started")
 		if err := r.Driver.ObserveTopology(ctx, &cluster); err != nil {
-			logger.Error(err, "lazy topology refresh failed")
+			logger.Error(err, "lazy topology refresh failed", "duration", time.Since(refreshStart))
+		} else {
+			logger.Info("lazy topology refresh finished", "duration", time.Since(refreshStart))
 		}
+	} else {
+		logger.Info("lazy topology refresh skipped")
 	}
 
 	spec := toClusterSpec(&cluster)
+	logger.Info("desired spec converted", "shards", spec.Shards, "replicasPerShard", spec.ReplicasPerShard, "image", spec.Image, "memorySize", spec.MemorySize)
 
 	active := cluster.Status.ActivePlan
 
 	if active != nil && planState(active) == plan.PlanStateRunning {
+		logger.Info("running active plan found", "planID", active.ID, "steps", len(active.Steps), "currentStep", active.CurrentStep)
 		return r.executeNextStep(ctx, &cluster, active)
 	}
 
 	if active != nil {
+		state := planState(active)
+		logger.Info("active plan found", "planID", active.ID, "planState", state, "targetGeneration", active.TargetGeneration, "steps", len(active.Steps))
 		if active.TargetGeneration != cluster.Generation {
 			cluster.Status.ActivePlan = nil
 			setCondition(&cluster, ConditionReady, metav1.ConditionFalse, "Replanning", "active plan targets an older generation")
 			setCondition(&cluster, ConditionPlanned, metav1.ConditionFalse, "PlanSuperseded", "active plan targets an older generation")
+			logger.Info("active plan superseded by generation", "planID", active.ID, "targetGeneration", active.TargetGeneration, "generation", cluster.Generation)
 			return r.finish(ctx, &cluster, ctrl.Result{Requeue: true}, nil)
 		}
-		switch planState(active) {
+		switch state {
 		case plan.PlanStateCompleted:
 			if topologyMatchesSpec(cluster.Status.Topology, spec) {
 				active.Status = string(plan.PlanStateCompleted)
 				cluster.Status.ObservedGeneration = cluster.Generation
 				setCondition(&cluster, ConditionPlanned, metav1.ConditionFalse, "NoPlanNeeded", "topology already matches spec")
 				setCondition(&cluster, ConditionReady, metav1.ConditionTrue, "ClusterReady", "cluster matches desired topology")
+				logger.Info("completed plan still matches spec", "planID", active.ID)
 				return r.finish(ctx, &cluster, ctrl.Result{RequeueAfter: r.TopologyRefreshInterval}, nil)
 			}
 			cluster.Status.ActivePlan = nil
 			setCondition(&cluster, ConditionReady, metav1.ConditionFalse, "Replanning", "topology drifted")
 			setCondition(&cluster, ConditionPlanned, metav1.ConditionFalse, "PlanSuperseded", "existing plan no longer valid")
+			logger.Info("completed plan drifted, replanning", "planID", active.ID)
 			return r.finish(ctx, &cluster, ctrl.Result{Requeue: true}, nil)
 		case plan.PlanStateFailed:
 			if topologyMatchesSpec(cluster.Status.Topology, spec) {
@@ -127,33 +163,40 @@ func (r *RedisClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 				cluster.Status.ObservedGeneration = cluster.Generation
 				setCondition(&cluster, ConditionPlanned, metav1.ConditionFalse, "NoPlanNeeded", "topology already matches spec")
 				setCondition(&cluster, ConditionReady, metav1.ConditionTrue, "ClusterReady", "cluster matches desired topology")
+				logger.Info("failed plan cleared because topology matches spec", "planID", active.ID)
 				return r.finish(ctx, &cluster, ctrl.Result{RequeueAfter: r.TopologyRefreshInterval}, nil)
 			}
 			cluster.Status.ActivePlan = nil
 			setCondition(&cluster, ConditionReady, metav1.ConditionFalse, "Replanning", "topology drifted")
 			setCondition(&cluster, ConditionPlanned, metav1.ConditionFalse, "PlanSuperseded", "existing plan no longer valid")
+			logger.Info("failed plan cleared, replanning", "planID", active.ID)
 			return r.finish(ctx, &cluster, ctrl.Result{Requeue: true}, nil)
 		}
 	}
 
 	if cluster.Status.ActivePlan == nil {
+		logger.Info("no active plan, reconciling plan")
 		return r.reconcilePlan(ctx, &cluster, spec)
 	}
 
+	logger.Info("no work this reconcile")
 	return r.finish(ctx, &cluster, ctrl.Result{RequeueAfter: r.TopologyRefreshInterval}, nil)
 }
 
 func (r *RedisClusterReconciler) reconcilePlan(ctx context.Context, cluster *v1alpha1.RedisCluster, spec plan.ClusterSpec) (ctrl.Result, error) {
 	logger := log.FromContext(ctx).WithValues("rediscluster", cluster.Name)
 
+	logger.Info("planning started")
 	req := toPlannerRequest(cluster, spec)
+	collectStart := time.Now()
 	nodes, err := r.Driver.CollectObservedNodes(ctx, cluster)
 	if err != nil {
-		logger.Error(err, "collect observed nodes failed")
+		logger.Error(err, "collect observed nodes failed", "duration", time.Since(collectStart))
 		setCondition(cluster, ConditionPlanned, metav1.ConditionFalse, "ObservedNodesFailed", err.Error())
 		cluster.Status.ObservedGeneration = cluster.Generation
 		return r.finish(ctx, cluster, ctrl.Result{RequeueAfter: 10 * time.Second}, nil)
 	}
+	logger.Info("observed nodes collected", "nodes", len(nodes), "duration", time.Since(collectStart))
 	req.ObservedState.Nodes = nodes
 
 	validationRetries := r.PlanValidationRetries
@@ -161,27 +204,34 @@ func (r *RedisClusterReconciler) reconcilePlan(ctx context.Context, cluster *v1a
 		validationRetries = 0
 	}
 	for attempt := 0; attempt <= validationRetries; attempt++ {
+		attemptStart := time.Now()
+		logger.Info("planner attempt started", "attempt", attempt, "maxAttempts", validationRetries+1, "feedback", len(req.ValidationFeedback))
 		newPlan, err := r.Planner.Plan(ctx, req)
 		if err != nil {
-			logger.Error(err, "planner returned an error")
+			logger.Error(err, "planner returned an error", "attempt", attempt, "duration", time.Since(attemptStart))
 			setCondition(cluster, ConditionPlanned, metav1.ConditionFalse, "PlannerFailed", err.Error())
 			cluster.Status.ObservedGeneration = cluster.Generation
 			return r.finish(ctx, cluster, ctrl.Result{RequeueAfter: 10 * time.Second}, nil)
 		}
 		if newPlan == nil {
+			logger.Info("planner returned no plan", "attempt", attempt, "duration", time.Since(attemptStart))
 			setCondition(cluster, ConditionPlanned, metav1.ConditionFalse, "PlannerEmpty", "planner returned no plan")
 			return r.finish(ctx, cluster, ctrl.Result{RequeueAfter: 10 * time.Second}, nil)
 		}
+		logger.Info("planner returned plan", "attempt", attempt, "planID", newPlan.PlanID, "steps", len(newPlan.Steps), "duration", time.Since(attemptStart))
+		validateStart := time.Now()
 		if err := r.ValidatePlan(newPlan, validationContext(cluster, spec, nodes)); err != nil {
 			if topologyMatchesSpec(cluster.Status.Topology, spec) {
-				logger.Info("plan rejected but topology already matches spec, marking ready")
+				logger.Info("plan rejected but topology already matches spec, marking ready", "attempt", attempt, "planID", newPlan.PlanID, "duration", time.Since(validateStart), "error", err)
 				cluster.Status.ObservedGeneration = cluster.Generation
 				setCondition(cluster, ConditionPlanned, metav1.ConditionFalse, "NoPlanNeeded", "topology already matches spec")
 				setCondition(cluster, ConditionReady, metav1.ConditionTrue, "ClusterReady", "cluster matches desired topology")
 				return r.finish(ctx, cluster, ctrl.Result{RequeueAfter: r.TopologyRefreshInterval}, nil)
 			}
+			logger.Info("plan rejected", "attempt", attempt, "planID", newPlan.PlanID, "duration", time.Since(validateStart), "error", err)
 			if attempt < validationRetries {
 				req.ValidationFeedback = append(req.ValidationFeedback, planner.ValidationFeedback{RejectedPlan: newPlan, Error: err.Error()})
+				logger.Info("validation feedback appended", "attempt", attempt, "feedback", len(req.ValidationFeedback))
 				continue
 			}
 			setCondition(cluster, ConditionPlanned, metav1.ConditionFalse, "PlanRejected", err.Error())
@@ -189,67 +239,90 @@ func (r *RedisClusterReconciler) reconcilePlan(ctx context.Context, cluster *v1a
 			r.event(cluster, "PlanRejected", err.Error())
 			return r.finish(ctx, cluster, ctrl.Result{RequeueAfter: 10 * time.Second}, nil)
 		}
+		logger.Info("plan validation passed", "attempt", attempt, "planID", newPlan.PlanID, "duration", time.Since(validateStart))
 		advanceNextPodOrdinalFromPlan(cluster, newPlan)
+		logger.Info("next pod ordinal advanced from plan", "nextPodOrdinal", cluster.Status.NextPodOrdinal)
 		cluster.Status.ActivePlan, err = planToStatus(newPlan)
 		if err != nil {
+			logger.Error(err, "plan persist conversion failed", "planID", newPlan.PlanID)
 			setCondition(cluster, ConditionPlanned, metav1.ConditionFalse, "PlanPersistFailed", err.Error())
 			cluster.Status.ObservedGeneration = cluster.Generation
 			return r.finish(ctx, cluster, ctrl.Result{RequeueAfter: 10 * time.Second}, nil)
 		}
+		logger.Info("plan accepted", "planID", newPlan.PlanID, "steps", len(newPlan.Steps))
 		cluster.Status.ObservedGeneration = cluster.Generation
 		setCondition(cluster, ConditionPlanned, metav1.ConditionTrue, "PlanAccepted", "plan passed validation")
 		return r.finish(ctx, cluster, ctrl.Result{Requeue: true}, nil)
 	}
 
+	logger.Info("planning finished without accepted plan")
 	return r.finish(ctx, cluster, ctrl.Result{RequeueAfter: r.TopologyRefreshInterval}, nil)
 }
 
 func (r *RedisClusterReconciler) executeNextStep(ctx context.Context, cluster *v1alpha1.RedisCluster, active *v1alpha1.PlanStatus) (ctrl.Result, error) {
+	logger := log.FromContext(ctx).WithValues("planID", active.ID)
 	idx := nextPendingStep(active)
 	if idx < 0 {
+		logger.Info("no pending step found")
 		return r.finish(ctx, cluster, ctrl.Result{RequeueAfter: 5 * time.Second}, nil)
 	}
 
 	step := active.Steps[idx]
+	logger = logger.WithValues("stepIndex", idx, "stepID", step.ID, "action", step.Action)
+	logger.Info("step execution started")
+	restoreStart := time.Now()
 	planModel, err := statusToPlan(active)
 	if err != nil {
+		logger.Error(err, "active plan restore failed", "duration", time.Since(restoreStart))
 		setStep(active, idx, string(plan.StepStateFailed), err.Error())
 		active.CurrentStep = step.ID
 		setCondition(cluster, ConditionReady, metav1.ConditionFalse, "PlanRestoreFailed", err.Error())
 		return r.finish(ctx, cluster, ctrl.Result{}, nil)
 	}
+	logger.Info("active plan restored", "duration", time.Since(restoreStart))
+	execStart := time.Now()
 	outcome, err := r.Driver.ExecuteStep(ctx, cluster, planModel, idx)
 	if err != nil {
+		logger.Error(err, "step execution failed", "duration", time.Since(execStart), "message", outcome.Message)
 		setStep(active, idx, string(plan.StepStateFailed), err.Error())
 		active.CurrentStep = step.ID
 		setCondition(cluster, ConditionReady, metav1.ConditionFalse, "StepFailed", err.Error())
 		return r.finish(ctx, cluster, ctrl.Result{}, nil)
 	}
+	logger.Info("step execution finished", "duration", time.Since(execStart), "status", outcome.Status, "message", outcome.Message)
 	setStep(active, idx, string(outcome.Status), outcome.Message)
 	active.CurrentStep = step.ID
 
 	switch outcome.Status {
 	case plan.StepStateCompleted:
+		logger.Info("step completed")
 		return r.finish(ctx, cluster, ctrl.Result{Requeue: true}, nil)
 	case plan.StepStateFailed:
+		logger.Info("step reported failed", "message", outcome.Message)
 		setCondition(cluster, ConditionReady, metav1.ConditionFalse, "StepFailed", outcome.Message)
 		return r.finish(ctx, cluster, ctrl.Result{}, nil)
 	case plan.StepStateRunning:
+		logger.Info("step still running", "message", outcome.Message)
 		return r.finish(ctx, cluster, ctrl.Result{RequeueAfter: 5 * time.Second}, nil)
 	default:
+		logger.Info("step returned unknown status", "status", outcome.Status)
 		return r.finish(ctx, cluster, ctrl.Result{RequeueAfter: 5 * time.Second}, nil)
 	}
 }
 
 func (r *RedisClusterReconciler) ensureNamespace(ctx context.Context, cluster *v1alpha1.RedisCluster) error {
+	logger := log.FromContext(ctx).WithValues("namespace", cluster.Name)
 	var ns corev1.Namespace
 	err := r.Get(ctx, client.ObjectKey{Name: cluster.Name}, &ns)
 	if err == nil {
+		logger.Info("namespace already exists")
 		return nil
 	}
 	if !apierrors.IsNotFound(err) {
+		logger.Error(err, "get namespace failed")
 		return err
 	}
+	logger.Info("creating namespace")
 	nsObj := &corev1.Namespace{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: cluster.Name,
@@ -262,40 +335,61 @@ func (r *RedisClusterReconciler) ensureNamespace(ctx context.Context, cluster *v
 	if err := ctrl.SetControllerReference(cluster, nsObj, r.Scheme); err != nil {
 		return fmt.Errorf("set namespace owner reference: %w", err)
 	}
-	return r.Create(ctx, nsObj)
+	if err := r.Create(ctx, nsObj); err != nil {
+		logger.Error(err, "create namespace failed")
+		return err
+	}
+	logger.Info("namespace created")
+	return nil
 }
 
 func (r *RedisClusterReconciler) reconcileDelete(ctx context.Context, cluster *v1alpha1.RedisCluster) (ctrl.Result, error) {
+	logger := log.FromContext(ctx).WithValues("rediscluster", cluster.Name)
+	logger.Info("delete reconcile started")
 	if !controllerutil.ContainsFinalizer(cluster, finalizer) {
+		logger.Info("finalizer already absent")
 		return ctrl.Result{}, nil
 	}
 	var ns corev1.Namespace
 	err := r.Get(ctx, client.ObjectKey{Name: cluster.Name}, &ns)
 	if err == nil {
 		if ns.DeletionTimestamp.IsZero() {
+			logger.Info("deleting owned namespace", "namespace", cluster.Name)
 			if derr := r.Delete(ctx, &ns); derr != nil && !apierrors.IsNotFound(derr) {
+				logger.Error(derr, "delete namespace failed", "namespace", cluster.Name)
 				return ctrl.Result{}, derr
 			}
 		}
+		logger.Info("waiting for namespace deletion", "namespace", cluster.Name)
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 	if !apierrors.IsNotFound(err) {
+		logger.Error(err, "get namespace during delete failed", "namespace", cluster.Name)
 		return ctrl.Result{}, err
 	}
+	logger.Info("owned namespace gone, removing finalizer", "namespace", cluster.Name)
 	controllerutil.RemoveFinalizer(cluster, finalizer)
 	if err := r.Update(ctx, cluster); err != nil {
+		logger.Error(err, "remove finalizer failed")
 		return ctrl.Result{}, err
 	}
+	logger.Info("finalizer removed")
 	return ctrl.Result{}, nil
 }
 
 func (r *RedisClusterReconciler) finish(ctx context.Context, cluster *v1alpha1.RedisCluster, res ctrl.Result, err error) (ctrl.Result, error) {
+	logger := log.FromContext(ctx).WithValues("rediscluster", cluster.Name)
+	start := time.Now()
+	logger.Info("status update started", "requeue", res.Requeue, "requeueAfter", res.RequeueAfter, "incomingError", err)
 	if uerr := r.Status().Update(ctx, cluster); uerr != nil && err == nil {
 		if apierrors.IsConflict(uerr) {
+			logger.Info("status update conflict", "duration", time.Since(start), "requeueAfter", statusConflictRequeueAfter)
 			return ctrl.Result{RequeueAfter: statusConflictRequeueAfter}, nil
 		}
+		logger.Error(uerr, "status update failed", "duration", time.Since(start))
 		return res, uerr
 	}
+	logger.Info("status update finished", "duration", time.Since(start), "skippedError", err != nil)
 	return res, err
 }
 
