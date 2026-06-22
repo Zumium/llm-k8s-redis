@@ -393,6 +393,50 @@ func TestVerifyCluster_MasterCountMismatchFails(t *testing.T) {
 	}
 }
 
+func TestVerifyCluster_ExtraNoSlotMasterReturnsRunning(t *testing.T) {
+	ctx := context.Background()
+	cluster := testCluster()
+	pods := append(vcFourReadyPods(), vcPod("redis-4", "10.0.0.5", true))
+	nodes := clusterOK() + "eee444 10.0.0.5:6379@16379 master - 0 0 5 connected\n"
+	fc := &fakeRedisClient{
+		clusterInfo:  func() (string, error) { return "cluster_state:ok\r\n", nil },
+		clusterNodes: func() (string, error) { return nodes, nil },
+	}
+	exec := vcExec(t, cluster, pods, fc)
+
+	outcome, err := executeStableVerify(t, ctx, exec, cluster, verifyStep())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if outcome.Status != plan.StepStateRunning {
+		t.Fatalf("expected Running for no-slot extra master, got %q: %s", outcome.Status, outcome.Message)
+	}
+}
+
+func TestVerifyCluster_ExtraSlotOwningMasterFails(t *testing.T) {
+	ctx := context.Background()
+	cluster := testCluster()
+	pods := append(vcFourReadyPods(), vcPod("redis-4", "10.0.0.5", true))
+	nodes := vcMaster0ID + " 10.0.0.1:6379@16379 master - 0 0 1 connected 0-8191\n" +
+		vcMaster1ID + " 10.0.0.2:6379@16379 master - 0 0 2 connected 8192-16382\n" +
+		vcReplica0ID + " 10.0.0.3:6379@16379 slave " + vcMaster0ID + " 0 0 3 connected\n" +
+		vcReplica1ID + " 10.0.0.4:6379@16379 slave " + vcMaster1ID + " 0 0 4 connected\n" +
+		"eee444 10.0.0.5:6379@16379 master - 0 0 5 connected 16383\n"
+	fc := &fakeRedisClient{
+		clusterInfo:  func() (string, error) { return "cluster_state:ok\r\n", nil },
+		clusterNodes: func() (string, error) { return nodes, nil },
+	}
+	exec := vcExec(t, cluster, pods, fc)
+
+	outcome, err := executeStableVerify(t, ctx, exec, cluster, verifyStep())
+	if err == nil {
+		t.Fatal("expected error on extra slot-owning master")
+	}
+	if outcome.Status != plan.StepStateFailed {
+		t.Fatalf("expected Failed, got %q: %s", outcome.Status, outcome.Message)
+	}
+}
+
 func TestVerifyCluster_ReplicaCountMismatchFails(t *testing.T) {
 	ctx := context.Background()
 	cluster := testCluster()

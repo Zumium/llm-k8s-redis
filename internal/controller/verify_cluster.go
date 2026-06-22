@@ -109,18 +109,28 @@ func (e *ActionExecutor) verifyCluster(ctx context.Context, cluster *v1alpha1.Re
 	logger.Info("verify cluster slot coverage passed", "slots", len(owner))
 
 	masters := rediscluster.HealthyMasters(obs.entries)
-	if len(masters) != expectedShards {
-		logger.Info("verify cluster master count mismatch", "expected", expectedShards, "got", len(masters))
-		return paramErr("expected %d masters, found %d", expectedShards, len(masters))
+	slotMasters := slotOwningMasters(masters)
+	if len(slotMasters) != expectedShards {
+		logger.Info("verify cluster slot-owning master count mismatch", "expected", expectedShards, "got", len(slotMasters), "healthyMasters", len(masters))
+		return paramErr("expected %d slot-owning masters, found %d", expectedShards, len(slotMasters))
 	}
-	for _, m := range masters {
+	if len(masters) != len(slotMasters) {
+		started := verifyStartedAt(step.Params, start)
+		if start.Sub(started) >= verifyStableTimeout {
+			logger.Info("verify cluster no-slot master convergence timeout", "expected", expectedShards, "healthyMasters", len(masters), "slotOwningMasters", len(slotMasters))
+			return paramErr("cluster did not converge within %s: expected %d masters, found %d healthy masters including %d no-slot masters", verifyStableTimeout, expectedShards, len(masters), len(masters)-len(slotMasters))
+		}
+		logger.Info("verify cluster waiting for no-slot masters to leave master view", "expected", expectedShards, "healthyMasters", len(masters), "slotOwningMasters", len(slotMasters))
+		return running("waiting for gossip to converge: expected %d masters, found %d healthy masters including %d no-slot masters", expectedShards, len(masters), len(masters)-len(slotMasters)), nil
+	}
+	for _, m := range slotMasters {
 		replicas := rediscluster.HealthyReplicasOf(obs.entries, m.ID)
 		if len(replicas) != expectedReplicas {
 			logger.Info("verify cluster replica count mismatch", "masterID", m.ID, "expected", expectedReplicas, "got", len(replicas))
 			return paramErr("master %s has %d healthy replicas, expected %d", m.ID, len(replicas), expectedReplicas)
 		}
 	}
-	logger.Info("verify cluster shard layout passed", "masters", len(masters), "replicasPerMaster", expectedReplicas)
+	logger.Info("verify cluster shard layout passed", "masters", len(slotMasters), "replicasPerMaster", expectedReplicas)
 
 	if unmapped := firstUnmappedNode(obs.entries, obs.podsByIP); unmapped != "" {
 		logger.Info("verify cluster found unmapped node", "node", unmapped)
@@ -246,6 +256,16 @@ func verifyFullSlotCoverage(owner map[int]string, entries []rediscluster.Entry) 
 		}
 	}
 	return ""
+}
+
+func slotOwningMasters(masters []rediscluster.Entry) []rediscluster.Entry {
+	out := make([]rediscluster.Entry, 0, len(masters))
+	for _, m := range masters {
+		if m.HasSlots() {
+			out = append(out, m)
+		}
+	}
+	return out
 }
 
 func firstUnmappedNode(entries []rediscluster.Entry, podsByIP map[string]*corev1.Pod) string {
