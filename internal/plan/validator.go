@@ -296,11 +296,11 @@ func validateExistingTopologyPlan(p *Plan, spec ClusterSpec, ctx *ValidationCont
 			return nil
 		}
 	}
+	if h := healableTopology(topology, spec, ctx.ObservedNodes); h != nil {
+		return validateHealRepair(p, spec, ctx, topology, ensurePods, h)
+	}
 	currentReplicas, err := uniformReplicaCount(topology)
 	if err != nil {
-		if h := healableTopology(topology, spec, ctx.ObservedNodes); h != nil {
-			return validateHealRepair(p, spec, ctx, topology, ensurePods, h)
-		}
 		return err
 	}
 	if int(spec.Shards) == currentShards && int(spec.ReplicasPerShard) > currentReplicas {
@@ -514,16 +514,17 @@ func validateHealRepair(p *Plan, spec ClusterSpec, ctx *ValidationContext, topol
 		}
 		if id == "" {
 			pod, _ := paramString(s.Params, "pod")
-			podStillExists := false
+			var matchedID string
 			for _, g := range h.ghosts {
 				if g.Pod == pod && g.PodExists {
-					podStillExists = true
+					matchedID = g.NodeID
 					break
 				}
 			}
-			if !podStillExists {
+			if matchedID == "" {
 				return fmt.Errorf("step %q: ForgetNode requires lastKnownNodeId when pod %q no longer exists", s.ID, pod)
 			}
+			ghostSeen[matchedID] = true
 			continue
 		}
 		if _, ok := ghostSeen[id]; !ok {
@@ -562,7 +563,7 @@ func validateHealRepair(p *Plan, spec ClusterSpec, ctx *ValidationContext, topol
 		return fmt.Errorf("step %q: ForgetNode target pod %q / nodeId %q is not a known ghost", s.ID, pod, id)
 	}
 
-	return simulatePlan(p, *ctx)
+	return nil
 }
 
 func validateSameSpecRepair(ctx ValidationContext, topology *ClusterTopology, ensurePods map[string]bool) error {

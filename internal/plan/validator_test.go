@@ -917,6 +917,44 @@ func TestValidate_HealRepairAcceptsValidPlan(t *testing.T) {
 	}
 }
 
+func TestValidate_HealRepairAcceptsUniformUnderReplicatedWithGhost(t *testing.T) {
+	ctx := ValidationContext{
+		Spec:           ClusterSpec{Name: "example", Generation: 1, Shards: 1, ReplicasPerShard: 1, Image: "redis:7.2", MemorySize: "2Gi"},
+		NextPodOrdinal: 2,
+		ObservedNodes: []ObservedNode{
+			{Pod: "redis-1", PodExists: true, RedisSeen: true, NodeID: "node-1", Role: "master", Slots: "0-16383", Ready: true},
+			{Pod: "redis-0", PodExists: false, RedisSeen: true, NodeID: "node-0", Role: "master", Slots: "", Flags: []string{"master", "fail"}},
+		},
+	}
+	p := &Plan{
+		DSLVersion:       DSLVersion,
+		PlanID:           "heal-uniform-1",
+		TargetGeneration: 1,
+		Steps: []Step{
+			{ID: "ensure-redis-2", Action: ActionEnsureNode, Params: map[string]any{"namespace": "example", "pod": "redis-2", "image": "redis:7.2", "memorySize": "2Gi"}},
+			{ID: "wait-redis-2", Action: ActionWaitNodeReady, Params: map[string]any{"namespace": "example", "pod": "redis-2"}},
+			{ID: "meet-redis-2", Action: ActionMeetNode, Params: map[string]any{"namespace": "example", "sourcePod": "redis-1", "targetPod": "redis-2"}},
+			{ID: "replicate-redis-2", Action: ActionReplicateNode, Params: map[string]any{"namespace": "example", "masterPod": "redis-1", "replicaPod": "redis-2"}},
+			{ID: "forget-redis-0", Action: ActionForgetNode, Params: map[string]any{"namespace": "example", "pod": "redis-0", "lastKnownNodeId": "node-0"}},
+			{ID: "delete-redis-0", Action: ActionDeleteNode, Params: map[string]any{"namespace": "example", "pod": "redis-0"}},
+			{ID: "verify", Action: ActionVerifyCluster, Params: map[string]any{"expectedShards": 1, "expectedReplicasPerShard": 1, "requireClusterStateOk": true, "requireFullSlotCoverage": true, "requireAllSlotOwnersHaveReplicas": true}},
+		},
+	}
+	if err := validatePlan(p, ctx); err != nil {
+		t.Fatalf("expected uniform under-replicated heal plan to pass, got %v", err)
+	}
+}
+
+func TestValidate_HealRepairAcceptsPodExistingGhostWithoutLastKnownNodeID(t *testing.T) {
+	ctx := healCtx()
+	ctx.ObservedNodes[3].PodExists = true
+	p := validHealPlan()
+	delete(p.Steps[stepIndex(t, p, "forget-redis-0")].Params, "lastKnownNodeId")
+	if err := validatePlan(p, ctx); err != nil {
+		t.Fatalf("expected pod-existing ghost forget to pass without lastKnownNodeId, got %v", err)
+	}
+}
+
 func TestValidate_HealRepairRejectsMissingReplicaReplenish(t *testing.T) {
 	p := validHealPlan()
 	// Drop the EnsureNode/Wait/Meet/Replicate for redis-4 so shard-0 stays
