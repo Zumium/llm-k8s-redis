@@ -925,8 +925,8 @@ func TestReconcile_ReplansAfterStalePlanCleared(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
-	if !res.Requeue {
-		t.Fatal("expected requeue after accepting new plan")
+	if res.Requeue || res.RequeueAfter != 0 {
+		t.Fatalf("expected no explicit requeue after accepting new plan, got %#v", res)
 	}
 	if fp.called != 1 {
 		t.Fatalf("expected planner to be called once, got %d", fp.called)
@@ -1098,8 +1098,8 @@ func TestReconcile_MissingReplicaRequestsDriftPlan(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
-	if !res.Requeue {
-		t.Fatal("expected requeue after accepting drift plan")
+	if res.Requeue || res.RequeueAfter != 0 {
+		t.Fatalf("expected no explicit requeue after accepting drift plan, got %#v", res)
 	}
 	if fp.called != 1 {
 		t.Fatalf("expected planner call, got %d", fp.called)

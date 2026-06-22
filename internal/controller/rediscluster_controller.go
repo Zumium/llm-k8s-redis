@@ -249,7 +249,7 @@ func (r *RedisClusterReconciler) reconcilePlan(ctx context.Context, cluster *v1a
 		logger.Info("plan accepted", "planID", newPlan.PlanID, "steps", len(newPlan.Steps))
 		cluster.Status.ObservedGeneration = cluster.Generation
 		setCondition(cluster, ConditionPlanned, metav1.ConditionTrue, "PlanAccepted", "plan passed validation")
-		return r.finish(ctx, cluster, ctrl.Result{Requeue: true}, nil)
+		return r.finish(ctx, cluster, ctrl.Result{}, nil)
 	}
 
 	logger.Info("planning finished without accepted plan")
