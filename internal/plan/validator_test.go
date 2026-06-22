@@ -49,11 +49,30 @@ func shardScaleOutSpec() ClusterSpec {
 	return s
 }
 
+func replicaScaleInSpec() ClusterSpec {
+	s := spec()
+	s.ReplicasPerShard = 1
+	return s
+}
+
 func topology() *ClusterTopology {
 	return &ClusterTopology{Shards: []ShardTopology{
 		{ID: "shard-0", Master: NodeTopology{Pod: "redis-0", Slots: "0-8191", Ready: true}, Replicas: []NodeTopology{{Pod: "redis-1", Ready: true}}},
 		{ID: "shard-1", Master: NodeTopology{Pod: "redis-2", Slots: "8192-16383", Ready: true}, Replicas: []NodeTopology{{Pod: "redis-3", Ready: true}}},
 	}}
+}
+
+func topologyWithTwoReplicas() *ClusterTopology {
+	return &ClusterTopology{Shards: []ShardTopology{
+		{ID: "shard-0", Master: NodeTopology{Pod: "redis-0", Slots: "0-8191", Ready: true}, Replicas: []NodeTopology{{Pod: "redis-1", Ready: true}, {Pod: "redis-4", Ready: true}}},
+		{ID: "shard-1", Master: NodeTopology{Pod: "redis-2", Slots: "8192-16383", Ready: true}, Replicas: []NodeTopology{{Pod: "redis-3", Ready: true}, {Pod: "redis-5", Ready: true}}},
+	}}
+}
+
+func topologyWithMixedReplicas() *ClusterTopology {
+	t := topologyWithTwoReplicas()
+	t.Shards[0].Replicas = t.Shards[0].Replicas[:1]
+	return t
 }
 
 func observedFromTopology(t *ClusterTopology) []ObservedNode {
@@ -110,6 +129,21 @@ func validShardScaleOutPlan() *Plan {
 			{ID: "migrate-redis-0-redis-2", Action: ActionMigrateSlots, Params: map[string]any{"namespace": "example", "sourcePod": "redis-0", "targetPod": "redis-2", "slots": "5462-8191"}},
 			{ID: "migrate-redis-2-redis-4", Action: ActionMigrateSlots, Params: map[string]any{"namespace": "example", "sourcePod": "redis-2", "targetPod": "redis-4", "slots": "10923-16383"}},
 			{ID: "verify", Action: ActionVerifyCluster, Params: map[string]any{"expectedShards": 3, "expectedReplicasPerShard": 1, "requireClusterStateOk": true, "requireFullSlotCoverage": true, "requireAllSlotOwnersHaveReplicas": true}},
+		},
+	}
+}
+
+func validReplicaScaleInPlan() *Plan {
+	return &Plan{
+		DSLVersion:       DSLVersion,
+		PlanID:           "replica-scalein-001",
+		TargetGeneration: 1,
+		Steps: []Step{
+			{ID: "forget-redis-4", Action: ActionForgetNode, Params: map[string]any{"namespace": "example", "pod": "redis-4"}},
+			{ID: "delete-redis-4", Action: ActionDeleteNode, Params: map[string]any{"namespace": "example", "pod": "redis-4"}},
+			{ID: "forget-redis-5", Action: ActionForgetNode, Params: map[string]any{"namespace": "example", "pod": "redis-5"}},
+			{ID: "delete-redis-5", Action: ActionDeleteNode, Params: map[string]any{"namespace": "example", "pod": "redis-5"}},
+			{ID: "verify", Action: ActionVerifyCluster, Params: map[string]any{"expectedShards": 2, "expectedReplicasPerShard": 1, "requireClusterStateOk": true, "requireFullSlotCoverage": true, "requireAllSlotOwnersHaveReplicas": true}},
 		},
 	}
 }
@@ -184,6 +218,62 @@ func TestValidate_ValidShardScaleOut(t *testing.T) {
 	ctx := ctxWithObservedNodes(shardScaleOutSpec(), topology())
 	if err := validatePlan(validShardScaleOutPlan(), ctx); err != nil {
 		t.Fatalf("expected no error, got %v", err)
+	}
+}
+
+func TestValidate_ValidReplicaScaleIn(t *testing.T) {
+	ctx := ctxWithObservedNodes(replicaScaleInSpec(), topologyWithTwoReplicas())
+	if err := validatePlan(validReplicaScaleInPlan(), ctx); err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+}
+
+func TestValidate_ReplicaScaleInHandlesMixedReplicaCounts(t *testing.T) {
+	p := validReplicaScaleInPlan()
+	p.Steps = []Step{
+		{ID: "forget-redis-5", Action: ActionForgetNode, Params: map[string]any{"namespace": "example", "pod": "redis-5"}},
+		{ID: "delete-redis-5", Action: ActionDeleteNode, Params: map[string]any{"namespace": "example", "pod": "redis-5"}},
+		{ID: "verify", Action: ActionVerifyCluster, Params: map[string]any{"expectedShards": 2, "expectedReplicasPerShard": 1, "requireClusterStateOk": true, "requireFullSlotCoverage": true, "requireAllSlotOwnersHaveReplicas": true}},
+	}
+	ctx := ctxWithObservedNodes(replicaScaleInSpec(), topologyWithMixedReplicas())
+	if err := validatePlan(p, ctx); err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+}
+
+func TestValidate_ReplicaScaleInRejectsZeroReplicas(t *testing.T) {
+	s := replicaScaleInSpec()
+	s.ReplicasPerShard = 0
+	ctx := ctxWithObservedNodes(s, topologyWithTwoReplicas())
+	if err := validatePlan(validReplicaScaleInPlan(), ctx); err == nil {
+		t.Fatal("expected error for zero replicas")
+	}
+}
+
+func TestValidate_ReplicaScaleInRejectsDeletingMaster(t *testing.T) {
+	p := validReplicaScaleInPlan()
+	p.Steps[0].Params["pod"] = "redis-0"
+	ctx := ctxWithObservedNodes(replicaScaleInSpec(), topologyWithTwoReplicas())
+	if err := validatePlan(p, ctx); err == nil {
+		t.Fatal("expected error for deleting master")
+	}
+}
+
+func TestValidate_ReplicaScaleInRejectsDeleteBeforeForget(t *testing.T) {
+	p := validReplicaScaleInPlan()
+	p.Steps = append(p.Steps[1:2], p.Steps[4])
+	ctx := ctxWithObservedNodes(replicaScaleInSpec(), topologyWithTwoReplicas())
+	if err := validatePlan(p, ctx); err == nil {
+		t.Fatal("expected error for DeleteNode without ForgetNode")
+	}
+}
+
+func TestValidate_ReplicaScaleInRejectsCreateAction(t *testing.T) {
+	p := validReplicaScaleInPlan()
+	p.Steps = append([]Step{{ID: "ensure-redis-6", Action: ActionEnsureNode, Params: map[string]any{"namespace": "example", "pod": "redis-6", "image": "redis:7.2", "memorySize": "2Gi"}}}, p.Steps...)
+	ctx := ctxWithObservedNodes(replicaScaleInSpec(), topologyWithTwoReplicas())
+	if err := validatePlan(p, ctx); err == nil {
+		t.Fatal("expected error for EnsureNode in replica scalein")
 	}
 }
 

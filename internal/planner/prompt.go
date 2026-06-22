@@ -79,6 +79,7 @@ func safetyInvariants() string {
 - A replica must not hold slots.
 - Slots 0-16383 must be fully covered exactly once across all AddSlots steps.
 - For shard ScaleOut, MigrateSlots must exactly rebalance slots to the controller rule: existing masters in observed topology order, then new masters in EnsureNode order, with slots 0-16383 split as evenly as possible.
+- For replica ScaleIn, only remove extra replicas with ForgetNode, then DeleteNode, then VerifyCluster. Never remove a master, migrate slots, or reduce replicasPerShard below 1.
 - Every namespace param must equal the RedisCluster name.
 - Every new pod referenced by WaitNodeReady/MeetNode/ReplicateNode/AddSlots must be declared by a preceding EnsureNode.
 - All Redis pods must be named "redis-<N>" where <N> is a single non-negative integer. Do NOT embed the cluster name or any other prefix. Correct examples: redis-0, redis-1, redis-2. Wrong examples: redis-3s1r-0, redis-cluster-0, redis-example-0. Pod names are globally non-reusable. Create uses redis-0 upward; all later new pods must start at the provided nextPodOrdinal and must not fill historical gaps.

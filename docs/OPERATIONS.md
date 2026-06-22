@@ -306,6 +306,35 @@ Controller 在执行 ScaleOut Plan 前必须做 schema 校验和安全校验：
 - 如果只增加 `replicasPerShard`，Plan 不允许包含 `MigrateSlots` 或 `AddSlots`
 - Plan 最后必须包含 `VerifyCluster`
 
+## ScaleIn
+
+ScaleIn Operation 表示在一个已经 Ready、健康、slot 完整覆盖的 Redis Cluster 上减少节点数量。第一版只支持减少每个 Shard 的 Replica 数量，不支持减少 Shard / Master 数量。
+
+Replica ScaleIn 的目标状态：
+
+- Master 数量保持等于当前 `spec.shards`
+- 每个 Master 的健康 Replica 数量等于新的 `spec.replicasPerShard`
+- `spec.replicasPerShard` 最小值为 1
+- slots 完整覆盖 `0-16383`，且 slot owner 不变
+- Redis Cluster 状态为 `ok`
+
+当只减少 `replicasPerShard` 时，Plan 不应创建节点，也不应迁移 slots。一个典型顺序是：
+
+1. 对每个多余 Replica 执行 `ForgetNode`
+2. 对同一个 Replica 执行 `DeleteNode`
+3. 最后执行 `VerifyCluster`
+
+Replica ScaleIn 安全校验：
+
+- `targetGeneration` 必须等于当前 RedisCluster CR 的 `metadata.generation`
+- `spec.shards` 必须保持不变
+- `spec.replicasPerShard` 必须小于当前 Replica 数量，且不能小于 1
+- Plan 只能包含 `ForgetNode`、`DeleteNode`、`VerifyCluster`
+- 被删除节点必须是当前 topology 中的 Replica，不能是 Master
+- 每个被删除 Replica 必须先 `ForgetNode`，再 `DeleteNode`
+- 每个 Shard 删除的 Replica 数必须精确收敛到新的 `spec.replicasPerShard`
+- Plan 最后必须包含 `VerifyCluster`
+
 ## Repair
 
 Repair Operation 表示实际 K8S/Redis 状态偏离了安全不变量。它只是文档中的状态差异分类，不是 Plan DSL 或 Controller 分支。Controller 不先恢复到单独的中间 baseline；它会废弃与当前实际状态不再匹配的 activePlan，并重新规划一个从当前状态直接收敛到当前 `spec` 的 Action Plan。

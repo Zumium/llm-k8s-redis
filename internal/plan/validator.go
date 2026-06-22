@@ -291,6 +291,11 @@ func validateCreatePodNames(ensurePods map[string]bool) error {
 
 func validateExistingTopologyPlan(p *Plan, spec ClusterSpec, ctx *ValidationContext, topology *ClusterTopology, ensurePods map[string]bool) error {
 	currentShards := len(topology.Shards)
+	if int(spec.Shards) == currentShards {
+		if err := validateReplicaScaleIn(p, spec, topology, ensurePods); err == nil {
+			return nil
+		}
+	}
 	currentReplicas, err := uniformReplicaCount(topology)
 	if err != nil {
 		if h := healableTopology(topology, spec, ctx.ObservedNodes); h != nil {
@@ -311,6 +316,79 @@ func validateExistingTopologyPlan(p *Plan, spec ClusterSpec, ctx *ValidationCont
 		return validateSameSpecRepair(*ctx, topology, ensurePods)
 	}
 	return fmt.Errorf("unsupported existing-topology change: spec.shards=%d current=%d spec.replicasPerShard=%d current=%d", spec.Shards, currentShards, spec.ReplicasPerShard, currentReplicas)
+}
+
+func validateReplicaScaleIn(p *Plan, spec ClusterSpec, topology *ClusterTopology, ensurePods map[string]bool) error {
+	target := int(spec.ReplicasPerShard)
+	if target < 1 {
+		return fmt.Errorf("replicasPerShard must be >= 1 for replica scalein")
+	}
+	if len(ensurePods) != 0 {
+		return fmt.Errorf("EnsureNode is not allowed for replica scalein")
+	}
+
+	needByMaster := map[string]int{}
+	replicaMaster := map[string]string{}
+	total := 0
+	for _, sh := range topology.Shards {
+		if len(sh.Replicas) < target {
+			return fmt.Errorf("master %q has %d replicas, fewer than target %d", sh.Master.Pod, len(sh.Replicas), target)
+		}
+		need := len(sh.Replicas) - target
+		needByMaster[sh.Master.Pod] = need
+		total += need
+		for _, r := range sh.Replicas {
+			replicaMaster[r.Pod] = sh.Master.Pod
+		}
+	}
+	if total == 0 {
+		return fmt.Errorf("replicasPerShard is not lower than current topology")
+	}
+
+	forgot := map[string]bool{}
+	deleted := map[string]bool{}
+	deletedByMaster := map[string]int{}
+	for _, s := range p.Steps {
+		switch s.Action {
+		case ActionForgetNode:
+			pod, _ := paramString(s.Params, "pod")
+			if _, ok := replicaMaster[pod]; !ok {
+				return fmt.Errorf("step %q: ForgetNode target %q is not a replica", s.ID, pod)
+			}
+			if forgot[pod] {
+				return fmt.Errorf("step %q: replica %q is forgotten more than once", s.ID, pod)
+			}
+			forgot[pod] = true
+		case ActionDeleteNode:
+			pod, _ := paramString(s.Params, "pod")
+			master, ok := replicaMaster[pod]
+			if !ok {
+				return fmt.Errorf("step %q: DeleteNode target %q is not a replica", s.ID, pod)
+			}
+			if !forgot[pod] {
+				return fmt.Errorf("step %q: DeleteNode target %q missing preceding ForgetNode", s.ID, pod)
+			}
+			if deleted[pod] {
+				return fmt.Errorf("step %q: replica %q is deleted more than once", s.ID, pod)
+			}
+			deleted[pod] = true
+			deletedByMaster[master]++
+		case ActionVerifyCluster:
+		default:
+			return fmt.Errorf("step %q: action %q is not allowed for replica scalein", s.ID, s.Action)
+		}
+	}
+	for pod := range forgot {
+		if !deleted[pod] {
+			return fmt.Errorf("replica %q is forgotten but not deleted", pod)
+		}
+	}
+	for master, need := range needByMaster {
+		if deletedByMaster[master] != need {
+			return fmt.Errorf("master %q deletes %d replicas, expected %d", master, deletedByMaster[master], need)
+		}
+	}
+	return nil
 }
 
 func healableTopology(topology *ClusterTopology, spec ClusterSpec, observed []ObservedNode) *healState {
