@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -44,6 +45,13 @@ func clusterOK() string {
 		vcReplica1ID + " 10.0.0.4:6379@16379 slave " + vcMaster1ID + " 0 0 4 connected\n"
 }
 
+func clusterOKAlt() string {
+	return "aaa999 10.0.0.1:6379@16379 master - 0 0 1 connected 0-8191\n" +
+		"bbb999 10.0.0.2:6379@16379 master - 0 0 2 connected 8192-16383\n" +
+		"ccc999 10.0.0.3:6379@16379 slave aaa999 0 0 3 connected\n" +
+		"ddd999 10.0.0.4:6379@16379 slave bbb999 0 0 4 connected\n"
+}
+
 func vcPod(name, ip string, ready bool) *corev1.Pod {
 	pod := desiredPod(testCluster(), "example", name, "redis:7.2", "2Gi", twoGiBytes)
 	pod.Status.PodIP = ip
@@ -76,6 +84,21 @@ func vcFourReadyPods() []*corev1.Pod {
 	}
 }
 
+func executeVerify(t *testing.T, ctx context.Context, exec *ActionExecutor, cluster *api.RedisCluster, p *plan.Plan) (StepOutcome, error) {
+	t.Helper()
+	return exec.ExecuteStep(ctx, cluster, p, 0)
+}
+
+func executeStableVerify(t *testing.T, ctx context.Context, exec *ActionExecutor, cluster *api.RedisCluster, step plan.Step) (StepOutcome, error) {
+	t.Helper()
+	p := &plan.Plan{Steps: []plan.Step{step}}
+	outcome, err := executeVerify(t, ctx, exec, cluster, p)
+	if err != nil || outcome.Status != plan.StepStateRunning {
+		return outcome, err
+	}
+	return executeVerify(t, ctx, exec, cluster, p)
+}
+
 func TestVerifyCluster_HappyPathReturnsCompletedAndRebuildsTopology(t *testing.T) {
 	ctx := context.Background()
 	cluster := testCluster()
@@ -86,7 +109,15 @@ func TestVerifyCluster_HappyPathReturnsCompletedAndRebuildsTopology(t *testing.T
 	}
 	exec := vcExec(t, cluster, pods, fc)
 
-	outcome, err := exec.ExecuteStep(ctx, cluster, &plan.Plan{Steps: []plan.Step{verifyStep()}}, 0)
+	p := &plan.Plan{Steps: []plan.Step{verifyStep()}}
+	outcome, err := executeVerify(t, ctx, exec, cluster, p)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if outcome.Status != plan.StepStateRunning {
+		t.Fatalf("expected first observation Running, got %q: %s", outcome.Status, outcome.Message)
+	}
+	outcome, err = executeVerify(t, ctx, exec, cluster, p)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -353,7 +384,7 @@ func TestVerifyCluster_MasterCountMismatchFails(t *testing.T) {
 	}
 	exec := vcExec(t, cluster, pods, fc)
 
-	outcome, err := exec.ExecuteStep(ctx, cluster, &plan.Plan{Steps: []plan.Step{verifyStep()}}, 0)
+	outcome, err := executeStableVerify(t, ctx, exec, cluster, verifyStep())
 	if err == nil {
 		t.Fatal("expected error on master count mismatch")
 	}
@@ -375,7 +406,7 @@ func TestVerifyCluster_ReplicaCountMismatchFails(t *testing.T) {
 	}
 	exec := vcExec(t, cluster, pods, fc)
 
-	outcome, err := exec.ExecuteStep(ctx, cluster, &plan.Plan{Steps: []plan.Step{verifyStep()}}, 0)
+	outcome, err := executeStableVerify(t, ctx, exec, cluster, verifyStep())
 	if err == nil {
 		t.Fatal("expected error on replica count mismatch")
 	}
@@ -398,7 +429,7 @@ func TestVerifyCluster_SlotCoverageGapFails(t *testing.T) {
 	}
 	exec := vcExec(t, cluster, pods, fc)
 
-	outcome, err := exec.ExecuteStep(ctx, cluster, &plan.Plan{Steps: []plan.Step{verifyStep()}}, 0)
+	outcome, err := executeStableVerify(t, ctx, exec, cluster, verifyStep())
 	if err == nil {
 		t.Fatal("expected error on slot coverage gap")
 	}
@@ -421,7 +452,7 @@ func TestVerifyCluster_MigratingSlotFails(t *testing.T) {
 	}
 	exec := vcExec(t, cluster, pods, fc)
 
-	outcome, err := exec.ExecuteStep(ctx, cluster, &plan.Plan{Steps: []plan.Step{verifyStep()}}, 0)
+	outcome, err := executeStableVerify(t, ctx, exec, cluster, verifyStep())
 	if err == nil {
 		t.Fatal("expected error on migrating slot")
 	}
@@ -444,7 +475,7 @@ func TestVerifyCluster_SlotOwnerNotMasterFails(t *testing.T) {
 	}
 	exec := vcExec(t, cluster, pods, fc)
 
-	outcome, err := exec.ExecuteStep(ctx, cluster, &plan.Plan{Steps: []plan.Step{verifyStep()}}, 0)
+	outcome, err := executeStableVerify(t, ctx, exec, cluster, verifyStep())
 	if err == nil {
 		t.Fatal("expected error when a replica owns a slot")
 	}
@@ -467,7 +498,7 @@ func TestVerifyCluster_FailedNodeFails(t *testing.T) {
 	}
 	exec := vcExec(t, cluster, pods, fc)
 
-	outcome, err := exec.ExecuteStep(ctx, cluster, &plan.Plan{Steps: []plan.Step{verifyStep()}}, 0)
+	outcome, err := executeStableVerify(t, ctx, exec, cluster, verifyStep())
 	if err == nil {
 		t.Fatal("expected error when a node is failed")
 	}
@@ -490,7 +521,7 @@ func TestVerifyCluster_ReplicaFailedFails(t *testing.T) {
 	}
 	exec := vcExec(t, cluster, pods, fc)
 
-	outcome, err := exec.ExecuteStep(ctx, cluster, &plan.Plan{Steps: []plan.Step{verifyStep()}}, 0)
+	outcome, err := executeStableVerify(t, ctx, exec, cluster, verifyStep())
 	if err == nil {
 		t.Fatal("expected error when a replica is failed (replica count drops)")
 	}
@@ -517,7 +548,7 @@ func TestVerifyCluster_UnmappedRedisNodeFails(t *testing.T) {
 	}
 	exec := vcExec(t, cluster, pods, fc)
 
-	outcome, err := exec.ExecuteStep(ctx, cluster, &plan.Plan{Steps: []plan.Step{verifyStep()}}, 0)
+	outcome, err := executeStableVerify(t, ctx, exec, cluster, verifyStep())
 	if err == nil {
 		t.Fatal("expected error when a redis node is not a managed pod")
 	}
@@ -537,7 +568,7 @@ func TestVerifyCluster_HandshakeNodeIgnored(t *testing.T) {
 	}
 	exec := vcExec(t, cluster, pods, fc)
 
-	outcome, err := exec.ExecuteStep(ctx, cluster, &plan.Plan{Steps: []plan.Step{verifyStep()}}, 0)
+	outcome, err := executeStableVerify(t, ctx, exec, cluster, verifyStep())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -559,12 +590,68 @@ func TestVerifyCluster_NonIntegerFloatShardsAccepted(t *testing.T) {
 	step := verifyStep()
 	step.Params["expectedShards"] = float64(2)
 	step.Params["expectedReplicasPerShard"] = float64(1)
-	outcome, err := exec.ExecuteStep(ctx, cluster, &plan.Plan{Steps: []plan.Step{step}}, 0)
+	outcome, err := executeStableVerify(t, ctx, exec, cluster, step)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if outcome.Status != plan.StepStateCompleted {
 		t.Fatalf("expected Completed with integer-valued float params, got %q: %s", outcome.Status, outcome.Message)
+	}
+}
+
+func TestVerifyCluster_TopologyChangeResetsStabilityCount(t *testing.T) {
+	ctx := context.Background()
+	cluster := testCluster()
+	pods := vcFourReadyPods()
+	nodes := []string{clusterOK(), clusterOKAlt(), clusterOKAlt()}
+	fc := &fakeRedisClient{
+		clusterInfo: func() (string, error) { return "cluster_state:ok\r\n", nil },
+		clusterNodes: func() (string, error) {
+			out := nodes[0]
+			if len(nodes) > 1 {
+				nodes = nodes[1:]
+			}
+			return out, nil
+		},
+	}
+	exec := vcExec(t, cluster, pods, fc)
+	p := &plan.Plan{Steps: []plan.Step{verifyStep()}}
+
+	outcome, err := executeVerify(t, ctx, exec, cluster, p)
+	if err != nil || outcome.Status != plan.StepStateRunning {
+		t.Fatalf("expected first observation Running, got %q %v: %s", outcome.Status, err, outcome.Message)
+	}
+	outcome, err = executeVerify(t, ctx, exec, cluster, p)
+	if err != nil || outcome.Status != plan.StepStateRunning {
+		t.Fatalf("expected changed observation to remain Running, got %q %v: %s", outcome.Status, err, outcome.Message)
+	}
+	outcome, err = executeVerify(t, ctx, exec, cluster, p)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if outcome.Status != plan.StepStateCompleted {
+		t.Fatalf("expected third stable observation Completed, got %q: %s", outcome.Status, outcome.Message)
+	}
+}
+
+func TestVerifyCluster_StabilityTimeoutFails(t *testing.T) {
+	ctx := context.Background()
+	cluster := testCluster()
+	pods := vcFourReadyPods()
+	fc := &fakeRedisClient{
+		clusterInfo:  func() (string, error) { return "cluster_state:ok\r\n", nil },
+		clusterNodes: func() (string, error) { return clusterOK(), nil },
+	}
+	exec := vcExec(t, cluster, pods, fc)
+	step := verifyStep()
+	step.Params[verifyStartedAtKey] = time.Now().Add(-3 * time.Minute).Format(time.RFC3339Nano)
+
+	outcome, err := exec.ExecuteStep(ctx, cluster, &plan.Plan{Steps: []plan.Step{step}}, 0)
+	if err == nil {
+		t.Fatal("expected timeout error")
+	}
+	if outcome.Status != plan.StepStateFailed {
+		t.Fatalf("expected Failed on stability timeout, got %q: %s", outcome.Status, outcome.Message)
 	}
 }
 

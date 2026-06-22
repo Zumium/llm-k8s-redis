@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
@@ -399,13 +400,21 @@ func (p *recordingPlanner) Plan(_ context.Context, req planner.Request) (*plan.P
 }
 
 type recordingExecutor struct {
-	called int
-	index  int
+	called  int
+	index   int
+	outcome StepOutcome
+	params  map[string]any
 }
 
-func (e *recordingExecutor) ExecuteStep(_ context.Context, _ *api.RedisCluster, _ *plan.Plan, stepIndex int) (StepOutcome, error) {
+func (e *recordingExecutor) ExecuteStep(_ context.Context, _ *api.RedisCluster, p *plan.Plan, stepIndex int) (StepOutcome, error) {
 	e.called++
 	e.index = stepIndex
+	if e.params != nil {
+		p.Steps[stepIndex].Params = e.params
+	}
+	if e.outcome.Status != "" {
+		return e.outcome, nil
+	}
 	return StepOutcome{Status: plan.StepStateCompleted, Message: "done"}, nil
 }
 
@@ -519,6 +528,31 @@ func failedPlan() *api.PlanStatus {
 		ID:               "plan",
 		TargetGeneration: 1,
 		Steps:            []api.StepStatus{{ID: "s1", Action: string(plan.ActionVerifyCluster), Status: string(plan.StepStateFailed)}},
+	}
+}
+
+func TestExecuteNextStep_PersistsUpdatedParams(t *testing.T) {
+	ctx := context.Background()
+	scheme := newScheme(t)
+	cluster := testCluster()
+	active := runningPlan()
+	cluster.Status.ActivePlan = active
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster).WithStatusSubresource(&api.RedisCluster{}).Build()
+	exec := &recordingExecutor{outcome: StepOutcome{
+		Status:  plan.StepStateRunning,
+		Message: "waiting",
+	}, params: map[string]any{"foo": "bar", "stable": 1}}
+	r := &RedisClusterReconciler{Client: cl, Scheme: scheme, Driver: exec}
+
+	if _, err := r.executeNextStep(ctx, cluster, active); err != nil {
+		t.Fatalf("executeNextStep: %v", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(active.Steps[0].Params.Raw, &got); err != nil {
+		t.Fatalf("unmarshal params: %v", err)
+	}
+	if got["foo"] != "bar" || got["stable"].(float64) != 1 {
+		t.Fatalf("unexpected persisted params: %#v", got)
 	}
 }
 

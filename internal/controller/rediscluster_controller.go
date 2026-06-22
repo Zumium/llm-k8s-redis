@@ -2,10 +2,12 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -290,6 +292,17 @@ func (r *RedisClusterReconciler) executeNextStep(ctx context.Context, cluster *v
 		return r.finish(ctx, cluster, ctrl.Result{}, nil)
 	}
 	logger.Info("step execution finished", "duration", time.Since(execStart), "status", outcome.Status, "message", outcome.Message)
+	if planModel.Steps[idx].Params != nil {
+		raw, err := json.Marshal(planModel.Steps[idx].Params)
+		if err != nil {
+			logger.Error(err, "step params marshal failed")
+			setStep(active, idx, string(plan.StepStateFailed), err.Error())
+			active.CurrentStep = step.ID
+			setCondition(cluster, ConditionReady, metav1.ConditionFalse, "StepFailed", err.Error())
+			return r.finish(ctx, cluster, ctrl.Result{}, nil)
+		}
+		active.Steps[idx].Params = apiextensionsv1.JSON{Raw: raw}
+	}
 	setStep(active, idx, string(outcome.Status), outcome.Message)
 	active.CurrentStep = step.ID
 

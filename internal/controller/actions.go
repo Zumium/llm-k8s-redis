@@ -55,7 +55,7 @@ func (e *ActionExecutor) ExecuteStep(ctx context.Context, cluster *v1alpha1.Redi
 	case plan.ActionDeleteNode:
 		return e.deleteNode(ctx, cluster, step)
 	case plan.ActionVerifyCluster:
-		return e.verifyCluster(ctx, cluster, p, step)
+		return e.verifyCluster(ctx, cluster, p, stepIndex)
 	default:
 		msg := fmt.Sprintf("action %q is not yet implemented", step.Action)
 		return StepOutcome{Status: plan.StepStateFailed, Message: msg}, fmt.Errorf("%s", msg)

@@ -323,9 +323,11 @@ Params：
 - Controller 从 Redis Cluster 读取 `CLUSTER INFO`、`CLUSTER NODES`、slot 分布等实际状态
 - Controller 同时读取 K8S Pod 等资源状态
 - 将 Redis 实际拓扑和 K8S 实际资源合并成状态快照
+- Controller 需要连续 2 次观察到相同的健康状态快照后才执行最终校验；若 2 分钟内未稳定则步骤失败
 - 校验 Master 数量、Replica 数量、slot 覆盖、cluster health 和单 Master 安全不变量
 - 校验通过后刷新 `status.topology` 和相关 conditions
 - `VerifyCluster` 不修改 Redis Cluster 拓扑，只负责观察、校验和更新状态
+- 稳定等待状态保存在当前 step 的 controller 内部 params 中，不属于 Planner DSL 输入
 
 安全校验：
 

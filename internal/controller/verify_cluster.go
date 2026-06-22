@@ -3,6 +3,8 @@ package controller
 import (
 	"context"
 	"fmt"
+	"sort"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -14,10 +16,20 @@ import (
 	"github.com/example/llm-k8s-redis/internal/rediscluster"
 )
 
-func (e *ActionExecutor) verifyCluster(ctx context.Context, cluster *v1alpha1.RedisCluster, _ *plan.Plan, step plan.Step) (StepOutcome, error) {
+const (
+	verifyStableRequired = 2
+	verifyStableTimeout  = 2 * time.Minute
+
+	verifyStartedAtKey   = "__controllerVerifyStartedAt"
+	verifyFingerprintKey = "__controllerVerifyFingerprint"
+	verifyStableCountKey = "__controllerVerifyStableCount"
+)
+
+func (e *ActionExecutor) verifyCluster(ctx context.Context, cluster *v1alpha1.RedisCluster, p *plan.Plan, stepIndex int) (StepOutcome, error) {
 	start := time.Now()
 	logger := log.FromContext(ctx)
 	logger.Info("verify cluster started")
+	step := &p.Steps[stepIndex]
 	expectedShards, outcome, err, ok := paramInt(step.Params, "expectedShards")
 	if !ok {
 		return outcome, err
@@ -66,9 +78,15 @@ func (e *ActionExecutor) verifyCluster(ctx context.Context, cluster *v1alpha1.Re
 	}
 	if !obs.healthy {
 		logger.Info("verify cluster observe topology unhealthy", "duration", time.Since(start), "message", obs.message)
-		return running("%s", obs.message), nil
+		outcome, _, err := waitForStableCluster(step.Params, start, "", obs.message)
+		return outcome, err
 	}
 	logger.Info("verify cluster topology observed", "duration", time.Since(start), "entries", len(obs.entries), "shards", len(obs.topology.Shards))
+
+	outcome, stable, err := waitForStableCluster(step.Params, start, clusterObservationFingerprint(obs), "")
+	if err != nil || !stable {
+		return outcome, err
+	}
 
 	if bad := firstUnhealthyManagedNode(obs.entries); bad != "" {
 		logger.Info("verify cluster found unhealthy node", "node", bad)
@@ -113,6 +131,86 @@ func (e *ActionExecutor) verifyCluster(ctx context.Context, cluster *v1alpha1.Re
 	setCondition(cluster, ConditionHealthy, metav1.ConditionTrue, "ClusterVerified", "cluster matches desired topology")
 	logger.Info("verify cluster finished", "duration", time.Since(start), "masters", expectedShards, "replicasPerMaster", expectedReplicas)
 	return completed("cluster verified: %d masters, %d replicas/master, full slot coverage", expectedShards, expectedReplicas), nil
+}
+
+func waitForStableCluster(params map[string]any, now time.Time, fingerprint, unhealthyMessage string) (StepOutcome, bool, error) {
+	started := verifyStartedAt(params, now)
+	params[verifyStartedAtKey] = started.Format(time.RFC3339Nano)
+
+	count := 0
+	if fingerprint != "" {
+		count = 1
+		if paramStringValue(params, verifyFingerprintKey) == fingerprint {
+			count = paramIntValue(params, verifyStableCountKey) + 1
+		}
+		params[verifyFingerprintKey] = fingerprint
+		params[verifyStableCountKey] = count
+	}
+
+	if count >= verifyStableRequired {
+		return StepOutcome{}, true, nil
+	}
+	if now.Sub(started) >= verifyStableTimeout {
+		if unhealthyMessage != "" {
+			outcome, err := paramErr("cluster did not stabilize within %s: %s", verifyStableTimeout, unhealthyMessage)
+			return outcome, false, err
+		}
+		outcome, err := paramErr("cluster did not stabilize within %s", verifyStableTimeout)
+		return outcome, false, err
+	}
+	if unhealthyMessage != "" {
+		return running("%s", unhealthyMessage), false, nil
+	}
+	out := running("waiting for stable cluster observation: %d/%d", count, verifyStableRequired)
+	return out, false, nil
+}
+
+func verifyStartedAt(params map[string]any, now time.Time) time.Time {
+	if s := paramStringValue(params, verifyStartedAtKey); s != "" {
+		if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
+			return t
+		}
+	}
+	return now
+}
+
+func clusterObservationFingerprint(obs clusterObservation) string {
+	parts := make([]string, 0, len(obs.entries)+len(obs.pods))
+	for _, e := range obs.entries {
+		flags := append([]string{}, e.Flags...)
+		sort.Strings(flags)
+		slots := append([]string{}, e.Slots...)
+		sort.Strings(slots)
+		parts = append(parts, "node|"+strings.Join([]string{
+			e.ID,
+			e.Addr,
+			strings.Join(flags, ","),
+			e.MasterID,
+			e.LinkState,
+			strings.Join(slots, ","),
+		}, "|"))
+	}
+	for _, p := range obs.pods {
+		parts = append(parts, fmt.Sprintf("pod|%s|%s|%t", p.Name, p.Status.PodIP, podReady(&p)))
+	}
+	sort.Strings(parts)
+	return strings.Join(parts, "\n")
+}
+
+func paramStringValue(params map[string]any, key string) string {
+	v, ok := params[key].(string)
+	if !ok {
+		return ""
+	}
+	return v
+}
+
+func paramIntValue(params map[string]any, key string) int {
+	v, _, _, ok := paramInt(params, key)
+	if !ok {
+		return 0
+	}
+	return v
 }
 
 func firstUnhealthyManagedNode(entries []rediscluster.Entry) string {
