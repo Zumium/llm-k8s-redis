@@ -1,0 +1,9 @@
+apiVersion: redis.example.com/v1alpha1
+kind: RedisCluster
+metadata:
+  name: valkey-3s1r
+spec:
+  shards: 3
+  replicasPerShard: 1
+  image: valkey/valkey:8
+  memorySize: 2Gi
