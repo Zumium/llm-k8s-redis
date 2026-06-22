@@ -54,6 +54,31 @@ func TestForgetNode_LastKnownNodeIDCompletes(t *testing.T) {
 	}
 }
 
+func TestForgetNode_PodAbsentFromClusterNodesCompletes(t *testing.T) {
+	ctx := context.Background()
+	cluster := clusterWithTopology()
+	seed := vcPod("redis-0", "10.0.0.1", true)
+	target := vcPod("redis-8", "10.0.0.8", true)
+	cl := fake.NewClientBuilder().WithScheme(newScheme(t)).WithObjects(cluster, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "example"}}, seed, target).Build()
+	fc := &fakeRedisClient{clusterNodes: func() (string, error) {
+		return "master 10.0.0.1:6379@16379 master - 0 0 1 connected 0-16383\n" +
+			"replica 10.0.0.2:6379@16379 slave master 0 0 1 connected\n", nil
+	}}
+	exec := &ActionExecutor{Client: cl, Scheme: newScheme(t), RedisFactory: fakeFactory(fc)}
+	step := plan.Step{ID: "forget", Action: plan.ActionForgetNode, Params: map[string]any{"namespace": "example", "pod": "redis-8"}}
+
+	outcome, err := exec.forgetNode(ctx, cluster, step)
+	if err != nil {
+		t.Fatalf("forgetNode: %v", err)
+	}
+	if outcome.Status != plan.StepStateCompleted {
+		t.Fatalf("expected completed, got %s: %s", outcome.Status, outcome.Message)
+	}
+	if len(fc.forgetCalls) != 0 {
+		t.Fatalf("unexpected forget calls: %#v", fc.forgetCalls)
+	}
+}
+
 func TestForgetNode_RejectsSlotOwner(t *testing.T) {
 	ctx := context.Background()
 	cluster := clusterWithTopology()

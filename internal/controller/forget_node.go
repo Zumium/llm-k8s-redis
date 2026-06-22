@@ -121,7 +121,7 @@ func (e *ActionExecutor) forgetTargetNodeID(step plan.Step, podName string, pods
 		}
 		entry := rediscluster.FindByIP(entries, pods[i].Status.PodIP)
 		if entry == nil {
-			return "", running("pod %s is not visible in CLUSTER NODES yet", podName), nil, false
+			return "", completed("pod %s already absent from CLUSTER NODES", podName), nil, false
 		}
 		return entry.ID, StepOutcome{}, nil, true
 	}
