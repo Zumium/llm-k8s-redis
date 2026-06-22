@@ -53,22 +53,23 @@ func buildSystemPrompt() string {
 func actionReference() string {
 	var b strings.Builder
 	type actionPromptLine struct {
-		name   plan.ActionType
-		params string
+		name        plan.ActionType
+		description string
+		params      string
 	}
 	lines := []actionPromptLine{
-		{plan.ActionEnsureNode, `{"namespace":"<cluster>","pod":"<name>","image":"<image>","memorySize":"<size>"}`},
-		{plan.ActionWaitNodeReady, `{"namespace":"<cluster>","pod":"<name>"}`},
-		{plan.ActionMeetNode, `{"namespace":"<cluster>","sourcePod":"<name>","targetPod":"<name>"}`},
-		{plan.ActionReplicateNode, `{"namespace":"<cluster>","masterPod":"<name>","replicaPod":"<name>"}`},
-		{plan.ActionAddSlots, `{"namespace":"<cluster>","pod":"<name>","slots":"<start-end>"}`},
-		{plan.ActionMigrateSlots, `{"namespace":"<cluster>","sourcePod":"<name>","targetPod":"<name>","slots":"<start-end>"}`},
-		{plan.ActionForgetNode, `{"namespace":"<cluster>","pod":"<name>","lastKnownNodeId":"<optional last-known node id only when pod is gone>"}`},
-		{plan.ActionDeleteNode, `{"namespace":"<cluster>","pod":"<name>"}`},
-		{plan.ActionVerifyCluster, `{"expectedShards":<n>,"expectedReplicasPerShard":<n>,"requireClusterStateOk":true,"requireFullSlotCoverage":true,"requireAllSlotOwnersHaveReplicas":true}`},
+		{plan.ActionEnsureNode, "Ensure the Redis Pod exists with the desired image and memory; does not meet nodes, set replicas, or assign slots.", `{"namespace":"<cluster>","pod":"<name>","image":"<image>","memorySize":"<size>"}`},
+		{plan.ActionWaitNodeReady, "Wait until the Pod is Ready and Redis is reachable.", `{"namespace":"<cluster>","pod":"<name>"}`},
+		{plan.ActionMeetNode, "Join targetPod to the Redis Cluster gossip network that sourcePod belongs to.", `{"namespace":"<cluster>","sourcePod":"<name>","targetPod":"<name>"}`},
+		{plan.ActionReplicateNode, "Make replicaPod replicate from masterPod; replicaPod must not own slots.", `{"namespace":"<cluster>","masterPod":"<name>","replicaPod":"<name>"}`},
+		{plan.ActionAddSlots, "Assign only unowned slots to a master; do not use it to move slots already owned by another master.", `{"namespace":"<cluster>","pod":"<name>","slots":"<start-end>"}`},
+		{plan.ActionMigrateSlots, "Move slots from source master to target master; slots already on target are treated as done and execution continues in batches.", `{"namespace":"<cluster>","sourcePod":"<name>","targetPod":"<name>","slots":"<start-end>"}`},
+		{plan.ActionForgetNode, "Remove a node from Redis Cluster membership without deleting its Pod; include lastKnownNodeId when the Pod is gone.", `{"namespace":"<cluster>","pod":"<name>","lastKnownNodeId":"<optional last-known node id only when pod is gone>"}`},
+		{plan.ActionDeleteNode, "Delete the Kubernetes resources for a node; only safe after ForgetNode or if the node never joined Redis Cluster.", `{"namespace":"<cluster>","pod":"<name>"}`},
+		{plan.ActionVerifyCluster, "Verify final state without changing topology; count only slot-owning masters, and wait for extra no-slot masters as gossip convergence instead of immediate shard mismatch.", `{"expectedShards":<n>,"expectedReplicasPerShard":<n>,"requireClusterStateOk":true,"requireFullSlotCoverage":true,"requireAllSlotOwnersHaveReplicas":true}`},
 	}
 	for _, line := range lines {
-		fmt.Fprintf(&b, "- %s: %s\n", line.name, line.params)
+		fmt.Fprintf(&b, "- %s: %s Params: %s\n", line.name, line.description, line.params)
 	}
 	return b.String()
 }

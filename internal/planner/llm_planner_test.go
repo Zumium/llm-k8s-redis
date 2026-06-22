@@ -140,6 +140,36 @@ func TestLLMPlanner_PromptContainsSpec(t *testing.T) {
 	}
 }
 
+func TestLLMPlanner_PromptContainsActionSemantics(t *testing.T) {
+	llmClient := &recordingLLMClient{resp: &LLMResponse{Text: validMinimalPlanJSON()}}
+	_, _ = NewLLMPlanner(llmClient).Plan(context.Background(), Request{Spec: sampleSpec()})
+
+	systemPrompt := llmClient.lastReq.Messages[0].Content
+	for _, want := range []string{
+		"EnsureNode: Ensure the Redis Pod exists",
+		"does not meet nodes, set replicas, or assign slots",
+		"WaitNodeReady: Wait until the Pod is Ready and Redis is reachable",
+		"MeetNode: Join targetPod to the Redis Cluster gossip network",
+		"ReplicateNode: Make replicaPod replicate from masterPod",
+		"replicaPod must not own slots",
+		"AddSlots: Assign only unowned slots to a master",
+		"do not use it to move slots already owned by another master",
+		"MigrateSlots: Move slots from source master to target master",
+		"execution continues in batches",
+		"ForgetNode: Remove a node from Redis Cluster membership without deleting its Pod",
+		"include lastKnownNodeId when the Pod is gone",
+		"DeleteNode: Delete the Kubernetes resources for a node",
+		"only safe after ForgetNode or if the node never joined Redis Cluster",
+		"VerifyCluster: Verify final state without changing topology",
+		"count only slot-owning masters",
+		"wait for extra no-slot masters as gossip convergence",
+	} {
+		if !strings.Contains(systemPrompt, want) {
+			t.Errorf("system prompt missing %q", want)
+		}
+	}
+}
+
 func TestLLMPlanner_FeedbackUsesMessageHistory(t *testing.T) {
 	llmClient := &recordingLLMClient{resp: &LLMResponse{Text: validMinimalPlanJSON()}}
 	rejectedPlan := &plan.Plan{PlanID: "bad-plan", Steps: []plan.Step{{ID: "bad", Action: plan.ActionAddSlots}}}
