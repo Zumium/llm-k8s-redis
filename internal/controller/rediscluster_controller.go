@@ -148,9 +148,7 @@ func (r *RedisClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		case plan.PlanStateCompleted:
 			if topologyMatchesSpec(cluster.Status.Topology, spec) {
 				active.Status = string(plan.PlanStateCompleted)
-				cluster.Status.ObservedGeneration = cluster.Generation
-				setCondition(&cluster, ConditionPlanned, metav1.ConditionFalse, "NoPlanNeeded", "topology already matches spec")
-				setCondition(&cluster, ConditionReady, metav1.ConditionTrue, "ClusterReady", "cluster matches desired topology")
+				markNoPlanNeeded(&cluster, "topology already matches spec")
 				logger.Info("completed plan still matches spec", "planID", active.ID)
 				return r.finish(ctx, &cluster, ctrl.Result{RequeueAfter: r.TopologyRefreshInterval}, nil)
 			}
@@ -162,9 +160,7 @@ func (r *RedisClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		case plan.PlanStateFailed:
 			if topologyMatchesSpec(cluster.Status.Topology, spec) {
 				cluster.Status.ActivePlan = nil
-				cluster.Status.ObservedGeneration = cluster.Generation
-				setCondition(&cluster, ConditionPlanned, metav1.ConditionFalse, "NoPlanNeeded", "topology already matches spec")
-				setCondition(&cluster, ConditionReady, metav1.ConditionTrue, "ClusterReady", "cluster matches desired topology")
+				markNoPlanNeeded(&cluster, "topology already matches spec")
 				logger.Info("failed plan cleared because topology matches spec", "planID", active.ID)
 				return r.finish(ctx, &cluster, ctrl.Result{RequeueAfter: r.TopologyRefreshInterval}, nil)
 			}
@@ -200,6 +196,12 @@ func (r *RedisClusterReconciler) reconcilePlan(ctx context.Context, cluster *v1a
 	}
 	logger.Info("observed nodes collected", "nodes", len(nodes), "duration", time.Since(collectStart))
 	req.ObservedState.Nodes = nodes
+	if observedNodesMatchSpec(nodes, spec) {
+		cluster.Status.ActivePlan = nil
+		markNoPlanNeeded(cluster, "live topology already matches spec")
+		logger.Info("live topology already matches spec, skipping planner")
+		return r.finish(ctx, cluster, ctrl.Result{RequeueAfter: r.TopologyRefreshInterval}, nil)
+	}
 
 	validationRetries := r.PlanValidationRetries
 	if validationRetries < 0 {
@@ -223,13 +225,6 @@ func (r *RedisClusterReconciler) reconcilePlan(ctx context.Context, cluster *v1a
 		logger.Info("planner returned plan", "attempt", attempt, "planID", newPlan.PlanID, "steps", len(newPlan.Steps), "duration", time.Since(attemptStart))
 		validateStart := time.Now()
 		if err := r.ValidatePlan(newPlan, validationContext(cluster, spec, nodes)); err != nil {
-			if topologyMatchesSpec(cluster.Status.Topology, spec) {
-				logger.Info("plan rejected but topology already matches spec, marking ready", "attempt", attempt, "planID", newPlan.PlanID, "duration", time.Since(validateStart), "error", err)
-				cluster.Status.ObservedGeneration = cluster.Generation
-				setCondition(cluster, ConditionPlanned, metav1.ConditionFalse, "NoPlanNeeded", "topology already matches spec")
-				setCondition(cluster, ConditionReady, metav1.ConditionTrue, "ClusterReady", "cluster matches desired topology")
-				return r.finish(ctx, cluster, ctrl.Result{RequeueAfter: r.TopologyRefreshInterval}, nil)
-			}
 			logger.Info("plan rejected", "attempt", attempt, "planID", newPlan.PlanID, "duration", time.Since(validateStart), "error", err)
 			if attempt < validationRetries {
 				req.ValidationFeedback = append(req.ValidationFeedback, planner.ValidationFeedback{RejectedPlan: newPlan, Error: err.Error()})
@@ -259,6 +254,12 @@ func (r *RedisClusterReconciler) reconcilePlan(ctx context.Context, cluster *v1a
 
 	logger.Info("planning finished without accepted plan")
 	return r.finish(ctx, cluster, ctrl.Result{RequeueAfter: r.TopologyRefreshInterval}, nil)
+}
+
+func markNoPlanNeeded(cluster *v1alpha1.RedisCluster, message string) {
+	cluster.Status.ObservedGeneration = cluster.Generation
+	setCondition(cluster, ConditionPlanned, metav1.ConditionFalse, "NoPlanNeeded", message)
+	setCondition(cluster, ConditionReady, metav1.ConditionTrue, "ClusterReady", "cluster matches desired topology")
 }
 
 func (r *RedisClusterReconciler) executeNextStep(ctx context.Context, cluster *v1alpha1.RedisCluster, active *v1alpha1.PlanStatus) (ctrl.Result, error) {

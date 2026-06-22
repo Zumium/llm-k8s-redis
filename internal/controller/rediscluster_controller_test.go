@@ -890,6 +890,84 @@ func TestReconcile_ReplansAfterStalePlanCleared(t *testing.T) {
 	}
 }
 
+func TestReconcile_LiveObservedTopologyMatchingSpecSkipsPlanner(t *testing.T) {
+	ctx := context.Background()
+	scheme := newScheme(t)
+	cluster := &api.RedisCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "example", Generation: 1, Finalizers: []string{finalizer}},
+		Spec:       api.RedisClusterSpec{Shards: 2, ReplicasPerShard: 1, Image: "redis:7.2", MemorySize: "2Gi"},
+		Status: api.RedisClusterStatus{
+			ObservedGeneration: 1,
+			Topology: &api.ClusterTopology{Shards: []api.ShardTopology{
+				{ID: "shard-0", Master: api.NodeTopology{Pod: "redis-0", Slots: "0-8191", Ready: true}},
+			}},
+		},
+	}
+	nodes := []plan.ObservedNode{
+		{Pod: "redis-0", PodExists: true, RedisSeen: true, NodeID: "master-0", Role: "master", Slots: "0-8191", Ready: true},
+		{Pod: "redis-1", PodExists: true, RedisSeen: true, NodeID: "replica-1", Role: "replica", MasterPod: "redis-0", Ready: true},
+		{Pod: "redis-2", PodExists: true, RedisSeen: true, NodeID: "master-2", Role: "master", Slots: "8192-16383", Ready: true},
+		{Pod: "redis-3", PodExists: true, RedisSeen: true, NodeID: "replica-3", Role: "replica", MasterPod: "redis-2", Ready: true},
+		{Pod: "redis-4", PodExists: true, RedisSeen: true, NodeID: "no-slot", Role: "master", Ready: true},
+	}
+	fp := &recordingPlanner{}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "example"}}).WithStatusSubresource(&api.RedisCluster{}).Build()
+	r := &RedisClusterReconciler{
+		Client: cl, Scheme: scheme, Planner: fp, Driver: &recordingObserver{nodes: nodes},
+		ValidatePlan:            plan.NewValidator().Validate,
+		TopologyRefreshInterval: 42 * time.Second, TopologyStaleThreshold: time.Hour,
+	}
+
+	res, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "example"}})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if fp.called != 0 {
+		t.Fatalf("expected planner to be skipped, got %d calls", fp.called)
+	}
+	if res.RequeueAfter != 42*time.Second {
+		t.Fatalf("expected RequeueAfter=42s, got %v", res.RequeueAfter)
+	}
+	var got api.RedisCluster
+	if err := cl.Get(ctx, client.ObjectKey{Name: "example"}, &got); err != nil {
+		t.Fatalf("get cluster: %v", err)
+	}
+	if got.Status.ActivePlan != nil {
+		t.Fatalf("expected activePlan cleared, got %#v", got.Status.ActivePlan)
+	}
+	if !hasCondition(got.Status.Conditions, ConditionReady, metav1.ConditionTrue, "ClusterReady") {
+		t.Fatalf("expected Ready=True/ClusterReady, got %#v", got.Status.Conditions)
+	}
+}
+
+func TestReconcile_LiveObservedTopologyMismatchCallsPlanner(t *testing.T) {
+	ctx := context.Background()
+	scheme := newScheme(t)
+	cluster := &api.RedisCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "example", Generation: 1, Finalizers: []string{finalizer}},
+		Spec:       api.RedisClusterSpec{Shards: 2, ReplicasPerShard: 1, Image: "redis:7.2", MemorySize: "2Gi"},
+	}
+	nodes := []plan.ObservedNode{
+		{Pod: "redis-0", PodExists: true, RedisSeen: true, NodeID: "master-0", Role: "master", Slots: "0-8191", Ready: true},
+		{Pod: "redis-1", PodExists: true, RedisSeen: true, NodeID: "replica-1", Role: "replica", MasterPod: "redis-0", Ready: true},
+		{Pod: "redis-2", PodExists: true, RedisSeen: true, NodeID: "master-2", Role: "master", Slots: "8192-16383", Ready: true},
+	}
+	fp := &recordingPlanner{}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "example"}}).WithStatusSubresource(&api.RedisCluster{}).Build()
+	r := &RedisClusterReconciler{
+		Client: cl, Scheme: scheme, Planner: fp, Driver: &recordingObserver{nodes: nodes},
+		ValidatePlan:            plan.NewValidator().Validate,
+		TopologyRefreshInterval: time.Minute, TopologyStaleThreshold: time.Hour,
+	}
+
+	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "example"}}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if fp.called != 1 {
+		t.Fatalf("expected planner to be called once, got %d", fp.called)
+	}
+}
+
 func TestReconcile_LazyRefreshForcedOnPodDelete(t *testing.T) {
 	ctx := context.Background()
 	scheme := newScheme(t)

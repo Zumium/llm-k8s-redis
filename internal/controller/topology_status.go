@@ -11,6 +11,7 @@ import (
 
 	v1alpha1 "github.com/example/llm-k8s-redis/api/v1alpha1"
 	"github.com/example/llm-k8s-redis/internal/plan"
+	"github.com/example/llm-k8s-redis/internal/rediscluster"
 )
 
 func (r *RedisClusterReconciler) shouldRefreshTopology(ctx context.Context, c *v1alpha1.RedisCluster) bool {
@@ -97,6 +98,67 @@ func topologyMatchesSpec(topology *v1alpha1.ClusterTopology, spec plan.ClusterSp
 			if !r.Ready {
 				return false
 			}
+		}
+	}
+	return true
+}
+
+func observedNodesMatchSpec(nodes []plan.ObservedNode, spec plan.ClusterSpec) bool {
+	if len(nodes) == 0 || spec.Shards <= 0 || spec.ReplicasPerShard < 0 {
+		return false
+	}
+	nodeIDToPod := map[string]string{}
+	for _, n := range nodes {
+		if n.NodeID != "" && n.Pod != "" {
+			nodeIDToPod[n.NodeID] = n.Pod
+		}
+	}
+	shards := map[string]int{}
+	covered := map[int]string{}
+	for _, n := range nodes {
+		if !n.PodExists || !n.RedisSeen || n.Role != "master" || n.Slots == "" {
+			continue
+		}
+		if n.Pod == "" || !n.Ready || n.Deleting {
+			return false
+		}
+		if _, ok := shards[n.Pod]; ok {
+			return false
+		}
+		slots, err := rediscluster.ParseSlotSpec(n.Slots)
+		if err != nil || len(slots) == 0 {
+			return false
+		}
+		for _, slot := range slots {
+			if _, ok := covered[slot]; ok {
+				return false
+			}
+			covered[slot] = n.Pod
+		}
+		shards[n.Pod] = 0
+	}
+	if len(shards) != int(spec.Shards) || len(covered) != 16384 {
+		return false
+	}
+	for _, n := range nodes {
+		if !n.PodExists || !n.RedisSeen || n.Role != "replica" {
+			continue
+		}
+		masterPod := n.MasterPod
+		if masterPod == "" && n.MasterID != "" {
+			masterPod = nodeIDToPod[n.MasterID]
+		}
+		if _, ok := shards[masterPod]; !ok {
+			continue
+		}
+		if n.Pod == "" || !n.Ready || n.Deleting {
+			return false
+		}
+		shards[masterPod]++
+	}
+	for _, replicas := range shards {
+		if replicas != int(spec.ReplicasPerShard) {
+			return false
 		}
 	}
 	return true
