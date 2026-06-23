@@ -49,6 +49,12 @@ func shardScaleOutSpec() ClusterSpec {
 	return s
 }
 
+func shardScaleInSpec() ClusterSpec {
+	s := spec()
+	s.Shards = 2
+	return s
+}
+
 func replicaScaleInSpec() ClusterSpec {
 	s := spec()
 	s.ReplicasPerShard = 1
@@ -73,6 +79,14 @@ func topologyWithMixedReplicas() *ClusterTopology {
 	t := topologyWithTwoReplicas()
 	t.Shards[0].Replicas = t.Shards[0].Replicas[:1]
 	return t
+}
+
+func topologyWithThreeShards() *ClusterTopology {
+	return &ClusterTopology{Shards: []ShardTopology{
+		{ID: "shard-0", Master: NodeTopology{Pod: "redis-0", Slots: "0-5461", Ready: true}, Replicas: []NodeTopology{{Pod: "redis-1", Ready: true}}},
+		{ID: "shard-1", Master: NodeTopology{Pod: "redis-2", Slots: "5462-10922", Ready: true}, Replicas: []NodeTopology{{Pod: "redis-3", Ready: true}}},
+		{ID: "shard-2", Master: NodeTopology{Pod: "redis-4", Slots: "10923-16383", Ready: true}, Replicas: []NodeTopology{{Pod: "redis-5", Ready: true}}},
+	}}
 }
 
 func observedFromTopology(t *ClusterTopology) []ObservedNode {
@@ -129,6 +143,47 @@ func validShardScaleOutPlan() *Plan {
 			{ID: "migrate-redis-0-redis-2", Action: ActionMigrateSlots, Params: map[string]any{"namespace": "example", "sourcePod": "redis-0", "targetPod": "redis-2", "slots": "5462-8191"}},
 			{ID: "migrate-redis-2-redis-4", Action: ActionMigrateSlots, Params: map[string]any{"namespace": "example", "sourcePod": "redis-2", "targetPod": "redis-4", "slots": "10923-16383"}},
 			{ID: "verify", Action: ActionVerifyCluster, Params: map[string]any{"expectedShards": 3, "expectedReplicasPerShard": 1, "requireClusterStateOk": true, "requireFullSlotCoverage": true, "requireAllSlotOwnersHaveReplicas": true}},
+		},
+	}
+}
+
+func validShardScaleInPlan() *Plan {
+	return &Plan{
+		DSLVersion:       DSLVersion,
+		PlanID:           "shard-scalein-001",
+		TargetGeneration: 1,
+		Steps: []Step{
+			{ID: "ensure-redis-6", Action: ActionEnsureNode, Params: map[string]any{"namespace": "example", "pod": "redis-6", "image": "redis:7.2", "memorySize": "2Gi"}},
+			{ID: "ensure-redis-7", Action: ActionEnsureNode, Params: map[string]any{"namespace": "example", "pod": "redis-7", "image": "redis:7.2", "memorySize": "2Gi"}},
+			{ID: "ensure-redis-8", Action: ActionEnsureNode, Params: map[string]any{"namespace": "example", "pod": "redis-8", "image": "redis:7.2", "memorySize": "2Gi"}},
+			{ID: "ensure-redis-9", Action: ActionEnsureNode, Params: map[string]any{"namespace": "example", "pod": "redis-9", "image": "redis:7.2", "memorySize": "2Gi"}},
+			{ID: "wait-redis-6", Action: ActionWaitNodeReady, Params: map[string]any{"namespace": "example", "pod": "redis-6"}},
+			{ID: "wait-redis-7", Action: ActionWaitNodeReady, Params: map[string]any{"namespace": "example", "pod": "redis-7"}},
+			{ID: "wait-redis-8", Action: ActionWaitNodeReady, Params: map[string]any{"namespace": "example", "pod": "redis-8"}},
+			{ID: "wait-redis-9", Action: ActionWaitNodeReady, Params: map[string]any{"namespace": "example", "pod": "redis-9"}},
+			{ID: "meet-redis-6", Action: ActionMeetNode, Params: map[string]any{"namespace": "example", "sourcePod": "redis-0", "targetPod": "redis-6"}},
+			{ID: "meet-redis-7", Action: ActionMeetNode, Params: map[string]any{"namespace": "example", "sourcePod": "redis-0", "targetPod": "redis-7"}},
+			{ID: "meet-redis-8", Action: ActionMeetNode, Params: map[string]any{"namespace": "example", "sourcePod": "redis-0", "targetPod": "redis-8"}},
+			{ID: "meet-redis-9", Action: ActionMeetNode, Params: map[string]any{"namespace": "example", "sourcePod": "redis-0", "targetPod": "redis-9"}},
+			{ID: "replicate-redis-7", Action: ActionReplicateNode, Params: map[string]any{"namespace": "example", "masterPod": "redis-6", "replicaPod": "redis-7"}},
+			{ID: "replicate-redis-9", Action: ActionReplicateNode, Params: map[string]any{"namespace": "example", "masterPod": "redis-8", "replicaPod": "redis-9"}},
+			{ID: "migrate-redis-0-redis-6", Action: ActionMigrateSlots, Params: map[string]any{"namespace": "example", "sourcePod": "redis-0", "targetPod": "redis-6", "slots": "0-5461"}},
+			{ID: "migrate-redis-2-redis-6", Action: ActionMigrateSlots, Params: map[string]any{"namespace": "example", "sourcePod": "redis-2", "targetPod": "redis-6", "slots": "5462-8191"}},
+			{ID: "migrate-redis-2-redis-8", Action: ActionMigrateSlots, Params: map[string]any{"namespace": "example", "sourcePod": "redis-2", "targetPod": "redis-8", "slots": "8192-10922"}},
+			{ID: "migrate-redis-4-redis-8", Action: ActionMigrateSlots, Params: map[string]any{"namespace": "example", "sourcePod": "redis-4", "targetPod": "redis-8", "slots": "10923-16383"}},
+			{ID: "forget-redis-0", Action: ActionForgetNode, Params: map[string]any{"namespace": "example", "pod": "redis-0"}},
+			{ID: "delete-redis-0", Action: ActionDeleteNode, Params: map[string]any{"namespace": "example", "pod": "redis-0"}},
+			{ID: "forget-redis-1", Action: ActionForgetNode, Params: map[string]any{"namespace": "example", "pod": "redis-1"}},
+			{ID: "delete-redis-1", Action: ActionDeleteNode, Params: map[string]any{"namespace": "example", "pod": "redis-1"}},
+			{ID: "forget-redis-2", Action: ActionForgetNode, Params: map[string]any{"namespace": "example", "pod": "redis-2"}},
+			{ID: "delete-redis-2", Action: ActionDeleteNode, Params: map[string]any{"namespace": "example", "pod": "redis-2"}},
+			{ID: "forget-redis-3", Action: ActionForgetNode, Params: map[string]any{"namespace": "example", "pod": "redis-3"}},
+			{ID: "delete-redis-3", Action: ActionDeleteNode, Params: map[string]any{"namespace": "example", "pod": "redis-3"}},
+			{ID: "forget-redis-4", Action: ActionForgetNode, Params: map[string]any{"namespace": "example", "pod": "redis-4"}},
+			{ID: "delete-redis-4", Action: ActionDeleteNode, Params: map[string]any{"namespace": "example", "pod": "redis-4"}},
+			{ID: "forget-redis-5", Action: ActionForgetNode, Params: map[string]any{"namespace": "example", "pod": "redis-5"}},
+			{ID: "delete-redis-5", Action: ActionDeleteNode, Params: map[string]any{"namespace": "example", "pod": "redis-5"}},
+			{ID: "verify", Action: ActionVerifyCluster, Params: map[string]any{"expectedShards": 2, "expectedReplicasPerShard": 1, "requireClusterStateOk": true, "requireFullSlotCoverage": true, "requireAllSlotOwnersHaveReplicas": true}},
 		},
 	}
 }
@@ -221,6 +276,13 @@ func TestValidate_ValidShardScaleOut(t *testing.T) {
 	}
 }
 
+func TestValidate_ValidShardScaleIn(t *testing.T) {
+	ctx := ctxWithObservedNodes(shardScaleInSpec(), topologyWithThreeShards())
+	if err := validatePlan(validShardScaleInPlan(), ctx); err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+}
+
 func TestValidate_ValidReplicaScaleIn(t *testing.T) {
 	ctx := ctxWithObservedNodes(replicaScaleInSpec(), topologyWithTwoReplicas())
 	if err := validatePlan(validReplicaScaleInPlan(), ctx); err != nil {
@@ -274,6 +336,44 @@ func TestValidate_ReplicaScaleInRejectsCreateAction(t *testing.T) {
 	ctx := ctxWithObservedNodes(replicaScaleInSpec(), topologyWithTwoReplicas())
 	if err := validatePlan(p, ctx); err == nil {
 		t.Fatal("expected error for EnsureNode in replica scalein")
+	}
+}
+
+func TestValidate_ShardScaleInRejectsMigrationToOldMaster(t *testing.T) {
+	p := validShardScaleInPlan()
+	p.Steps[stepIndex(t, p, "migrate-redis-2-redis-6")].Params["targetPod"] = "redis-0"
+	ctx := ctxWithObservedNodes(shardScaleInSpec(), topologyWithThreeShards())
+	if err := validatePlan(p, ctx); err == nil {
+		t.Fatal("expected error for migration to old master")
+	}
+}
+
+func TestValidate_ShardScaleInRejectsMissingMigration(t *testing.T) {
+	p := validShardScaleInPlan()
+	idx := stepIndex(t, p, "migrate-redis-4-redis-8")
+	p.Steps = append(p.Steps[:idx], p.Steps[idx+1:]...)
+	ctx := ctxWithObservedNodes(shardScaleInSpec(), topologyWithThreeShards())
+	if err := validatePlan(p, ctx); err == nil {
+		t.Fatal("expected error for missing migration")
+	}
+}
+
+func TestValidate_ShardScaleInRejectsMissingOldDelete(t *testing.T) {
+	p := validShardScaleInPlan()
+	idx := stepIndex(t, p, "delete-redis-5")
+	p.Steps = append(p.Steps[:idx], p.Steps[idx+1:]...)
+	ctx := ctxWithObservedNodes(shardScaleInSpec(), topologyWithThreeShards())
+	if err := validatePlan(p, ctx); err == nil {
+		t.Fatal("expected error for missing old pod delete")
+	}
+}
+
+func TestValidate_ShardScaleInRejectsReplicaChange(t *testing.T) {
+	s := shardScaleInSpec()
+	s.ReplicasPerShard = 2
+	ctx := ctxWithObservedNodes(s, topologyWithThreeShards())
+	if err := validatePlan(validShardScaleInPlan(), ctx); err == nil {
+		t.Fatal("expected error for changing shards and replicas together")
 	}
 }
 

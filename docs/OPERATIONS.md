@@ -308,7 +308,7 @@ Controller 在执行 ScaleOut Plan 前必须做 schema 校验和安全校验：
 
 ## ScaleIn
 
-ScaleIn Operation 表示在一个已经 Ready、健康、slot 完整覆盖的 Redis Cluster 上减少节点数量。第一版只支持减少每个 Shard 的 Replica 数量，不支持减少 Shard / Master 数量。
+ScaleIn Operation 表示在一个已经 Ready、健康、slot 完整覆盖的 Redis Cluster 上减少节点数量。支持两类变更：减少每个 Shard 的 Replica 数量，或减少 Shard / Master 数量。一次 ScaleIn 只能调整 `spec.shards` 或 `spec.replicasPerShard` 其中一个参数。
 
 Replica ScaleIn 的目标状态：
 
@@ -333,6 +333,40 @@ Replica ScaleIn 安全校验：
 - 被删除节点必须是当前 topology 中的 Replica，不能是 Master
 - 每个被删除 Replica 必须先 `ForgetNode`，再 `DeleteNode`
 - 每个 Shard 删除的 Replica 数必须精确收敛到新的 `spec.replicasPerShard`
+- Plan 最后必须包含 `VerifyCluster`
+
+Shard ScaleIn 采用全量替换策略：不把 slots 迁移到既有旧 Master 上，而是创建 `spec.shards` 组新的 Master + Replica，按确定性均衡规则把所有 slots 从旧 Master 迁移到新 Master，迁移完成后移除所有旧节点。
+
+Shard ScaleIn 的目标状态：
+
+- Master 数量等于新的 `spec.shards`
+- `spec.replicasPerShard` 保持不变
+- 所有最终 Master 都是本次新建 Pod，旧 Master 和旧 Replica 都被移除
+- slots 在新 Master 间按确定性策略尽量均衡分布
+- Redis Cluster 状态为 `ok`
+
+当减少 `shards` 时，一个典型顺序是：
+
+1. 对所有新 Redis 节点执行 `EnsureNode`
+2. 对所有新 Redis 节点执行 `WaitNodeReady`
+3. 用已有健康节点作为 seed，对所有新节点执行 `MeetNode`
+4. 对新 Master 的 Replica 执行 `ReplicateNode`
+5. 执行 `MigrateSlots`，把所有 slots 从旧 Master 迁移到新 Master
+6. 对每个旧节点执行 `ForgetNode`
+7. 对同一个旧节点执行 `DeleteNode`
+8. 最后执行 `VerifyCluster`
+
+Shard ScaleIn 安全校验：
+
+- `targetGeneration` 必须等于当前 RedisCluster CR 的 `metadata.generation`
+- 当前 topology 必须存在、健康、完整覆盖 slots，且没有 migrating/importing slot
+- `spec.shards` 必须小于当前 Master 数量，且 `spec.replicasPerShard` 必须保持不变
+- Plan 只能包含 `EnsureNode`、`WaitNodeReady`、`MeetNode`、`ReplicateNode`、`MigrateSlots`、`ForgetNode`、`DeleteNode`、`VerifyCluster`
+- 新 Pod 数量必须等于 `spec.shards * (1 + spec.replicasPerShard)`，并从历史最大 `redis-N + 1` 开始连续命名
+- 每个新 Master 必须在迁移 slots 前拥有目标数量的 Replica
+- `MigrateSlots` 的 source 必须是旧 Master，target 必须是新 Master
+- `MigrateSlots` 的 slots 必须精确匹配 Controller 按新 Master 顺序计算出的迁移矩阵
+- 每个旧 Master 和旧 Replica 必须先 `ForgetNode`，再 `DeleteNode`
 - Plan 最后必须包含 `VerifyCluster`
 
 ## Repair

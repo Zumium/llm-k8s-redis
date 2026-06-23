@@ -309,6 +309,9 @@ func validateExistingTopologyPlan(p *Plan, spec ClusterSpec, ctx *ValidationCont
 	if int(spec.Shards) > currentShards && int(spec.ReplicasPerShard) == currentReplicas {
 		return validateShardScaleOut(p, spec, *ctx, topology, ensurePods)
 	}
+	if int(spec.Shards) < currentShards && int(spec.ReplicasPerShard) == currentReplicas {
+		return validateShardScaleIn(p, spec, *ctx, topology, ensurePods)
+	}
 	if int(spec.Shards) > currentShards && int(spec.ReplicasPerShard) > currentReplicas {
 		return fmt.Errorf("shards and replicasPerShard cannot both change in one scaleout")
 	}
@@ -666,18 +669,18 @@ func validateShardScaleOut(p *Plan, spec ClusterSpec, ctx ValidationContext, top
 	if err := validateSequentialNewPods(existingPods, newPods, effectiveNextPodOrdinal(ctx, topology)); err != nil {
 		return err
 	}
-	newMasters, err := shardScaleOutMasters(p, newPods, ensureOrder, int(spec.Shards)-currentShards)
+	newMasters, err := newShardMasters(p, newPods, ensureOrder, int(spec.Shards)-currentShards)
 	if err != nil {
 		return err
 	}
-	if err := validateShardScaleOutReplicas(p, spec, newPods, newMasters); err != nil {
+	if err := validateNewShardReplicas(p, spec, newPods, newMasters); err != nil {
 		return err
 	}
 	expected, err := expectedShardScaleOutMigrations(topology, newMasters)
 	if err != nil {
 		return err
 	}
-	actual, err := actualMigrations(p, topology, newMasters)
+	actual, err := actualMigrations(p, topology, finalMasterSet(topology, newMasters), "final master")
 	if err != nil {
 		return err
 	}
@@ -685,6 +688,73 @@ func validateShardScaleOut(p *Plan, spec ClusterSpec, ctx ValidationContext, top
 		return err
 	}
 	return nil
+}
+
+func validateShardScaleIn(p *Plan, spec ClusterSpec, ctx ValidationContext, topology *ClusterTopology, ensurePods map[string]bool) error {
+	currentShards := len(topology.Shards)
+	currentReplicas, err := uniformReplicaCount(topology)
+	if err != nil {
+		return err
+	}
+	if int(spec.Shards) >= currentShards {
+		return fmt.Errorf("shards must decrease for shard scalein: spec=%d current=%d", spec.Shards, currentShards)
+	}
+	if int(spec.ReplicasPerShard) != currentReplicas {
+		return fmt.Errorf("replicasPerShard must remain %d for shard scalein, got %d", currentReplicas, spec.ReplicasPerShard)
+	}
+	if err := validateTopologyReadyAndCovered(topology); err != nil {
+		return err
+	}
+	for _, s := range p.Steps {
+		switch s.Action {
+		case ActionEnsureNode, ActionWaitNodeReady, ActionMeetNode, ActionReplicateNode, ActionMigrateSlots, ActionForgetNode, ActionDeleteNode, ActionVerifyCluster:
+		default:
+			return fmt.Errorf("step %q: action %q is not allowed for shard scalein", s.ID, s.Action)
+		}
+	}
+
+	existingPods := topologyPods(topology)
+	newPods := map[string]bool{}
+	ensureOrder := []string{}
+	for _, s := range p.Steps {
+		if s.Action != ActionEnsureNode {
+			continue
+		}
+		pod, _ := paramString(s.Params, "pod")
+		if !existingPods[pod] {
+			if !newPods[pod] {
+				ensureOrder = append(ensureOrder, pod)
+			}
+			newPods[pod] = true
+		}
+	}
+	wantNewPods := int(spec.Shards) * (1 + int(spec.ReplicasPerShard))
+	if len(newPods) != wantNewPods {
+		return fmt.Errorf("EnsureNode declared %d new pods, expected %d replacement shard nodes", len(newPods), wantNewPods)
+	}
+	if err := validateSequentialNewPods(existingPods, newPods, effectiveNextPodOrdinal(ctx, topology)); err != nil {
+		return err
+	}
+
+	newMasters, err := newShardMasters(p, newPods, ensureOrder, int(spec.Shards))
+	if err != nil {
+		return err
+	}
+	if err := validateNewShardReplicas(p, spec, newPods, newMasters); err != nil {
+		return err
+	}
+	expected, err := expectedShardScaleInMigrations(topology, newMasters)
+	if err != nil {
+		return err
+	}
+	actual, err := actualMigrations(p, topology, stringSet(newMasters), "replacement master")
+	if err != nil {
+		return err
+	}
+	if err := compareMigrationSets(expected, actual); err != nil {
+		return err
+	}
+	return validateOldPodsForgottenAndDeleted(p, existingPods)
 }
 
 type migrationKey struct {
@@ -723,7 +793,7 @@ func validateTopologyReadyAndCovered(topology *ClusterTopology) error {
 	return nil
 }
 
-func shardScaleOutMasters(p *Plan, newPods map[string]bool, ensureOrder []string, want int) ([]string, error) {
+func newShardMasters(p *Plan, newPods map[string]bool, ensureOrder []string, want int) ([]string, error) {
 	masters := map[string]bool{}
 	for i, s := range p.Steps {
 		if s.Action != ActionReplicateNode {
@@ -753,7 +823,7 @@ func shardScaleOutMasters(p *Plan, newPods map[string]bool, ensureOrder []string
 	return out, nil
 }
 
-func validateShardScaleOutReplicas(p *Plan, spec ClusterSpec, newPods map[string]bool, newMasters []string) error {
+func validateNewShardReplicas(p *Plan, spec ClusterSpec, newPods map[string]bool, newMasters []string) error {
 	needByMaster := map[string]int{}
 	for _, pod := range newMasters {
 		needByMaster[pod] = int(spec.ReplicasPerShard)
@@ -837,17 +907,50 @@ func expectedShardScaleOutMigrations(topology *ClusterTopology, newMasters []str
 	return out, nil
 }
 
-func actualMigrations(p *Plan, topology *ClusterTopology, newMasters []string) (map[migrationKey]map[int]struct{}, error) {
+func expectedShardScaleInMigrations(topology *ClusterTopology, newMasters []string) (map[migrationKey]map[int]struct{}, error) {
+	currentOwner := map[int]string{}
+	for _, sh := range topology.Shards {
+		slots, err := parseSlots(sh.Master.Slots)
+		if err != nil {
+			return nil, err
+		}
+		for slot := range slots {
+			currentOwner[slot] = sh.Master.Pod
+		}
+	}
+	out := map[migrationKey]map[int]struct{}{}
+	for i, master := range newMasters {
+		start, end := balancedSlotRange(i, len(newMasters))
+		for slot := start; slot <= end; slot++ {
+			source := currentOwner[slot]
+			if source == "" {
+				return nil, fmt.Errorf("slot %d has no current owner", slot)
+			}
+			key := migrationKey{source: source, target: master}
+			if out[key] == nil {
+				out[key] = map[int]struct{}{}
+			}
+			out[key][slot] = struct{}{}
+		}
+	}
+	return out, nil
+}
+
+func finalMasterSet(topology *ClusterTopology, newMasters []string) map[string]bool {
+	out := map[string]bool{}
+	for _, sh := range topology.Shards {
+		out[sh.Master.Pod] = true
+	}
+	for _, pod := range newMasters {
+		out[pod] = true
+	}
+	return out
+}
+
+func actualMigrations(p *Plan, topology *ClusterTopology, targetMasters map[string]bool, targetLabel string) (map[migrationKey]map[int]struct{}, error) {
 	existingMasters := map[string]bool{}
 	for _, sh := range topology.Shards {
 		existingMasters[sh.Master.Pod] = true
-	}
-	targetMasters := map[string]bool{}
-	for pod := range existingMasters {
-		targetMasters[pod] = true
-	}
-	for _, pod := range newMasters {
-		targetMasters[pod] = true
 	}
 	out := map[migrationKey]map[int]struct{}{}
 	for _, s := range p.Steps {
@@ -860,7 +963,7 @@ func actualMigrations(p *Plan, topology *ClusterTopology, newMasters []string) (
 		}
 		target, ok := paramString(s.Params, "targetPod")
 		if !ok || !targetMasters[target] {
-			return nil, fmt.Errorf("step %q: targetPod %q is not a final master", s.ID, target)
+			return nil, fmt.Errorf("step %q: targetPod %q is not a %s", s.ID, target, targetLabel)
 		}
 		if source == target {
 			return nil, fmt.Errorf("step %q: sourcePod and targetPod must differ", s.ID)
@@ -885,6 +988,53 @@ func actualMigrations(p *Plan, topology *ClusterTopology, newMasters []string) (
 		}
 	}
 	return out, nil
+}
+
+func validateOldPodsForgottenAndDeleted(p *Plan, oldPods map[string]bool) error {
+	forgot := map[string]bool{}
+	deleted := map[string]bool{}
+	for _, s := range p.Steps {
+		switch s.Action {
+		case ActionForgetNode:
+			pod, _ := paramString(s.Params, "pod")
+			if !oldPods[pod] {
+				return fmt.Errorf("step %q: ForgetNode target %q is not an old topology pod", s.ID, pod)
+			}
+			if forgot[pod] {
+				return fmt.Errorf("step %q: old pod %q is forgotten more than once", s.ID, pod)
+			}
+			forgot[pod] = true
+		case ActionDeleteNode:
+			pod, _ := paramString(s.Params, "pod")
+			if !oldPods[pod] {
+				return fmt.Errorf("step %q: DeleteNode target %q is not an old topology pod", s.ID, pod)
+			}
+			if !forgot[pod] {
+				return fmt.Errorf("step %q: DeleteNode target %q missing preceding ForgetNode", s.ID, pod)
+			}
+			if deleted[pod] {
+				return fmt.Errorf("step %q: old pod %q is deleted more than once", s.ID, pod)
+			}
+			deleted[pod] = true
+		}
+	}
+	for pod := range oldPods {
+		if !forgot[pod] {
+			return fmt.Errorf("old pod %q is not forgotten", pod)
+		}
+		if !deleted[pod] {
+			return fmt.Errorf("old pod %q is not deleted", pod)
+		}
+	}
+	return nil
+}
+
+func stringSet(items []string) map[string]bool {
+	out := map[string]bool{}
+	for _, item := range items {
+		out[item] = true
+	}
+	return out
 }
 
 func compareMigrationSets(expected, actual map[migrationKey]map[int]struct{}) error {
