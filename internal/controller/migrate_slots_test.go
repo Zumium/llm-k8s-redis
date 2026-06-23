@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -199,6 +200,76 @@ func TestMigrateSlots_MigratesKeysAndReturnsRunning(t *testing.T) {
 	call := fc.migrateCalls[0]
 	if call.host != "10.0.0.3" || call.port != 6379 || len(call.keys) != 1 || call.keys[0] != "key-a" {
 		t.Fatalf("unexpected migrate call: %+v", call)
+	}
+}
+
+func TestMigrateSlots_ProcessesMultipleEmptySlotsInOneReconcile(t *testing.T) {
+	ctx := context.Background()
+	cluster := testCluster()
+	migrateTopology(cluster)
+	p := migratePlan()
+	p.Steps[0].Params["slots"] = "0-2"
+	calls := 0
+	fc := &fakeRedisClient{
+		clusterNodes: func() (string, error) {
+			calls++
+			if calls == 1 {
+				return migrateClusterNodes("0-8191", "8192-16383"), nil
+			}
+			return migrateClusterNodes("3-8191", "0-2 8192-16383"), nil
+		},
+	}
+	exec := migrateExec(t, cluster, fc)
+
+	outcome, err := exec.ExecuteStep(ctx, cluster, p, 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if outcome.Status != plan.StepStateCompleted {
+		t.Fatalf("expected Completed, got %q: %s", outcome.Status, outcome.Message)
+	}
+	if len(fc.setSlotCalls) != 12 {
+		t.Fatalf("expected 12 setslot calls, got %d: %v", len(fc.setSlotCalls), fc.setSlotCalls)
+	}
+	seen := map[int]map[string]int{}
+	for _, call := range fc.setSlotCalls {
+		if seen[call.slot] == nil {
+			seen[call.slot] = map[string]int{}
+		}
+		seen[call.slot][call.mode]++
+	}
+	for slot := 0; slot <= 2; slot++ {
+		if seen[slot]["IMPORTING"] != 1 || seen[slot]["MIGRATING"] != 1 || seen[slot]["NODE"] != 2 {
+			t.Fatalf("unexpected setslot calls for slot %d: %#v", slot, seen[slot])
+		}
+	}
+}
+
+func TestMigrateSlots_MigratesKeysForMultipleSlotsInOneReconcile(t *testing.T) {
+	ctx := context.Background()
+	cluster := testCluster()
+	migrateTopology(cluster)
+	p := migratePlan()
+	p.Steps[0].Params["slots"] = "0-2"
+	fc := &fakeRedisClient{
+		clusterNodes: func() (string, error) {
+			return migrateClusterNodes("0-8191", "8192-16383"), nil
+		},
+		getKeysInSlot: func(slot, count int) ([]string, error) {
+			return []string{fmt.Sprintf("key-%d", slot)}, nil
+		},
+	}
+	exec := migrateExec(t, cluster, fc)
+
+	outcome, err := exec.ExecuteStep(ctx, cluster, p, 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if outcome.Status != plan.StepStateRunning {
+		t.Fatalf("expected Running, got %q: %s", outcome.Status, outcome.Message)
+	}
+	if len(fc.migrateCalls) != 3 {
+		t.Fatalf("expected 3 migrate calls, got %v", fc.migrateCalls)
 	}
 }
 

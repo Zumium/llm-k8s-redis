@@ -225,7 +225,8 @@ Params：
 - 如果某个目标 slot 已经归属于目标 Master，则该 slot 视为已完成
 - 对每个需要迁移的 slot，将目标 Master 标记为 `IMPORTING`，源 Master 标记为 `MIGRATING`
 - 从源 Master 扫描属于该 slot 的 keys，并使用受控 Redis 迁移流程迁移到目标 Master
-- 每次 reconcile 最多处理 8 个 slots；每个 slot 每批最多迁移 100 个 keys，未完成时返回 `Running`，下一轮 reconcile 从 live Redis 状态继续
+- 每次 reconcile 中，单个 `MigrateSlots` 最多并发处理 8 个 slots；每个 slot 每批最多迁移 100 个 keys，未完成时返回 `Running`，下一轮 reconcile 从 live Redis 状态继续
+- 连续的多个 `MigrateSlots` step 如果 source Pod 和 target Pod 都互不重复，可以在同一次 reconcile 中并发执行
 - key 迁移完成后，将该 slot 的 owner 切换为目标 Master
 - 每迁移一批 slots 后重新观察 cluster 状态，确保可以从中断处继续执行
 - 所有 slots 迁移完成后，清理临时迁移状态并确认 slot owner 已变为 `target`

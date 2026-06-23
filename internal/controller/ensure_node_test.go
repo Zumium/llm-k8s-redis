@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -55,7 +56,9 @@ func baseParams() map[string]any {
 }
 
 // fakeRedisClient is a test double for redis.Client.
+// goroutine-safe via mu so it can be shared across concurrent slot migrations.
 type fakeRedisClient struct {
+	mu               sync.Mutex
 	pingErr          error
 	configGet        func(key string) (string, error)
 	configSet        func(key, value string) error
@@ -168,6 +171,8 @@ func (f *fakeRedisClient) ClusterAddSlots(_ context.Context, slots []int) error 
 	return f.clusterAddSlots(slots)
 }
 func (f *fakeRedisClient) ClusterSetSlotImporting(_ context.Context, slot int, sourceNodeID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.setSlotCalls = append(f.setSlotCalls, setSlotCall{mode: "IMPORTING", slot: slot, nodeID: sourceNodeID})
 	if f.setSlotImporting == nil {
 		return nil
@@ -175,6 +180,8 @@ func (f *fakeRedisClient) ClusterSetSlotImporting(_ context.Context, slot int, s
 	return f.setSlotImporting(slot, sourceNodeID)
 }
 func (f *fakeRedisClient) ClusterSetSlotMigrating(_ context.Context, slot int, targetNodeID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.setSlotCalls = append(f.setSlotCalls, setSlotCall{mode: "MIGRATING", slot: slot, nodeID: targetNodeID})
 	if f.setSlotMigrating == nil {
 		return nil
@@ -182,6 +189,8 @@ func (f *fakeRedisClient) ClusterSetSlotMigrating(_ context.Context, slot int, t
 	return f.setSlotMigrating(slot, targetNodeID)
 }
 func (f *fakeRedisClient) ClusterSetSlotNode(_ context.Context, slot int, nodeID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.setSlotCalls = append(f.setSlotCalls, setSlotCall{mode: "NODE", slot: slot, nodeID: nodeID})
 	if f.setSlotNode == nil {
 		return nil
@@ -189,6 +198,8 @@ func (f *fakeRedisClient) ClusterSetSlotNode(_ context.Context, slot int, nodeID
 	return f.setSlotNode(slot, nodeID)
 }
 func (f *fakeRedisClient) ClusterGetKeysInSlot(_ context.Context, slot, count int) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.getKeysCalls = append(f.getKeysCalls, getKeysCall{slot: slot, count: count})
 	if f.getKeysInSlot == nil {
 		return nil, nil
@@ -196,6 +207,8 @@ func (f *fakeRedisClient) ClusterGetKeysInSlot(_ context.Context, slot, count in
 	return f.getKeysInSlot(slot, count)
 }
 func (f *fakeRedisClient) MigrateKeys(_ context.Context, host string, port int, keys []string, timeout time.Duration) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	cp := append([]string{}, keys...)
 	f.migrateCalls = append(f.migrateCalls, migrateCall{host: host, port: port, keys: cp, timeout: timeout})
 	if f.migrateKeys == nil {
@@ -211,6 +224,8 @@ type addrFakeRedisClient struct {
 }
 
 func (f *addrFakeRedisClient) ClusterSetSlotNode(_ context.Context, slot int, nodeID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.setSlotCalls = append(f.setSlotCalls, setSlotCall{addr: f.addr, mode: "NODE", slot: slot, nodeID: nodeID})
 	if f.setSlotNode == nil {
 		return nil

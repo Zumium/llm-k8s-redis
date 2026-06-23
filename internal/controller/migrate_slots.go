@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -163,53 +164,51 @@ func (e *ActionExecutor) migrateSlots(ctx context.Context, cluster *v1alpha1.Red
 		}
 	}
 
-	done := 0
+	todo := []int{}
 	for _, slot := range desired {
 		if owner[slot] == target.ID {
 			logger.Info("slot already owned by target", "slot", slot, "targetID", target.ID)
 			continue
 		}
-		if done >= migrateSlotsPerReconcile {
-			logger.Info("migrate slots per reconcile limit reached", "done", done, "limit", migrateSlotsPerReconcile, "slots", slotsSpec)
-			return running("migrated %d slots this reconcile; continuing slots %s", done, slotsSpec), nil
+		if len(todo) >= migrateSlotsPerReconcile {
+			break
 		}
-		slotStart := time.Now()
-		logger.Info("migrating slot started", "slot", slot, "sourceID", source.ID, "targetID", target.ID)
-		if err := targetRC.ClusterSetSlotImporting(ctx, slot, source.ID); err != nil {
-			logger.Error(err, "target setslot importing failed", "slot", slot, "duration", time.Since(slotStart))
-			return StepOutcome{Status: plan.StepStateFailed, Message: fmt.Sprintf("target SETSLOT IMPORTING slot %d: %v", slot, err)}, err
-		}
-		if err := sourceRC.ClusterSetSlotMigrating(ctx, slot, target.ID); err != nil {
-			logger.Error(err, "source setslot migrating failed", "slot", slot, "duration", time.Since(slotStart))
-			return StepOutcome{Status: plan.StepStateFailed, Message: fmt.Sprintf("source SETSLOT MIGRATING slot %d: %v", slot, err)}, err
-		}
-		keys, err := sourceRC.ClusterGetKeysInSlot(ctx, slot, migrateKeysPerSlot)
-		if err != nil {
-			logger.Error(err, "get keys in slot failed", "slot", slot, "duration", time.Since(slotStart))
-			return StepOutcome{Status: plan.StepStateFailed, Message: fmt.Sprintf("GETKEYSINSLOT slot %d: %v", slot, err)}, err
-		}
-		logger.Info("keys in slot read", "slot", slot, "keys", len(keys), "limit", migrateKeysPerSlot)
-		if len(keys) > 0 {
-			host, port := rediscluster.RedisHostPortFromAddr(target.Addr)
-			migrateStart := time.Now()
-			logger.Info("migrating keys started", "slot", slot, "keys", len(keys), "host", host, "port", port)
-			if err := sourceRC.MigrateKeys(ctx, host, port, keys, migrateKeyTimeout); err != nil {
-				logger.Error(err, "migrate keys failed", "slot", slot, "keys", len(keys), "duration", time.Since(migrateStart))
-				return StepOutcome{Status: plan.StepStateFailed, Message: fmt.Sprintf("MIGRATE slot %d keys: %v", slot, err)}, err
+		todo = append(todo, slot)
+	}
+
+	slotCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var mu sync.Mutex
+	var firstErr migrateSlotResult
+	migratedKeys := 0
+	completedSlots := 0
+	var wg sync.WaitGroup
+	for _, slot := range todo {
+		wg.Add(1)
+		go func(slot int) {
+			defer wg.Done()
+			result := e.migrateSlot(slotCtx, sourceRC, targetRC, source.ID, target.ID, target.Addr, slot)
+			mu.Lock()
+			if firstErr.err == nil && result.err != nil {
+				firstErr = result
+				cancel()
 			}
-			logger.Info("migrating keys finished", "slot", slot, "keys", len(keys), "duration", time.Since(migrateStart))
-			return running("migrated %d keys for slot %d; waiting to finish slot ownership", len(keys), slot), nil
-		}
-		if err := sourceRC.ClusterSetSlotNode(ctx, slot, target.ID); err != nil {
-			logger.Error(err, "source setslot node failed", "slot", slot, "duration", time.Since(slotStart))
-			return StepOutcome{Status: plan.StepStateFailed, Message: fmt.Sprintf("source SETSLOT NODE slot %d: %v", slot, err)}, err
-		}
-		if err := targetRC.ClusterSetSlotNode(ctx, slot, target.ID); err != nil {
-			logger.Error(err, "target setslot node failed", "slot", slot, "duration", time.Since(slotStart))
-			return StepOutcome{Status: plan.StepStateFailed, Message: fmt.Sprintf("target SETSLOT NODE slot %d: %v", slot, err)}, err
-		}
-		logger.Info("migrating slot finished", "slot", slot, "duration", time.Since(slotStart))
-		done++
+			if result.keys > 0 {
+				migratedKeys += result.keys
+			} else if result.err == nil {
+				completedSlots++
+			}
+			mu.Unlock()
+		}(slot)
+	}
+	wg.Wait()
+
+	if firstErr.err != nil {
+		return firstErr.outcome, firstErr.err
+	}
+	if migratedKeys > 0 {
+		return running("migrated %d keys across %d slots; waiting to finish slot ownership", migratedKeys, len(todo)-completedSlots), nil
 	}
 
 	afterStart := time.Now()
@@ -239,6 +238,53 @@ func (e *ActionExecutor) migrateSlots(ctx context.Context, cluster *v1alpha1.Red
 	logger.Info("migrate slots verified", "sourcePod", sourcePodName, "targetPod", targetPodName, "targetID", target.ID, "slotCount", len(desired))
 	refreshExistingTopologySlots(cluster, targetPodName, target.ID, slotsSpec)
 	return completed("slots %s migrated from %s/%s to %s/%s", slotsSpec, ns, sourcePodName, ns, targetPodName), nil
+}
+
+type migrateSlotResult struct {
+	outcome StepOutcome
+	err     error
+	keys    int
+}
+
+func (e *ActionExecutor) migrateSlot(ctx context.Context, sourceRC, targetRC redis.Client, sourceID, targetID, targetAddr string, slot int) migrateSlotResult {
+	logger := log.FromContext(ctx)
+	slotStart := time.Now()
+	logger.Info("migrating slot started", "slot", slot, "sourceID", sourceID, "targetID", targetID)
+	if err := targetRC.ClusterSetSlotImporting(ctx, slot, sourceID); err != nil {
+		logger.Error(err, "target setslot importing failed", "slot", slot, "duration", time.Since(slotStart))
+		return migrateSlotResult{outcome: StepOutcome{Status: plan.StepStateFailed, Message: fmt.Sprintf("target SETSLOT IMPORTING slot %d: %v", slot, err)}, err: err}
+	}
+	if err := sourceRC.ClusterSetSlotMigrating(ctx, slot, targetID); err != nil {
+		logger.Error(err, "source setslot migrating failed", "slot", slot, "duration", time.Since(slotStart))
+		return migrateSlotResult{outcome: StepOutcome{Status: plan.StepStateFailed, Message: fmt.Sprintf("source SETSLOT MIGRATING slot %d: %v", slot, err)}, err: err}
+	}
+	keys, err := sourceRC.ClusterGetKeysInSlot(ctx, slot, migrateKeysPerSlot)
+	if err != nil {
+		logger.Error(err, "get keys in slot failed", "slot", slot, "duration", time.Since(slotStart))
+		return migrateSlotResult{outcome: StepOutcome{Status: plan.StepStateFailed, Message: fmt.Sprintf("GETKEYSINSLOT slot %d: %v", slot, err)}, err: err}
+	}
+	logger.Info("keys in slot read", "slot", slot, "keys", len(keys), "limit", migrateKeysPerSlot)
+	if len(keys) > 0 {
+		host, port := rediscluster.RedisHostPortFromAddr(targetAddr)
+		migrateStart := time.Now()
+		logger.Info("migrating keys started", "slot", slot, "keys", len(keys), "host", host, "port", port)
+		if err := sourceRC.MigrateKeys(ctx, host, port, keys, migrateKeyTimeout); err != nil {
+			logger.Error(err, "migrate keys failed", "slot", slot, "keys", len(keys), "duration", time.Since(migrateStart))
+			return migrateSlotResult{outcome: StepOutcome{Status: plan.StepStateFailed, Message: fmt.Sprintf("MIGRATE slot %d keys: %v", slot, err)}, err: err}
+		}
+		logger.Info("migrating keys finished", "slot", slot, "keys", len(keys), "duration", time.Since(migrateStart))
+		return migrateSlotResult{keys: len(keys)}
+	}
+	if err := sourceRC.ClusterSetSlotNode(ctx, slot, targetID); err != nil {
+		logger.Error(err, "source setslot node failed", "slot", slot, "duration", time.Since(slotStart))
+		return migrateSlotResult{outcome: StepOutcome{Status: plan.StepStateFailed, Message: fmt.Sprintf("source SETSLOT NODE slot %d: %v", slot, err)}, err: err}
+	}
+	if err := targetRC.ClusterSetSlotNode(ctx, slot, targetID); err != nil {
+		logger.Error(err, "target setslot node failed", "slot", slot, "duration", time.Since(slotStart))
+		return migrateSlotResult{outcome: StepOutcome{Status: plan.StepStateFailed, Message: fmt.Sprintf("target SETSLOT NODE slot %d: %v", slot, err)}, err: err}
+	}
+	logger.Info("migrating slot finished", "slot", slot, "duration", time.Since(slotStart))
+	return migrateSlotResult{}
 }
 
 func (e *ActionExecutor) getPod(ctx context.Context, ns, podName string) (*corev1.Pod, StepOutcome, error, bool) {

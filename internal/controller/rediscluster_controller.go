@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -303,6 +304,28 @@ func markNoPlanNeeded(cluster *v1alpha1.RedisCluster, message string) {
 	setCondition(cluster, ConditionReady, metav1.ConditionTrue, "ClusterReady", "cluster matches desired topology")
 }
 
+const maxMigrateBatchSize = 4
+
+func (r *RedisClusterReconciler) applyStepOutcome(ctx context.Context, cluster *v1alpha1.RedisCluster, active *v1alpha1.PlanStatus, planModel *plan.Plan, idx int, outcome StepOutcome, err error) bool {
+	logger := log.FromContext(ctx).WithValues("stepIndex", idx, "stepID", active.Steps[idx].ID)
+	if err != nil {
+		logger.Error(err, "step execution failed", "message", outcome.Message)
+		setStep(active, idx, string(plan.StepStateFailed), err.Error())
+		return true
+	}
+	if planModel.Steps[idx].Params != nil {
+		raw, merr := json.Marshal(planModel.Steps[idx].Params)
+		if merr != nil {
+			logger.Error(merr, "step params marshal failed")
+			setStep(active, idx, string(plan.StepStateFailed), merr.Error())
+			return true
+		}
+		active.Steps[idx].Params = apiextensionsv1.JSON{Raw: raw}
+	}
+	setStep(active, idx, string(outcome.Status), outcome.Message)
+	return outcome.Status == plan.StepStateFailed
+}
+
 func (r *RedisClusterReconciler) executeNextStep(ctx context.Context, cluster *v1alpha1.RedisCluster, active *v1alpha1.PlanStatus) (ctrl.Result, error) {
 	logger := log.FromContext(ctx).WithValues("planID", active.ID)
 	idx := nextPendingStep(active)
@@ -324,45 +347,113 @@ func (r *RedisClusterReconciler) executeNextStep(ctx context.Context, cluster *v
 		return r.finish(ctx, cluster, ctrl.Result{}, nil)
 	}
 	logger.Info("active plan restored", "duration", time.Since(restoreStart))
+	if step.Action == string(plan.ActionMigrateSlots) {
+		return r.executeMigrateStepBatch(ctx, cluster, active, planModel, idx)
+	}
 	execStart := time.Now()
 	outcome, err := r.Driver.ExecuteStep(ctx, cluster, planModel, idx)
-	if err != nil {
-		logger.Error(err, "step execution failed", "duration", time.Since(execStart), "message", outcome.Message)
-		setStep(active, idx, string(plan.StepStateFailed), err.Error())
-		active.CurrentStep = step.ID
-		setCondition(cluster, ConditionReady, metav1.ConditionFalse, "StepFailed", err.Error())
+	logger.Info("step execution finished", "duration", time.Since(execStart), "status", outcome.Status, "message", outcome.Message)
+	failed := r.applyStepOutcome(ctx, cluster, active, planModel, idx, outcome, err)
+	active.CurrentStep = step.ID
+	if failed {
+		setCondition(cluster, ConditionReady, metav1.ConditionFalse, "StepFailed", active.Steps[idx].Message)
 		return r.finish(ctx, cluster, ctrl.Result{}, nil)
 	}
-	logger.Info("step execution finished", "duration", time.Since(execStart), "status", outcome.Status, "message", outcome.Message)
-	if planModel.Steps[idx].Params != nil {
-		raw, err := json.Marshal(planModel.Steps[idx].Params)
-		if err != nil {
-			logger.Error(err, "step params marshal failed")
-			setStep(active, idx, string(plan.StepStateFailed), err.Error())
-			active.CurrentStep = step.ID
-			setCondition(cluster, ConditionReady, metav1.ConditionFalse, "StepFailed", err.Error())
-			return r.finish(ctx, cluster, ctrl.Result{}, nil)
-		}
-		active.Steps[idx].Params = apiextensionsv1.JSON{Raw: raw}
-	}
-	setStep(active, idx, string(outcome.Status), outcome.Message)
-	active.CurrentStep = step.ID
-
 	switch outcome.Status {
 	case plan.StepStateCompleted:
 		logger.Info("step completed")
 		return r.finish(ctx, cluster, ctrl.Result{Requeue: true}, nil)
-	case plan.StepStateFailed:
-		logger.Info("step reported failed", "message", outcome.Message)
-		setCondition(cluster, ConditionReady, metav1.ConditionFalse, "StepFailed", outcome.Message)
-		return r.finish(ctx, cluster, ctrl.Result{}, nil)
 	case plan.StepStateRunning:
 		logger.Info("step still running", "message", outcome.Message)
-		return r.finish(ctx, cluster, ctrl.Result{RequeueAfter: 5 * time.Second}, nil)
+		return r.finish(ctx, cluster, ctrl.Result{RequeueAfter: time.Second}, nil)
 	default:
 		logger.Info("step returned unknown status", "status", outcome.Status)
-		return r.finish(ctx, cluster, ctrl.Result{RequeueAfter: 5 * time.Second}, nil)
+		return r.finish(ctx, cluster, ctrl.Result{RequeueAfter: time.Second}, nil)
 	}
+}
+
+type stepExecutionResult struct {
+	index   int
+	outcome StepOutcome
+	err     error
+}
+
+func (r *RedisClusterReconciler) executeMigrateStepBatch(ctx context.Context, cluster *v1alpha1.RedisCluster, active *v1alpha1.PlanStatus, planModel *plan.Plan, start int) (ctrl.Result, error) {
+	logger := log.FromContext(ctx).WithValues("planID", active.ID)
+	indices := independentMigrateStepBatch(active, planModel, start)
+	if len(indices) == 0 {
+		indices = []int{start}
+	}
+
+	batchCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	results := make(chan stepExecutionResult, len(indices))
+	var wg sync.WaitGroup
+	for _, idx := range indices {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			execStart := time.Now()
+			outcome, err := r.Driver.ExecuteStep(batchCtx, cluster, planModel, idx)
+			log.FromContext(ctx).WithValues("stepIndex", idx, "stepID", active.Steps[idx].ID, "action", active.Steps[idx].Action).Info("step execution finished", "duration", time.Since(execStart), "status", outcome.Status, "message", outcome.Message, "error", err)
+			results <- stepExecutionResult{index: idx, outcome: outcome, err: err}
+		}(idx)
+	}
+	wg.Wait()
+	close(results)
+
+	failed := ""
+	running := false
+	for result := range results {
+		if r.applyStepOutcome(ctx, cluster, active, planModel, result.index, result.outcome, result.err) {
+			failed = active.Steps[result.index].Message
+			cancel()
+		} else if result.outcome.Status == plan.StepStateRunning {
+			running = true
+		}
+	}
+	active.CurrentStep = firstPendingID(active.Steps)
+	if failed != "" {
+		logger.Info("migrate step batch failed", "steps", len(indices), "message", failed)
+		setCondition(cluster, ConditionReady, metav1.ConditionFalse, "StepFailed", failed)
+		return r.finish(ctx, cluster, ctrl.Result{}, nil)
+	}
+	if running {
+		logger.Info("migrate step batch still running", "steps", len(indices))
+		return r.finish(ctx, cluster, ctrl.Result{RequeueAfter: time.Second}, nil)
+	}
+	logger.Info("migrate step batch completed", "steps", len(indices))
+	return r.finish(ctx, cluster, ctrl.Result{Requeue: true}, nil)
+}
+
+func independentMigrateStepBatch(active *v1alpha1.PlanStatus, p *plan.Plan, start int) []int {
+	indices := []int{}
+	sources := map[string]bool{}
+	targets := map[string]bool{}
+	for i := start; i < len(p.Steps); i++ {
+		if p.Steps[i].Action != plan.ActionMigrateSlots || active.Steps[i].Action != string(plan.ActionMigrateSlots) {
+			break
+		}
+		if active.Steps[i].Status == string(plan.StepStateCompleted) {
+			continue
+		}
+		source, sourceOK := paramString(p.Steps[i].Params, "sourcePod")
+		target, targetOK := paramString(p.Steps[i].Params, "targetPod")
+		if !sourceOK || !targetOK {
+			break
+		}
+		if sources[source] || targets[target] {
+			continue
+		}
+		sources[source] = true
+		targets[target] = true
+		indices = append(indices, i)
+		if len(indices) >= maxMigrateBatchSize {
+			break
+		}
+	}
+	return indices
 }
 
 func (r *RedisClusterReconciler) ensureNamespace(ctx context.Context, cluster *v1alpha1.RedisCluster) error {
