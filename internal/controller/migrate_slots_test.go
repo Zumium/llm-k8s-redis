@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -10,6 +11,7 @@ import (
 
 	api "github.com/example/llm-k8s-redis/api/v1alpha1"
 	"github.com/example/llm-k8s-redis/internal/plan"
+	"github.com/example/llm-k8s-redis/internal/redis"
 )
 
 const (
@@ -111,8 +113,54 @@ func TestMigrateSlots_EmptySlotSwitchesOwner(t *testing.T) {
 	want := []setSlotCall{
 		{mode: "IMPORTING", slot: 0, nodeID: migrateSourceID},
 		{mode: "MIGRATING", slot: 0, nodeID: migrateTargetID},
-		{mode: "NODE", slot: 0, nodeID: migrateTargetID},
-		{mode: "NODE", slot: 0, nodeID: migrateTargetID},
+		{addr: "10.0.0.1:6379", mode: "NODE", slot: 0, nodeID: migrateTargetID},
+		{addr: "10.0.0.3:6379", mode: "NODE", slot: 0, nodeID: migrateTargetID},
+	}
+	if len(fc.setSlotCalls) != len(want) {
+		t.Fatalf("expected %d setslot calls, got %d: %v", len(want), len(fc.setSlotCalls), fc.setSlotCalls)
+	}
+	for i := range want {
+		if fc.setSlotCalls[i] != want[i] {
+			t.Fatalf("setslot call %d = %+v, want %+v", i, fc.setSlotCalls[i], want[i])
+		}
+	}
+}
+
+func TestMigrateSlots_DoesNotSetSlotNodeOnStaleMaster(t *testing.T) {
+	ctx := context.Background()
+	cluster := testCluster()
+	migrateTopology(cluster)
+	calls := 0
+	fc := &fakeRedisClient{
+		clusterNodes: func() (string, error) {
+			calls++
+			staleMaster := "stale 10.0.0.9:6379@16379 master - 0 0 9 connected\n"
+			if calls == 1 {
+				return migrateClusterNodes("0-8191", "8192-16383") + staleMaster, nil
+			}
+			return migrateClusterNodes("1-8191", "0 8192-16383") + staleMaster, nil
+		},
+	}
+	exec := migrateExec(t, cluster, fc)
+	exec.RedisFactory = func(addr string) (redis.Client, error) {
+		if addr == "10.0.0.9:6379" {
+			return nil, errors.New("stale master should not be contacted")
+		}
+		return &addrFakeRedisClient{fakeRedisClient: fc, addr: addr}, nil
+	}
+
+	outcome, err := exec.ExecuteStep(ctx, cluster, migratePlan(), 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if outcome.Status != plan.StepStateCompleted {
+		t.Fatalf("expected Completed, got %q: %s", outcome.Status, outcome.Message)
+	}
+	want := []setSlotCall{
+		{mode: "IMPORTING", slot: 0, nodeID: migrateSourceID},
+		{mode: "MIGRATING", slot: 0, nodeID: migrateTargetID},
+		{addr: "10.0.0.1:6379", mode: "NODE", slot: 0, nodeID: migrateTargetID},
+		{addr: "10.0.0.3:6379", mode: "NODE", slot: 0, nodeID: migrateTargetID},
 	}
 	if len(fc.setSlotCalls) != len(want) {
 		t.Fatalf("expected %d setslot calls, got %d: %v", len(want), len(fc.setSlotCalls), fc.setSlotCalls)

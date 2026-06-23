@@ -200,10 +200,13 @@ func (e *ActionExecutor) migrateSlots(ctx context.Context, cluster *v1alpha1.Red
 			logger.Info("migrating keys finished", "slot", slot, "keys", len(keys), "duration", time.Since(migrateStart))
 			return running("migrated %d keys for slot %d; waiting to finish slot ownership", len(keys), slot), nil
 		}
-		setStart := time.Now()
-		if err := setSlotNodeOnHealthyMasters(ctx, e.RedisFactory, entries, slot, target.ID); err != nil {
-			logger.Error(err, "set slot node on healthy masters failed", "slot", slot, "duration", time.Since(setStart))
-			return StepOutcome{Status: plan.StepStateFailed, Message: fmt.Sprintf("SETSLOT NODE slot %d: %v", slot, err)}, err
+		if err := sourceRC.ClusterSetSlotNode(ctx, slot, target.ID); err != nil {
+			logger.Error(err, "source setslot node failed", "slot", slot, "duration", time.Since(slotStart))
+			return StepOutcome{Status: plan.StepStateFailed, Message: fmt.Sprintf("source SETSLOT NODE slot %d: %v", slot, err)}, err
+		}
+		if err := targetRC.ClusterSetSlotNode(ctx, slot, target.ID); err != nil {
+			logger.Error(err, "target setslot node failed", "slot", slot, "duration", time.Since(slotStart))
+			return StepOutcome{Status: plan.StepStateFailed, Message: fmt.Sprintf("target SETSLOT NODE slot %d: %v", slot, err)}, err
 		}
 		logger.Info("migrating slot finished", "slot", slot, "duration", time.Since(slotStart))
 		done++
@@ -258,32 +261,4 @@ func (e *ActionExecutor) getPod(ctx context.Context, ns, podName string) (*corev
 
 func podDeclaredOrInTopology(cluster *v1alpha1.RedisCluster, p *plan.Plan, stepIndex int, ns, podName string) bool {
 	return precededEnsureNode(p, stepIndex, ns, podName) || podInTopology(cluster, podName)
-}
-
-func setSlotNodeOnHealthyMasters(ctx context.Context, factory redis.Factory, entries []rediscluster.Entry, slot int, targetID string) error {
-	logger := log.FromContext(ctx).WithValues("slot", slot, "targetID", targetID)
-	for _, entry := range entries {
-		if !entry.IsMaster() || !entry.Healthy() {
-			continue
-		}
-		addr := rediscluster.RedisAddrFromClusterAddr(entry.Addr)
-		start := time.Now()
-		logger.Info("setslot node on master started", "addr", addr, "nodeID", entry.ID)
-		rc, err := factory(addr)
-		if err != nil {
-			logger.Error(err, "build redis client for setslot node failed", "addr", addr)
-			return fmt.Errorf("build redis client for %s: %w", addr, err)
-		}
-		if err := rc.ClusterSetSlotNode(ctx, slot, targetID); err != nil {
-			rc.Close()
-			logger.Error(err, "setslot node on master failed", "addr", addr, "nodeID", entry.ID, "duration", time.Since(start))
-			return err
-		}
-		if err := rc.Close(); err != nil {
-			logger.Error(err, "close redis client after setslot node failed", "addr", addr)
-			return err
-		}
-		logger.Info("setslot node on master finished", "addr", addr, "nodeID", entry.ID, "duration", time.Since(start))
-	}
-	return nil
 }

@@ -82,6 +82,7 @@ type fakeRedisClient struct {
 }
 
 type setSlotCall struct {
+	addr   string
 	mode   string
 	slot   int
 	nodeID string
@@ -204,8 +205,23 @@ func (f *fakeRedisClient) MigrateKeys(_ context.Context, host string, port int, 
 }
 func (f *fakeRedisClient) Close() error { return nil }
 
+type addrFakeRedisClient struct {
+	*fakeRedisClient
+	addr string
+}
+
+func (f *addrFakeRedisClient) ClusterSetSlotNode(_ context.Context, slot int, nodeID string) error {
+	f.setSlotCalls = append(f.setSlotCalls, setSlotCall{addr: f.addr, mode: "NODE", slot: slot, nodeID: nodeID})
+	if f.setSlotNode == nil {
+		return nil
+	}
+	return f.setSlotNode(slot, nodeID)
+}
+
 func fakeFactory(fc *fakeRedisClient) redis.Factory {
-	return func(string) (redis.Client, error) { return fc, nil }
+	return func(addr string) (redis.Client, error) {
+		return &addrFakeRedisClient{fakeRedisClient: fc, addr: addr}, nil
+	}
 }
 
 func newExecutor(t *testing.T, objs []client.Object, fc *fakeRedisClient) *ActionExecutor {
