@@ -158,10 +158,10 @@ func (s *planSimulator) ensureNode(step Step) error {
 		return fmt.Errorf("EnsureNode requires a non-empty pod param")
 	}
 	if image, _ := paramString(step.Params, "image"); image != s.spec.Image {
-		return fmt.Errorf("image %q must equal spec.image %q", image, s.spec.Image)
+		return verr(fmt.Sprintf("Set image to %q", s.spec.Image), "image %q must equal spec.image %q", image, s.spec.Image)
 	}
 	if memorySize, _ := paramString(step.Params, "memorySize"); memorySize != s.spec.MemorySize {
-		return fmt.Errorf("memorySize %q must equal spec.memorySize %q", memorySize, s.spec.MemorySize)
+		return verr(fmt.Sprintf("Set memorySize to %q", s.spec.MemorySize), "memorySize %q must equal spec.memorySize %q", memorySize, s.spec.MemorySize)
 	}
 	s.ensureExistingNode(pod)
 	return nil
@@ -174,7 +174,7 @@ func (s *planSimulator) waitNodeReady(step Step) error {
 	}
 	n := s.nodes[pod]
 	if n == nil || !n.exists {
-		return fmt.Errorf("pod %q was not declared by EnsureNode", pod)
+		return verr(fmt.Sprintf("Add an EnsureNode step for pod %q before this WaitNodeReady", pod), "pod %q was not declared by EnsureNode", pod)
 	}
 	n.ready = true
 	return nil
@@ -194,11 +194,11 @@ func (s *planSimulator) meetNode(step Step) error {
 	}
 	source := s.nodes[sourcePod]
 	if source == nil || !source.ready {
-		return fmt.Errorf("source pod %q is not ready", sourcePod)
+		return verr(fmt.Sprintf("Add a WaitNodeReady step for pod %q before this MeetNode", sourcePod), "source pod %q is not ready", sourcePod)
 	}
 	target := s.nodes[targetPod]
 	if target == nil || !target.ready {
-		return fmt.Errorf("target pod %q is not ready", targetPod)
+		return verr(fmt.Sprintf("Add a WaitNodeReady step for pod %q before this MeetNode", targetPod), "target pod %q is not ready", targetPod)
 	}
 	source.clusterMember = true
 	target.clusterMember = true
@@ -222,20 +222,20 @@ func (s *planSimulator) replicateNode(step Step) error {
 	}
 	master := s.nodes[masterPod]
 	if master == nil || !master.ready || !master.clusterMember {
-		return fmt.Errorf("master pod %q is not a ready cluster member", masterPod)
+		return verr(fmt.Sprintf("Add a WaitNodeReady step for pod %q before this ReplicateNode", masterPod), "master pod %q is not a ready cluster member", masterPod)
 	}
 	if master.role == "" {
 		master.role = "master"
 	}
 	if master.role != "master" {
-		return fmt.Errorf("master pod %q is not a master", masterPod)
+		return verr(fmt.Sprintf("Pod %q must be a master; check the ReplicateNode assignment", masterPod), "master pod %q is not a master", masterPod)
 	}
 	replica := s.nodes[replicaPod]
 	if replica == nil || !replica.ready || !replica.clusterMember {
-		return fmt.Errorf("replica pod %q is not a ready cluster member", replicaPod)
+		return verr(fmt.Sprintf("Add a MeetNode step for pod %q before this ReplicateNode", replicaPod), "replica pod %q is not a ready cluster member", replicaPod)
 	}
 	if len(replica.slots) > 0 {
-		return fmt.Errorf("replica pod %q already owns slots", replicaPod)
+		return verr(fmt.Sprintf("Pod %q already owns slots; use MigrateSlots to transfer them away first", replicaPod), "replica pod %q already owns slots", replicaPod)
 	}
 	replica.role = "replica"
 	replica.replicaOf = masterPod
@@ -249,16 +249,16 @@ func (s *planSimulator) addSlots(step Step) error {
 	}
 	n := s.nodes[pod]
 	if n == nil || !n.ready || !n.clusterMember {
-		return fmt.Errorf("target pod %q is not a ready cluster member", pod)
+		return verr(fmt.Sprintf("Add WaitNodeReady and MeetNode steps for pod %q before this AddSlots", pod), "target pod %q is not a ready cluster member", pod)
 	}
 	if n.role == "" {
 		n.role = "master"
 	}
 	if n.role != "master" {
-		return fmt.Errorf("target pod %q is not a master", pod)
+		return verr(fmt.Sprintf("Pod %q must be a master to own slots; check the ReplicateNode assignment", pod), "target pod %q is not a master", pod)
 	}
 	if s.replicaCount(pod) == 0 {
-		return fmt.Errorf("target master %q has no replica", pod)
+		return verr(fmt.Sprintf("Add a ReplicateNode step to give master %q a replica before assigning slots", pod), "target master %q has no replica", pod)
 	}
 	slotsStr, ok := paramString(step.Params, "slots")
 	if !ok || slotsStr == "" {
@@ -270,7 +270,7 @@ func (s *planSimulator) addSlots(step Step) error {
 	}
 	for slot := range slots {
 		if owner, exists := s.slotOwners[slot]; exists {
-			return fmt.Errorf("slot %d already belongs to pod %q", slot, owner)
+			return verr(fmt.Sprintf("Slot %d is already owned by %q; use MigrateSlots to transfer it instead of AddSlots", slot, owner), "slot %d already belongs to pod %q", slot, owner)
 		}
 	}
 	for slot := range slots {
@@ -294,14 +294,14 @@ func (s *planSimulator) migrateSlots(step Step) error {
 	}
 	source := s.nodes[sourcePod]
 	if source == nil || !source.ready || !source.clusterMember || source.role != "master" {
-		return fmt.Errorf("source pod %q is not a ready master", sourcePod)
+		return verr(fmt.Sprintf("Pod %q must be a ready master to migrate slots from; add WaitNodeReady if needed", sourcePod), "source pod %q is not a ready master", sourcePod)
 	}
 	target := s.nodes[targetPod]
 	if target == nil || !target.ready || !target.clusterMember || target.role != "master" {
-		return fmt.Errorf("target pod %q is not a ready master", targetPod)
+		return verr(fmt.Sprintf("Pod %q must be a ready master to receive slots; add WaitNodeReady and MeetNode if needed", targetPod), "target pod %q is not a ready master", targetPod)
 	}
 	if s.replicaCount(targetPod) == 0 {
-		return fmt.Errorf("target master %q has no replica", targetPod)
+		return verr(fmt.Sprintf("Add a ReplicateNode step to give target master %q a replica before migrating slots", targetPod), "target master %q has no replica", targetPod)
 	}
 	slotsStr, ok := paramString(step.Params, "slots")
 	if !ok || slotsStr == "" {
@@ -317,7 +317,7 @@ func (s *planSimulator) migrateSlots(step Step) error {
 			return fmt.Errorf("slot %d has no owner", slot)
 		}
 		if owner != sourcePod && owner != targetPod {
-			return fmt.Errorf("slot %d belongs to pod %q, not source %q or target %q", slot, owner, sourcePod, targetPod)
+			return verr(fmt.Sprintf("Slot %d belongs to %q; migrate from its current owner %q to %q", slot, owner, owner, targetPod), "slot %d belongs to pod %q, not source %q or target %q", slot, owner, sourcePod, targetPod)
 		}
 	}
 	for slot := range slots {
@@ -389,10 +389,10 @@ func (s *planSimulator) verifyCluster(step Step) error {
 		return fmt.Errorf("VerifyCluster requires integer expectedReplicasPerShard")
 	}
 	if expectedShards != int(s.spec.Shards) {
-		return fmt.Errorf("expectedShards %d must equal spec.shards %d", expectedShards, s.spec.Shards)
+		return verr(fmt.Sprintf("Set expectedShards to spec.shards value %d", s.spec.Shards), "expectedShards %d must equal spec.shards %d", expectedShards, s.spec.Shards)
 	}
 	if expectedReplicas != int(s.spec.ReplicasPerShard) {
-		return fmt.Errorf("expectedReplicasPerShard %d must equal spec.replicasPerShard %d", expectedReplicas, s.spec.ReplicasPerShard)
+		return verr(fmt.Sprintf("Set expectedReplicasPerShard to spec.replicasPerShard value %d", s.spec.ReplicasPerShard), "expectedReplicasPerShard %d must equal spec.replicasPerShard %d", expectedReplicas, s.spec.ReplicasPerShard)
 	}
 	masters := 0
 	for pod, n := range s.nodes {
@@ -405,10 +405,10 @@ func (s *planSimulator) verifyCluster(step Step) error {
 		}
 	}
 	if masters != expectedShards {
-		return fmt.Errorf("found %d slot-owning masters, expected %d", masters, expectedShards)
+		return verr(fmt.Sprintf("Found %d slot-owning masters; add EnsureNode steps for missing masters", masters), "found %d slot-owning masters, expected %d", masters, expectedShards)
 	}
 	if len(s.slotOwners) != 16384 {
-		return fmt.Errorf("slot coverage is %d, expected 16384", len(s.slotOwners))
+		return verr(fmt.Sprintf("Slot coverage is %d/16384; add AddSlots or MigrateSlots steps to cover all slots 0-16383", len(s.slotOwners)), "slot coverage is %d, expected 16384", len(s.slotOwners))
 	}
 	return s.checkInvariants()
 }
@@ -419,14 +419,14 @@ func (s *planSimulator) checkInvariants() error {
 			continue
 		}
 		if n.role == "replica" && len(n.slots) > 0 {
-			return fmt.Errorf("replica pod %q owns slots", pod)
+			return verr(fmt.Sprintf("Replica %q owns slots; use MigrateSlots to transfer them to a master first", pod), "replica pod %q owns slots", pod)
 		}
 		if len(n.slots) > 0 {
 			if n.role != "master" {
-				return fmt.Errorf("slot-owning pod %q is not a master", pod)
+				return verr(fmt.Sprintf("Pod %q owns slots but is not a master; set its role via ReplicateNode", pod), "slot-owning pod %q is not a master", pod)
 			}
 			if !s.healMode && s.replicaCount(pod) == 0 {
-				return fmt.Errorf("slot-owning master %q has no replica", pod)
+				return verr(fmt.Sprintf("Master %q owns slots but has no replica; add a ReplicateNode step for a replica", pod), "slot-owning master %q has no replica", pod)
 			}
 		}
 	}

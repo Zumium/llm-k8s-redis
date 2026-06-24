@@ -62,14 +62,17 @@ func buildLLMRequest(req Request) (LLMRequest, error) {
 		}
 		messages = append(messages,
 			LLMMessage{Role: "assistant", Content: string(rejectedPlan)},
-			LLMMessage{Role: "user", Content: buildValidationFeedbackPrompt(feedback.Error)},
+			LLMMessage{Role: "user", Content: buildValidationFeedbackPrompt(feedback)},
 		)
 	}
 	return LLMRequest{Messages: messages}, nil
 }
 
-func buildValidationFeedbackPrompt(validationError string) string {
-	return fmt.Sprintf("The controller Validator rejected that plan:\n%s\nReturn a corrected JSON plan only.", validationError)
+func buildValidationFeedbackPrompt(feedback ValidationFeedback) string {
+	if feedback.Hint != "" {
+		return fmt.Sprintf("The controller Validator rejected that plan:\n%s\nFix: %s\nReturn a corrected JSON plan only.", feedback.Error, feedback.Hint)
+	}
+	return fmt.Sprintf("The controller Validator rejected that plan:\n%s\nReturn a corrected JSON plan only.", feedback.Error)
 }
 
 func parsePlanJSON(planJSON string) (*plan.Plan, error) {

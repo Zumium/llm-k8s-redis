@@ -269,7 +269,11 @@ func (r *RedisClusterReconciler) reconcilePlan(ctx context.Context, cluster *v1a
 		if err := r.ValidatePlan(newPlan, validationContext(cluster, spec, nodes)); err != nil {
 			logger.Info("plan rejected", "attempt", attempt, "planID", newPlan.PlanID, "duration", time.Since(validateStart), "error", err)
 			if attempt < validationRetries {
-				req.ValidationFeedback = append(req.ValidationFeedback, planner.ValidationFeedback{RejectedPlan: newPlan, Error: err.Error()})
+				req.ValidationFeedback = append(req.ValidationFeedback, planner.ValidationFeedback{
+					RejectedPlan: newPlan,
+					Error:        err.Error(),
+					Hint:         plan.ValidationHint(err),
+				})
 				logger.Info("validation feedback appended", "attempt", attempt, "feedback", len(req.ValidationFeedback))
 				continue
 			}

@@ -29,6 +29,7 @@ type ObservedNode = plan.ObservedNode
 type ValidationFeedback struct {
 	RejectedPlan *plan.Plan
 	Error        string
+	Hint         string
 }
 
 var ErrNotConfigured = errors.New("planner not configured; provide a Planner implementation")

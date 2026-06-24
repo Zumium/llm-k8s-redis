@@ -44,7 +44,7 @@ func (v *Validator) Validate(p *Plan, input any) error {
 		if s.Action != ActionVerifyCluster {
 			ns, _ := paramString(s.Params, "namespace")
 			if ns != spec.Name {
-				return fmt.Errorf("step %q: namespace %q must equal cluster name %q", s.ID, ns, spec.Name)
+				return verr(fmt.Sprintf("Set namespace to %q", spec.Name), "step %q: namespace %q must equal cluster name %q", s.ID, ns, spec.Name)
 			}
 		}
 		if s.Action == ActionEnsureNode {
@@ -58,7 +58,7 @@ func (v *Validator) Validate(p *Plan, input any) error {
 
 	last := p.Steps[len(p.Steps)-1]
 	if last.Action != ActionVerifyCluster {
-		return fmt.Errorf("last step must be VerifyCluster, got %q", last.Action)
+		return verr("Add a VerifyCluster step as the final step of the plan", "last step must be VerifyCluster, got %q", last.Action)
 	}
 	topology := validationTopology(ctx)
 	ctx.Topology = topology
@@ -131,7 +131,7 @@ func topologyFromObservedNodes(nodes []ObservedNode) *ClusterTopology {
 func validateCreate(spec ClusterSpec, ensurePods map[string]bool) error {
 	want := int(spec.Shards) * (1 + int(spec.ReplicasPerShard))
 	if len(ensurePods) != want {
-		return fmt.Errorf("EnsureNode declared %d distinct pods, expected shards*(1+replicasPerShard)=%d", len(ensurePods), want)
+		return verr(fmt.Sprintf("Create exactly %d EnsureNode steps (shards=%d * (1+replicasPerShard=%d) = %d)", want, spec.Shards, spec.ReplicasPerShard, want), "EnsureNode declared %d distinct pods, expected shards*(1+replicasPerShard)=%d", len(ensurePods), want)
 	}
 	return validateCreatePodNames(ensurePods)
 }
@@ -196,7 +196,7 @@ func validateStepSchema(s Step) error {
 		}
 		return requireTrueBoolParams(s.Params, "requireClusterStateOk", "requireFullSlotCoverage", "requireAllSlotOwnersHaveReplicas")
 	default:
-		return fmt.Errorf("action %q is not in the whitelist", s.Action)
+		return verr("Use only whitelisted actions: EnsureNode, WaitNodeReady, MeetNode, ReplicateNode, AddSlots, MigrateSlots, ForgetNode, DeleteNode, VerifyCluster", "action %q is not in the whitelist", s.Action)
 	}
 }
 
@@ -220,7 +220,7 @@ func requirePodParams(params map[string]any, keys ...string) error {
 	for _, key := range keys {
 		pod, _ := paramString(params, key)
 		if _, ok := redisPodOrdinal(pod); !ok {
-			return fmt.Errorf("%s %q does not match required naming redis-<N>", key, pod)
+			return verr(fmt.Sprintf("Rename %s to 'redis-<N>' format where N is a non-negative integer", key), "%s %q does not match required naming redis-<N>", key, pod)
 		}
 	}
 	return nil
@@ -273,7 +273,7 @@ func validateCreatePodNames(ensurePods map[string]bool) error {
 	for pod := range ensurePods {
 		n, ok := redisPodOrdinal(pod)
 		if !ok {
-			return fmt.Errorf("pod %q does not match required naming redis-<N>", pod)
+			return verr(fmt.Sprintf("Rename %q to 'redis-<N>' format where N is a non-negative integer", pod), "pod %q does not match required naming redis-<N>", pod)
 		}
 		ordinals[n] = true
 		if n > max {
@@ -281,7 +281,7 @@ func validateCreatePodNames(ensurePods map[string]bool) error {
 		}
 	}
 	if max != want-1 {
-		return fmt.Errorf("EnsureNode pods must be contiguous from redis-0 to redis-%d", want-1)
+		return verr(fmt.Sprintf("Use pod names redis-0 through redis-%d without gaps", want-1), "EnsureNode pods must be contiguous from redis-0 to redis-%d", want-1)
 	}
 	if len(ordinals) != want {
 		return fmt.Errorf("EnsureNode pods have duplicate ordinals")
@@ -313,21 +313,22 @@ func validateExistingTopologyPlan(p *Plan, spec ClusterSpec, ctx *ValidationCont
 		return validateShardScaleIn(p, spec, *ctx, topology, ensurePods)
 	}
 	if int(spec.Shards) > currentShards && int(spec.ReplicasPerShard) > currentReplicas {
-		return fmt.Errorf("shards and replicasPerShard cannot both change in one scaleout")
+		return verr("Change only shards or only replicasPerShard in one plan, not both", "shards and replicasPerShard cannot both change in one scaleout")
 	}
 	if int(spec.Shards) == currentShards && int(spec.ReplicasPerShard) == currentReplicas {
 		return validateSameSpecRepair(*ctx, topology, ensurePods)
 	}
-	return fmt.Errorf("unsupported existing-topology change: spec.shards=%d current=%d spec.replicasPerShard=%d current=%d", spec.Shards, currentShards, spec.ReplicasPerShard, currentReplicas)
+	return verr("Check that spec.shards and spec.replicasPerShard match the current topology or change only one of them",
+		"unsupported existing-topology change: spec.shards=%d current=%d spec.replicasPerShard=%d current=%d", spec.Shards, currentShards, spec.ReplicasPerShard, currentReplicas)
 }
 
 func validateReplicaScaleIn(p *Plan, spec ClusterSpec, topology *ClusterTopology, ensurePods map[string]bool) error {
 	target := int(spec.ReplicasPerShard)
 	if target < 1 {
-		return fmt.Errorf("replicasPerShard must be >= 1 for replica scalein")
+		return verr("replicasPerShard cannot be reduced below 1", "replicasPerShard must be >= 1 for replica scalein")
 	}
 	if len(ensurePods) != 0 {
-		return fmt.Errorf("EnsureNode is not allowed for replica scalein")
+		return verr("Remove all EnsureNode steps; replica scalein only uses ForgetNode, DeleteNode, VerifyCluster", "EnsureNode is not allowed for replica scalein")
 	}
 
 	needByMaster := map[string]int{}
@@ -344,8 +345,9 @@ func validateReplicaScaleIn(p *Plan, spec ClusterSpec, topology *ClusterTopology
 			replicaMaster[r.Pod] = sh.Master.Pod
 		}
 	}
-	if total == 0 {
-		return fmt.Errorf("replicasPerShard is not lower than current topology")
+		if total == 0 {
+		return verr("Reduce spec.replicasPerShard to a value lower than the current replica count",
+			"replicasPerShard is not lower than current topology")
 	}
 
 	forgot := map[string]bool{}
@@ -378,7 +380,8 @@ func validateReplicaScaleIn(p *Plan, spec ClusterSpec, topology *ClusterTopology
 			deletedByMaster[master]++
 		case ActionVerifyCluster:
 		default:
-			return fmt.Errorf("step %q: action %q is not allowed for replica scalein", s.ID, s.Action)
+			return verr("For replica scalein, only use: ForgetNode, DeleteNode, VerifyCluster",
+				"step %q: action %q is not allowed for replica scalein", s.ID, s.Action)
 		}
 	}
 	for pod := range forgot {
@@ -429,9 +432,6 @@ func healableTopology(topology *ClusterTopology, spec ClusterSpec, observed []Ob
 	}
 
 	ghosts := ghostNodes(observed)
-	if len(ghosts) == 0 {
-		return nil
-	}
 
 	return &healState{
 		underReplicated: underReplicated,
@@ -477,7 +477,8 @@ func validateHealRepair(p *Plan, spec ClusterSpec, ctx *ValidationContext, topol
 		switch s.Action {
 		case ActionEnsureNode, ActionWaitNodeReady, ActionMeetNode, ActionReplicateNode, ActionForgetNode, ActionDeleteNode, ActionVerifyCluster:
 		default:
-			return fmt.Errorf("step %q: action %q is not allowed for heal repair", s.ID, s.Action)
+			return verr("For heal repair, only use: EnsureNode, WaitNodeReady, MeetNode, ReplicateNode, ForgetNode, DeleteNode, VerifyCluster",
+				"step %q: action %q is not allowed for heal repair", s.ID, s.Action)
 		}
 	}
 
@@ -525,7 +526,8 @@ func validateHealRepair(p *Plan, spec ClusterSpec, ctx *ValidationContext, topol
 				}
 			}
 			if matchedID == "" {
-				return fmt.Errorf("step %q: ForgetNode requires lastKnownNodeId when pod %q no longer exists", s.ID, pod)
+				return verr(fmt.Sprintf("Add 'lastKnownNodeId' param with the NodeID of pod %q from the observed state", pod),
+					"step %q: ForgetNode requires lastKnownNodeId when pod %q no longer exists", s.ID, pod)
 			}
 			ghostSeen[matchedID] = true
 			continue
@@ -590,14 +592,16 @@ func validateReplicaScaleOut(p *Plan, spec ClusterSpec, ctx ValidationContext, t
 		return err
 	}
 	if int(spec.ReplicasPerShard) <= currentReplicas {
-		return fmt.Errorf("replicasPerShard must increase for replica scaleout: spec=%d current=%d", spec.ReplicasPerShard, currentReplicas)
+		return verr("Set spec.replicasPerShard to a number greater than current replica count",
+			"replicasPerShard must increase for replica scaleout: spec=%d current=%d", spec.ReplicasPerShard, currentReplicas)
 	}
 
 	for _, s := range p.Steps {
 		switch s.Action {
 		case ActionEnsureNode, ActionWaitNodeReady, ActionMeetNode, ActionReplicateNode, ActionVerifyCluster:
 		default:
-			return fmt.Errorf("step %q: action %q is not allowed for replica scaleout", s.ID, s.Action)
+			return verr("For replica scaleout, only use: EnsureNode, WaitNodeReady, MeetNode, ReplicateNode, VerifyCluster",
+				"step %q: action %q is not allowed for replica scaleout", s.ID, s.Action)
 		}
 	}
 	existingPods := topologyPods(topology)
@@ -609,7 +613,8 @@ func validateReplicaScaleOut(p *Plan, spec ClusterSpec, ctx ValidationContext, t
 	}
 	wantNewPods := currentShards * (int(spec.ReplicasPerShard) - currentReplicas)
 	if len(newPods) != wantNewPods {
-		return fmt.Errorf("EnsureNode declared %d new pods, expected %d new replicas", len(newPods), wantNewPods)
+		return verr(fmt.Sprintf("Create exactly %d new EnsureNode steps (%d shards * %d new replicas per shard)", wantNewPods, currentShards, wantNewPods/currentShards),
+			"EnsureNode declared %d new pods, expected %d new replicas", len(newPods), wantNewPods)
 	}
 	if err := validateSequentialNewPods(existingPods, newPods, effectiveNextPodOrdinal(ctx, topology)); err != nil {
 		return err
@@ -632,10 +637,12 @@ func validateShardScaleOut(p *Plan, spec ClusterSpec, ctx ValidationContext, top
 		return err
 	}
 	if int(spec.Shards) <= currentShards {
-		return fmt.Errorf("shards must increase for shard scaleout: spec=%d current=%d", spec.Shards, currentShards)
+		return verr("Set spec.shards to a number greater than current master count",
+			"shards must increase for shard scaleout: spec=%d current=%d", spec.Shards, currentShards)
 	}
 	if int(spec.ReplicasPerShard) != currentReplicas {
-		return fmt.Errorf("replicasPerShard must remain %d for shard scaleout, got %d", currentReplicas, spec.ReplicasPerShard)
+		return verr(fmt.Sprintf("Keep replicasPerShard at %d; shard scaleout only changes shards", currentReplicas),
+			"replicasPerShard must remain %d for shard scaleout, got %d", currentReplicas, spec.ReplicasPerShard)
 	}
 	if err := validateTopologyReadyAndCovered(topology); err != nil {
 		return err
@@ -644,7 +651,8 @@ func validateShardScaleOut(p *Plan, spec ClusterSpec, ctx ValidationContext, top
 		switch s.Action {
 		case ActionEnsureNode, ActionWaitNodeReady, ActionMeetNode, ActionReplicateNode, ActionMigrateSlots, ActionVerifyCluster:
 		default:
-			return fmt.Errorf("step %q: action %q is not allowed for shard scaleout", s.ID, s.Action)
+			return verr("For shard scaleout, only use: EnsureNode, WaitNodeReady, MeetNode, ReplicateNode, MigrateSlots, VerifyCluster",
+				"step %q: action %q is not allowed for shard scaleout", s.ID, s.Action)
 		}
 	}
 	existingPods := topologyPods(topology)
@@ -664,7 +672,8 @@ func validateShardScaleOut(p *Plan, spec ClusterSpec, ctx ValidationContext, top
 	}
 	wantNewPods := (int(spec.Shards) - currentShards) * (1 + int(spec.ReplicasPerShard))
 	if len(newPods) != wantNewPods {
-		return fmt.Errorf("EnsureNode declared %d new pods, expected %d new shard nodes", len(newPods), wantNewPods)
+		return verr(fmt.Sprintf("Create exactly %d new EnsureNode steps: (%d new shards) * (1+replicasPerShard=%d) = %d", wantNewPods, int(spec.Shards)-currentShards, currentReplicas+1, wantNewPods),
+			"EnsureNode declared %d new pods, expected %d new shard nodes", len(newPods), wantNewPods)
 	}
 	if err := validateSequentialNewPods(existingPods, newPods, effectiveNextPodOrdinal(ctx, topology)); err != nil {
 		return err
@@ -697,10 +706,12 @@ func validateShardScaleIn(p *Plan, spec ClusterSpec, ctx ValidationContext, topo
 		return err
 	}
 	if int(spec.Shards) >= currentShards {
-		return fmt.Errorf("shards must decrease for shard scalein: spec=%d current=%d", spec.Shards, currentShards)
+		return verr("Set spec.shards to a number less than current master count",
+			"shards must decrease for shard scalein: spec=%d current=%d", spec.Shards, currentShards)
 	}
 	if int(spec.ReplicasPerShard) != currentReplicas {
-		return fmt.Errorf("replicasPerShard must remain %d for shard scalein, got %d", currentReplicas, spec.ReplicasPerShard)
+		return verr(fmt.Sprintf("Keep replicasPerShard at %d; shard scalein only changes shards", currentReplicas),
+			"replicasPerShard must remain %d for shard scalein, got %d", currentReplicas, spec.ReplicasPerShard)
 	}
 	if err := validateTopologyReadyAndCovered(topology); err != nil {
 		return err
@@ -709,7 +720,8 @@ func validateShardScaleIn(p *Plan, spec ClusterSpec, ctx ValidationContext, topo
 		switch s.Action {
 		case ActionEnsureNode, ActionWaitNodeReady, ActionMeetNode, ActionReplicateNode, ActionMigrateSlots, ActionForgetNode, ActionDeleteNode, ActionVerifyCluster:
 		default:
-			return fmt.Errorf("step %q: action %q is not allowed for shard scalein", s.ID, s.Action)
+			return verr("For shard scalein, only use: EnsureNode, WaitNodeReady, MeetNode, ReplicateNode, MigrateSlots, ForgetNode, DeleteNode, VerifyCluster",
+				"step %q: action %q is not allowed for shard scalein", s.ID, s.Action)
 		}
 	}
 
@@ -730,7 +742,8 @@ func validateShardScaleIn(p *Plan, spec ClusterSpec, ctx ValidationContext, topo
 	}
 	wantNewPods := int(spec.Shards) * (1 + int(spec.ReplicasPerShard))
 	if len(newPods) != wantNewPods {
-		return fmt.Errorf("EnsureNode declared %d new pods, expected %d replacement shard nodes", len(newPods), wantNewPods)
+		return verr(fmt.Sprintf("Create exactly %d new EnsureNode steps: spec.shards=%d * (1+replicasPerShard=%d) = %d", wantNewPods, spec.Shards, spec.ReplicasPerShard, wantNewPods),
+			"EnsureNode declared %d new pods, expected %d replacement shard nodes", len(newPods), wantNewPods)
 	}
 	if err := validateSequentialNewPods(existingPods, newPods, effectiveNextPodOrdinal(ctx, topology)); err != nil {
 		return err
