@@ -15,6 +15,9 @@ type Config struct {
 	Temperature           float32
 	ReasoningEffort       string
 	PlanValidationRetries int
+	EmbeddingModel        string
+	EmbeddingBaseURL      string
+	EmbeddingAPIKey       string
 }
 
 func DefaultConfig() Config {
@@ -39,6 +42,9 @@ func (c Config) Validate() error {
 	}
 	if c.PlanValidationRetries < 0 || c.PlanValidationRetries > 10 {
 		return fmt.Errorf("llm config: planValidationRetries must be between 0 and 10")
+	}
+	if err := validateEmbeddingConfig(c); err != nil {
+		return err
 	}
 	return nil
 }
@@ -80,10 +86,42 @@ func ParseConfig(data map[string]string) (Config, error) {
 		config.PlanValidationRetries = retries
 	}
 
+	if value, ok := data["embeddingModel"]; ok {
+		config.EmbeddingModel = strings.TrimSpace(value)
+	}
+	if value, ok := data["embeddingBaseUrl"]; ok {
+		config.EmbeddingBaseURL = strings.TrimSpace(value)
+	}
+	if value, ok := data["embeddingApiKey"]; ok {
+		config.EmbeddingAPIKey = strings.TrimSpace(value)
+	}
+
 	if err := config.Validate(); err != nil {
 		return Config{}, err
 	}
 	return config, nil
+}
+
+func (c Config) HasEmbeddingConfig() bool {
+	return c.EmbeddingModel != "" && c.EmbeddingBaseURL != "" && c.EmbeddingAPIKey != ""
+}
+
+func validateEmbeddingConfig(c Config) error {
+	hasModel := c.EmbeddingModel != ""
+	hasBaseURL := c.EmbeddingBaseURL != ""
+	hasAPIKey := c.EmbeddingAPIKey != ""
+	if hasModel || hasBaseURL || hasAPIKey {
+		if !hasModel {
+			return errors.New("llm config: embeddingModel is required when other embedding fields are set")
+		}
+		if !hasBaseURL {
+			return errors.New("llm config: embeddingBaseUrl is required when other embedding fields are set")
+		}
+		if !hasAPIKey {
+			return errors.New("llm config: embeddingApiKey is required when other embedding fields are set")
+		}
+	}
+	return nil
 }
 
 func validReasoningEffort(v string) bool {

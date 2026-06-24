@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"os"
 	"time"
 
@@ -21,6 +22,7 @@ import (
 	"github.com/example/llm-k8s-redis/internal/controller"
 	"github.com/example/llm-k8s-redis/internal/plan"
 	"github.com/example/llm-k8s-redis/internal/planner"
+	"github.com/example/llm-k8s-redis/internal/rag"
 	"github.com/example/llm-k8s-redis/internal/redis"
 )
 
@@ -84,6 +86,16 @@ func main() {
 		p = llmPlanner
 		planValidationRetries = config.PlanValidationRetries
 		setupLog.Info("using fixed llm planner backed by configmap", "name", llmConfigMapName, "namespace", llmConfigMapNS, "model", config.Model)
+
+		if config.HasEmbeddingConfig() {
+			ret, err := newPlanRetrieverFromConfig(config)
+			if err != nil {
+				setupLog.Error(err, "unable to create rag plan retriever")
+				os.Exit(1)
+			}
+			setupLog.Info("rag plan retriever enabled", "model", config.EmbeddingModel)
+			_ = ret
+		}
 	} else {
 		setupLog.Info("llm planner disabled; using NoopPlanner")
 	}
@@ -127,4 +139,21 @@ func newLLMPlannerFromConfigMap(ctx context.Context, reader client.Reader, key t
 		return nil, planner.Config{}, err
 	}
 	return planner.NewLLMPlanner(llmClient), config, nil
+}
+
+func newPlanRetrieverFromConfig(config planner.Config) (*rag.PlanRetriever, error) {
+	embedder, err := rag.NewOpenAIEmbedder(
+		config.EmbeddingBaseURL,
+		config.EmbeddingAPIKey,
+		config.EmbeddingModel,
+	)
+	if err != nil {
+		return nil, err
+	}
+	probeVec, err := embedder.Embed(context.Background(), "probe")
+	if err != nil {
+		return nil, fmt.Errorf("probe embedding dims: %w", err)
+	}
+	vectorDB := rag.NewMemoryVectorDB(len(probeVec))
+	return rag.NewPlanRetriever(vectorDB, embedder), nil
 }

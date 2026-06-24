@@ -93,3 +93,46 @@ func TestParseConfig_BadValues(t *testing.T) {
 		}
 	}
 }
+
+func TestParseConfig_EmbeddingAllSet(t *testing.T) {
+	config, err := ParseConfig(map[string]string{
+		"baseUrl":           "u",
+		"apiKey":            "k",
+		"model":             "m",
+		"embeddingModel":    "text-embedding-3-small",
+		"embeddingBaseUrl":  "https://api.openai.com/v1",
+		"embeddingApiKey":   "sk-emb",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !config.HasEmbeddingConfig() {
+		t.Fatal("expected HasEmbeddingConfig to be true")
+	}
+}
+
+func TestParseConfig_EmbeddingNone(t *testing.T) {
+	config, err := ParseConfig(map[string]string{
+		"baseUrl": "u",
+		"apiKey":  "k",
+		"model":   "m",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if config.HasEmbeddingConfig() {
+		t.Fatal("expected HasEmbeddingConfig to be false")
+	}
+}
+
+func TestParseConfig_EmbeddingPartial(t *testing.T) {
+	for _, data := range []map[string]string{
+		{"baseUrl": "u", "apiKey": "k", "model": "m", "embeddingModel": "text-embedding-3-small"},
+		{"baseUrl": "u", "apiKey": "k", "model": "m", "embeddingModel": "text-embedding-3-small", "embeddingBaseUrl": "https://api.openai.com/v1"},
+		{"baseUrl": "u", "apiKey": "k", "model": "m", "embeddingBaseUrl": "https://api.openai.com/v1"},
+	} {
+		if _, err := ParseConfig(data); err == nil {
+			t.Fatalf("expected error for %#v", data)
+		}
+	}
+}
