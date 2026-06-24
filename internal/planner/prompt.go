@@ -1,53 +1,34 @@
 package planner
 
 import (
+	"bytes"
+	"embed"
 	"fmt"
 	"strings"
+	"text/template"
 
 	"github.com/example/llm-k8s-redis/internal/plan"
 )
 
+//go:embed prompts/*.md
+var promptFS embed.FS
+
+var (
+	systemTmpl = template.Must(template.New("system.md").ParseFS(promptFS, "prompts/system.md"))
+	userTmpl   = template.Must(template.New("user.md").ParseFS(promptFS, "prompts/user.md"))
+)
+
 func buildSystemPrompt() string {
-	var b strings.Builder
-	b.WriteString("You are a Redis Cluster operations planner for a Kubernetes controller.\n")
-	b.WriteString("Your job is to produce a JSON plan that the controller will validate and execute step by step.\n\n")
-
-	b.WriteString("## DSL version\n")
-	b.WriteString(fmt.Sprintf("Every plan must set \"dslVersion\" to %q.\n\n", plan.DSLVersion))
-
-	b.WriteString("## Plan schema\n")
-	b.WriteString("The output must be a single JSON object matching this structure:\n")
-	b.WriteString("```json\n")
-	b.WriteString(`{
-  "dslVersion": "redis.ops/v1alpha1",
-  "planId": "<unique short id, e.g. create-001>",
-  "targetGeneration": <integer, the cluster generation you are planning for>,
-  "summary": "<one-line human-readable description>",
-  "steps": [
-    {
-      "id": "<unique step id>",
-      "action": "<one of the whitelisted actions>",
-      "params": { ... }
-    }
-  ]
-}`)
-	b.WriteString("\n```\n\n")
-
-	b.WriteString("## Whitelisted actions and their params\n")
-	b.WriteString(actionReference())
-	b.WriteString("\n")
-
-	b.WriteString("## Safety invariants (the controller will reject plans that violate these)\n")
-	b.WriteString(safetyInvariants())
-	b.WriteString("\n")
-
-	b.WriteString("## Output rules\n")
-	b.WriteString("1. Output ONLY the JSON plan. No markdown fences, no commentary.\n")
-	b.WriteString("2. Every pod-targeting action must include a \"namespace\" param equal to the cluster name.\n")
-	b.WriteString("3. Do NOT invent Redis nodeIds; the controller discovers them at runtime.\n")
-	b.WriteString("4. All Redis pods must be named redis-<N> where N is a single non-negative integer.\n")
-	b.WriteString("5. Reconcile desired spec, live Pods, and CLUSTER NODES facts before choosing actions.\n")
-	return b.String()
+	var buf bytes.Buffer
+	err := systemTmpl.Execute(&buf, map[string]any{
+		"DSLVersion": plan.DSLVersion,
+		"Actions":    actionReference(),
+		"Invariants": safetyInvariants(),
+	})
+	if err != nil {
+		panic(fmt.Sprintf("system prompt template: %v", err))
+	}
+	return buf.String()
 }
 
 func actionReference() string {
@@ -75,39 +56,31 @@ func actionReference() string {
 }
 
 func safetyInvariants() string {
-	return strings.TrimSpace(`- The cluster must never have a shard with zero replicas for a slot-owning master, not even transiently.
-- AddSlots must run only after the target master has at least one replica.
-- A replica must not hold slots.
-- Slots 0-16383 must be fully covered exactly once across all AddSlots steps.
-- For shard ScaleOut, MigrateSlots must exactly rebalance slots to the controller rule: existing masters in observed topology order, then new masters in EnsureNode order, with slots 0-16383 split as evenly as possible.
-- For replica ScaleIn, only remove extra replicas with ForgetNode, then DeleteNode, then VerifyCluster. Never remove a master, migrate slots, or reduce replicasPerShard below 1.
-- For shard ScaleIn, replace all old nodes: create spec.shards new master+replica groups using nextPodOrdinal, migrate every slot from old masters to the new masters balanced across only the new masters, then ForgetNode and DeleteNode every old pod before VerifyCluster. Do not change replicasPerShard in the same plan.
-- Every namespace param must equal the RedisCluster name.
-- Every new pod referenced by WaitNodeReady/MeetNode/ReplicateNode/AddSlots must be declared by a preceding EnsureNode.
-- All Redis pods must be named "redis-<N>" where <N> is a single non-negative integer. Do NOT embed the cluster name or any other prefix. Correct examples: redis-0, redis-1, redis-2. Wrong examples: redis-3s1r-0, redis-cluster-0, redis-example-0. Pod names are globally non-reusable. Create uses redis-0 upward; all later new pods must start at the provided nextPodOrdinal and must not fill historical gaps.
-- sourcePod and targetPod (or masterPod and replicaPod) must not be the same pod.`)
+	data, err := promptFS.ReadFile("prompts/invariants.md")
+	if err != nil {
+		panic("invariants.md not found in embedded FS")
+	}
+	return strings.TrimSpace(string(data))
 }
 
 func buildUserPrompt(req Request) string {
-	var b strings.Builder
-	fmt.Fprintf(&b, "RedisCluster name: %s\n", req.Spec.Name)
-	fmt.Fprintf(&b, "metadata.generation: %d\n\n", req.Spec.Generation)
-
-	b.WriteString("## Desired spec\n")
-	fmt.Fprintf(&b, "shards: %d\n", req.Spec.Shards)
-	fmt.Fprintf(&b, "replicasPerShard: %d\n", req.Spec.ReplicasPerShard)
-	fmt.Fprintf(&b, "image: %s\n", req.Spec.Image)
-	fmt.Fprintf(&b, "memorySize: %s\n\n", req.Spec.MemorySize)
-	fmt.Fprintf(&b, "nextPodOrdinal: %d\n\n", req.ObservedState.NextPodOrdinal)
-
-	b.WriteString("## Observed state\n")
-	writeObservedNodesTable(&b, req.ObservedState.Nodes)
-	b.WriteString("\n")
-
-	b.WriteString("## Task\n")
-	b.WriteString("Bring the cluster from the observed state to the desired spec. Pick whichever whitelisted action sequence you think is safest; the controller's Validator is the final safety net.\n")
-	b.WriteString("Return only the JSON plan.\n")
-	return b.String()
+	var buf bytes.Buffer
+	var tableBuf strings.Builder
+	writeObservedNodesTable(&tableBuf, req.ObservedState.Nodes)
+	err := userTmpl.Execute(&buf, map[string]any{
+		"Name":              req.Spec.Name,
+		"Generation":        req.Spec.Generation,
+		"Shards":            req.Spec.Shards,
+		"ReplicasPerShard":  req.Spec.ReplicasPerShard,
+		"Image":             req.Spec.Image,
+		"MemorySize":        req.Spec.MemorySize,
+		"NextPodOrdinal":    req.ObservedState.NextPodOrdinal,
+		"ObservedNodesTable": tableBuf.String(),
+	})
+	if err != nil {
+		panic(fmt.Sprintf("user prompt template: %v", err))
+	}
+	return buf.String()
 }
 
 func writeObservedNodesTable(b *strings.Builder, nodes []ObservedNode) {
