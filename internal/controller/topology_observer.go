@@ -183,6 +183,9 @@ func (e *ActionExecutor) CollectObservedNodes(ctx context.Context, cluster *v1al
 	} else {
 		entries = rediscluster.ParseNodes(raw)
 	}
+	if err := e.verifySlotCoverageFromMasters(ctx, entries); err != nil {
+		return nil, err
+	}
 	nodes := observedNodes(cluster, pods, entries)
 	logger.Info("collect observed nodes finished", "duration", time.Since(start), "nodes", len(nodes), "pods", len(pods), "entries", len(entries))
 	return nodes, nil
@@ -296,6 +299,67 @@ func observedNodes(cluster *v1alpha1.RedisCluster, pods []corev1.Pod, entries []
 		return out[i].NodeID < out[j].NodeID
 	})
 	return out
+}
+
+func (e *ActionExecutor) verifySlotCoverageFromMasters(ctx context.Context, entries []rediscluster.Entry) error {
+	if e.RedisFactory == nil {
+		return fmt.Errorf("slot verification: redis factory not set")
+	}
+	seedOwner, err := rediscluster.SlotOwnership(entries)
+	if err != nil {
+		return fmt.Errorf("slot verification: seed has conflicting assignments: %w", err)
+	}
+	if len(seedOwner) != 16384 {
+		return nil
+	}
+
+	slotOwners := map[string]bool{}
+	for _, id := range seedOwner {
+		slotOwners[id] = true
+	}
+	for _, entry := range entries {
+		if !slotOwners[entry.ID] {
+			continue
+		}
+		addr := rediscluster.IPFromAddr(entry.Addr)
+		rc, cerr := e.RedisFactory(addr)
+		if cerr != nil {
+			continue
+		}
+		if perr := rc.Ping(ctx); perr != nil {
+			rc.Close()
+			continue
+		}
+		infoRaw, ierr := rc.ClusterInfo(ctx)
+		if ierr != nil {
+			rc.Close()
+			continue
+		}
+		info := rediscluster.ParseInfo(infoRaw)
+		if !rediscluster.StateOK(info) {
+			rc.Close()
+			return fmt.Errorf("slot verification: master %s at %s cluster_state=%q", entry.ID, addr, info["cluster_state"])
+		}
+		nodesRaw, nerr := rc.ClusterNodes(ctx)
+		rc.Close()
+		if nerr != nil {
+			continue
+		}
+		masterEntries := rediscluster.ParseNodes(nodesRaw)
+		masterOwner, merr := rediscluster.SlotOwnership(masterEntries)
+		if merr != nil {
+			return fmt.Errorf("slot verification: master %s at %s has conflicting assignments: %w", entry.ID, addr, merr)
+		}
+		if len(masterOwner) != 16384 {
+			return fmt.Errorf("slot verification: master %s at %s sees %d slot owners, expected 16384", entry.ID, addr, len(masterOwner))
+		}
+		for slot, owner := range seedOwner {
+			if masterOwner[slot] != owner {
+				return fmt.Errorf("slot verification: master %s at %s disagrees on slot %d: seed says %s, master sees %s", entry.ID, addr, slot, owner, masterOwner[slot])
+			}
+		}
+	}
+	return nil
 }
 
 func fillObservedNode(n *plan.ObservedNode, entry rediscluster.Entry, nodeIDToPod map[string]string) {

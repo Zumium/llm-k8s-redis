@@ -403,9 +403,6 @@ func healableTopology(topology *ClusterTopology, spec ClusterSpec, observed []Ob
 	}
 	covered := map[int]string{}
 	for _, sh := range topology.Shards {
-		if sh.Master.Pod == "" || !sh.Master.Ready || sh.Master.Slots == "" {
-			return nil
-		}
 		slots, err := parseSlots(sh.Master.Slots)
 		if err != nil {
 			return nil
