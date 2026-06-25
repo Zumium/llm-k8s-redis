@@ -91,10 +91,10 @@ plan.Validator                (deterministic safety gate, internal/plan/validato
 A known-good test environment used for development. Keep this section in sync
 with `cluster-configs/` and the live `llm-config` ConfigMap.
 
-- **Host**: <ip> (user <user>, SSH key-based, sudo passwordless)
+- **Host**: `<ip>` (user `<user>`, SSH key-based, sudo passwordless)
 - **KIND cluster**: `kind`, 1 control-plane + 5 workers, K8s v1.36.1
   - Provisioned from `cluster-configs/kind-1-control-plane-5-workers.yaml`
-  - Managed with `<home-path>go/bin/kind` (v0.32.0)
+  - Managed with `<kind-binary-path>` (v0.32.0)
 - **Working tree on remote**: `~/projects/llm-k8s-redis` (not a git checkout;
   it's a tarball-synced copy of this repo). Re-sync from WSL with:
   ```bash
@@ -118,7 +118,7 @@ with `cluster-configs/` and the live `llm-config` ConfigMap.
   ssh <user>@<ip> \
     'cd /tmp/llm-k8s-redis-image && docker build -t controller:latest .'
   ssh <user>@<ip> \
-    '<home-path>go/bin/kind load docker-image controller:latest --name kind'
+    'kind load docker-image controller:latest --name kind'
   ssh <user>@<ip> \
     'kubectl -n redis-cluster-system rollout restart deployment/controller-manager &&
      kubectl -n redis-cluster-system rollout status deployment/controller-manager --timeout=120s &&
