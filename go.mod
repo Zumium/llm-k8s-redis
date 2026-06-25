@@ -1,4 +1,4 @@
-module github.com/example/llm-k8s-redis
+module github.com/Zumium/llm-k8s-redis
 
 go 1.26.0
 

@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/example/llm-k8s-redis/internal/plan"
+	"github.com/Zumium/llm-k8s-redis/internal/plan"
 )
 
 type LLMPlanner struct {

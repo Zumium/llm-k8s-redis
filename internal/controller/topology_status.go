@@ -9,9 +9,9 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	v1alpha1 "github.com/example/llm-k8s-redis/api/v1alpha1"
-	"github.com/example/llm-k8s-redis/internal/plan"
-	"github.com/example/llm-k8s-redis/internal/rediscluster"
+	v1alpha1 "github.com/Zumium/llm-k8s-redis/api/v1alpha1"
+	"github.com/Zumium/llm-k8s-redis/internal/plan"
+	"github.com/Zumium/llm-k8s-redis/internal/rediscluster"
 )
 
 func (r *RedisClusterReconciler) shouldRefreshTopology(ctx context.Context, c *v1alpha1.RedisCluster) bool {

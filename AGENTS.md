@@ -136,7 +136,7 @@ with `cluster-configs/` and the live `llm-config` ConfigMap.
 
 ## Module path caveat
 
-`go.mod` declares `module github.com/example/llm-k8s-redis` — a placeholder,
+`go.mod` declares `module github.com/Zumium/llm-k8s-redis`,
 not a real GitHub repo. Imports throughout the tree use this path. Do not
 rewrite imports to a different path without user instruction.
 

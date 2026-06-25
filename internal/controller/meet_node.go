@@ -8,8 +8,8 @@ import (
 
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
-	v1alpha1 "github.com/example/llm-k8s-redis/api/v1alpha1"
-	"github.com/example/llm-k8s-redis/internal/plan"
+	v1alpha1 "github.com/Zumium/llm-k8s-redis/api/v1alpha1"
+	"github.com/Zumium/llm-k8s-redis/internal/plan"
 )
 
 func (e *ActionExecutor) meetNode(ctx context.Context, cluster *v1alpha1.RedisCluster, p *plan.Plan, stepIndex int) (StepOutcome, error) {

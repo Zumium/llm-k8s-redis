@@ -10,9 +10,9 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	api "github.com/example/llm-k8s-redis/api/v1alpha1"
-	"github.com/example/llm-k8s-redis/internal/plan"
-	"github.com/example/llm-k8s-redis/internal/redis"
+	api "github.com/Zumium/llm-k8s-redis/api/v1alpha1"
+	"github.com/Zumium/llm-k8s-redis/internal/plan"
+	"github.com/Zumium/llm-k8s-redis/internal/redis"
 )
 
 const (

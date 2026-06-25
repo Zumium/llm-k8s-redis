@@ -8,8 +8,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	api "github.com/example/llm-k8s-redis/api/v1alpha1"
-	"github.com/example/llm-k8s-redis/internal/redis"
+	api "github.com/Zumium/llm-k8s-redis/api/v1alpha1"
+	"github.com/Zumium/llm-k8s-redis/internal/redis"
 )
 
 func TestObserveTopology_HappyPath(t *testing.T) {

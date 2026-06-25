@@ -2,7 +2,7 @@ domain: example.com
 layout:
 - go.kubebuilder.io/v4
 projectName: llm-k8s-redis
-repo: github.com/example/llm-k8s-redis
+repo: github.com/Zumium/llm-k8s-redis
 resources:
 - group: redis
   kind: RedisCluster

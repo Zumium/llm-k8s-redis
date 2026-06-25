@@ -11,10 +11,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
-	v1alpha1 "github.com/example/llm-k8s-redis/api/v1alpha1"
-	"github.com/example/llm-k8s-redis/internal/plan"
-	"github.com/example/llm-k8s-redis/internal/redis"
-	"github.com/example/llm-k8s-redis/internal/rediscluster"
+	v1alpha1 "github.com/Zumium/llm-k8s-redis/api/v1alpha1"
+	"github.com/Zumium/llm-k8s-redis/internal/plan"
+	"github.com/Zumium/llm-k8s-redis/internal/redis"
+	"github.com/Zumium/llm-k8s-redis/internal/rediscluster"
 )
 
 const (

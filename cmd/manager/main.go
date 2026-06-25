@@ -18,12 +18,12 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
-	api "github.com/example/llm-k8s-redis/api/v1alpha1"
-	"github.com/example/llm-k8s-redis/internal/controller"
-	"github.com/example/llm-k8s-redis/internal/plan"
-	"github.com/example/llm-k8s-redis/internal/planner"
-	"github.com/example/llm-k8s-redis/internal/rag"
-	"github.com/example/llm-k8s-redis/internal/redis"
+	api "github.com/Zumium/llm-k8s-redis/api/v1alpha1"
+	"github.com/Zumium/llm-k8s-redis/internal/controller"
+	"github.com/Zumium/llm-k8s-redis/internal/plan"
+	"github.com/Zumium/llm-k8s-redis/internal/planner"
+	"github.com/Zumium/llm-k8s-redis/internal/rag"
+	"github.com/Zumium/llm-k8s-redis/internal/redis"
 )
 
 var (
