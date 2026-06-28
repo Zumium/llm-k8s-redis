@@ -345,7 +345,7 @@ func validateReplicaScaleIn(p *Plan, spec ClusterSpec, topology *ClusterTopology
 			replicaMaster[r.Pod] = sh.Master.Pod
 		}
 	}
-		if total == 0 {
+	if total == 0 {
 		return verr("Reduce spec.replicasPerShard to a value lower than the current replica count",
 			"replicasPerShard is not lower than current topology")
 	}

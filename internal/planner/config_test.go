@@ -96,12 +96,12 @@ func TestParseConfig_BadValues(t *testing.T) {
 
 func TestParseConfig_EmbeddingAllSet(t *testing.T) {
 	config, err := ParseConfig(map[string]string{
-		"baseUrl":           "u",
-		"apiKey":            "k",
-		"model":             "m",
-		"embeddingModel":    "text-embedding-3-small",
-		"embeddingBaseUrl":  "https://api.openai.com/v1",
-		"embeddingApiKey":   "sk-emb",
+		"baseUrl":          "u",
+		"apiKey":           "k",
+		"model":            "m",
+		"embeddingModel":   "text-embedding-3-small",
+		"embeddingBaseUrl": "https://api.openai.com/v1",
+		"embeddingApiKey":  "sk-emb",
 	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
