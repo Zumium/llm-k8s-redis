@@ -4,13 +4,17 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"github.com/Zumium/llm-k8s-redis/internal/plan"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 type LLMPlanner struct {
 	LLMClient LLMClient
 }
+
+const llmPlanTimeout = 2 * time.Minute
 
 func NewLLMPlanner(llmClient LLMClient) *LLMPlanner {
 	return &LLMPlanner{LLMClient: llmClient}
@@ -20,15 +24,27 @@ func (p *LLMPlanner) Plan(ctx context.Context, req Request) (*plan.Plan, error) 
 	if p.LLMClient == nil {
 		return nil, fmt.Errorf("llm planner: client is nil")
 	}
+	ctx, cancel := context.WithTimeout(ctx, llmPlanTimeout)
+	defer cancel()
 
+	logger := log.FromContext(ctx)
+	start := time.Now()
+	logger.Info("llm analysis request started")
 	analysisJSON, err := p.askLLMForAnalysisJSON(ctx, req)
 	if err != nil {
+		logger.Error(err, "llm analysis request failed", "duration", time.Since(start))
 		return nil, err
 	}
+	logger.Info("llm analysis request finished", "duration", time.Since(start))
+
+	start = time.Now()
+	logger.Info("llm plan request started")
 	planJSON, err := p.askLLMForPlanJSON(ctx, req, analysisJSON)
 	if err != nil {
+		logger.Error(err, "llm plan request failed", "duration", time.Since(start))
 		return nil, err
 	}
+	logger.Info("llm plan request finished", "duration", time.Since(start))
 	generatedPlan, err := parsePlanJSON(planJSON)
 	if err != nil {
 		return nil, err
@@ -70,11 +86,15 @@ func buildAnalysisLLMRequest(req Request) LLMRequest {
 func buildLLMRequest(req Request, analysisJSON string) (LLMRequest, error) {
 	system := buildSystemPrompt()
 	prompt := buildUserPrompt(req)
+	planTask := "Use the subprocess analysis above as planning context. Return only the JSON plan."
+	if examples := workedExamplesForAnalysis(analysisJSON); examples != "" {
+		planTask += "\n\n## Worked examples\n" + examples
+	}
 	messages := []LLMMessage{
 		{Role: "system", Content: system},
 		{Role: "user", Content: prompt},
 		{Role: "assistant", Content: analysisJSON},
-		{Role: "user", Content: "Use the subprocess analysis above as planning context. Return only the JSON plan."},
+		{Role: "user", Content: planTask},
 	}
 	for _, feedback := range req.ValidationFeedback {
 		rejectedPlan, err := json.Marshal(feedback.RejectedPlan)

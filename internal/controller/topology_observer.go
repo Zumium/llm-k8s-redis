@@ -155,12 +155,52 @@ func (e *ActionExecutor) CollectObservedNodes(ctx context.Context, cluster *v1al
 	logger.Info("collect observed nodes pods listed", "pods", len(pods))
 
 	entries := []rediscluster.Entry{}
-	seed, ok := pickObservationSeedPod(cluster, pods)
-	if !ok {
+	seeds := observationSeedPods(cluster, pods)
+	if len(seeds) == 0 {
 		nodes := observedNodes(cluster, pods, entries)
 		logger.Info("collect observed nodes no seed pod", "duration", time.Since(start), "nodes", len(nodes), "pods", len(pods))
 		return nodes, nil
 	}
+
+	entries, err := e.collectBestClusterNodes(ctx, seeds)
+	if err != nil {
+		return nil, err
+	}
+	if err := e.verifySlotCoverageFromMasters(ctx, entries); err != nil {
+		return nil, err
+	}
+	nodes := observedNodes(cluster, pods, entries)
+	logger.Info("collect observed nodes finished", "duration", time.Since(start), "nodes", len(nodes), "pods", len(pods), "entries", len(entries))
+	return nodes, nil
+}
+
+func (e *ActionExecutor) collectBestClusterNodes(ctx context.Context, seeds []corev1.Pod) ([]rediscluster.Entry, error) {
+	best := []rediscluster.Entry{}
+	var lastErr error
+	for _, seed := range seeds {
+		entries, err := e.clusterNodesFromSeed(ctx, seed)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if len(entries) > len(best) {
+			best = entries
+		}
+		if ownsAllSlots(entries) {
+			return entries, nil
+		}
+	}
+	if len(best) > 0 {
+		return best, nil
+	}
+	if lastErr == nil {
+		return best, nil
+	}
+	return nil, lastErr
+}
+
+func (e *ActionExecutor) clusterNodesFromSeed(ctx context.Context, seed corev1.Pod) ([]rediscluster.Entry, error) {
+	logger := log.FromContext(ctx)
 	addr := podRedisAddr(&seed)
 	logger.Info("collect observed nodes seed selected", "pod", seed.Name, "addr", addr)
 	rc, err := e.RedisFactory(addr)
@@ -173,22 +213,19 @@ func (e *ActionExecutor) CollectObservedNodes(ctx context.Context, cluster *v1al
 	pingStart := time.Now()
 	if err := rc.Ping(ctx); err != nil {
 		logger.Error(err, "collect observed nodes seed ping failed", "addr", addr, "duration", time.Since(pingStart))
-		return nil, fmt.Errorf("seed redis at %s not reachable: %w", addr, err)
+		return nil, fmt.Errorf("seed redis at %s failed: %w", addr, err)
 	}
 	logger.Info("collect observed nodes seed ping succeeded", "addr", addr, "duration", time.Since(pingStart))
+
 	nodesStart := time.Now()
-	if raw, err := rc.ClusterNodes(ctx); err != nil {
+	raw, err := rc.ClusterNodes(ctx)
+	if err != nil {
 		logger.Error(err, "collect observed nodes cluster nodes failed", "addr", addr, "duration", time.Since(nodesStart))
-		return nil, fmt.Errorf("seed redis at %s CLUSTER NODES failed: %w", addr, err)
-	} else {
-		entries = rediscluster.ParseNodes(raw)
+		return nil, fmt.Errorf("seed redis at %s failed: %w", addr, err)
 	}
-	if err := e.verifySlotCoverageFromMasters(ctx, entries); err != nil {
-		return nil, err
-	}
-	nodes := observedNodes(cluster, pods, entries)
-	logger.Info("collect observed nodes finished", "duration", time.Since(start), "nodes", len(nodes), "pods", len(pods), "entries", len(entries))
-	return nodes, nil
+	entries := rediscluster.ParseNodes(raw)
+	logger.Info("collect observed nodes seed read", "addr", addr, "duration", time.Since(nodesStart), "entries", len(entries))
+	return entries, nil
 }
 
 func (e *ActionExecutor) listManagedPods(ctx context.Context, cluster *v1alpha1.RedisCluster) ([]corev1.Pod, StepOutcome, bool) {
@@ -228,19 +265,49 @@ func pickSeedPod(pods []corev1.Pod) (corev1.Pod, bool) {
 }
 
 func pickObservationSeedPod(cluster *v1alpha1.RedisCluster, pods []corev1.Pod) (corev1.Pod, bool) {
+	seeds := observationSeedPods(cluster, pods)
+	if len(seeds) == 0 {
+		return corev1.Pod{}, false
+	}
+	return seeds[0], true
+}
+
+func observationSeedPods(cluster *v1alpha1.RedisCluster, pods []corev1.Pod) []corev1.Pod {
 	podsByName := map[string]corev1.Pod{}
 	for _, p := range pods {
 		podsByName[p.Name] = p
 	}
+	out := []corev1.Pod{}
+	seen := map[string]bool{}
 	if cluster != nil && cluster.Status.Topology != nil {
 		for _, sh := range cluster.Status.Topology.Shards {
 			p, ok := podsByName[sh.Master.Pod]
 			if ok && podReady(&p) && p.Status.PodIP != "" {
-				return p, true
+				out = append(out, p)
+				seen[p.Name] = true
 			}
 		}
 	}
-	return pickSeedPod(pods)
+	ready := []corev1.Pod{}
+	for _, p := range pods {
+		if !seen[p.Name] && podReady(&p) && p.Status.PodIP != "" {
+			ready = append(ready, p)
+		}
+	}
+	sort.Slice(ready, func(i, j int) bool {
+		ai, aok := controllerRedisPodOrdinal(ready[i].Name)
+		bi, bok := controllerRedisPodOrdinal(ready[j].Name)
+		if aok && bok {
+			return ai < bi
+		}
+		return ready[i].Name < ready[j].Name
+	})
+	return append(out, ready...)
+}
+
+func ownsAllSlots(entries []rediscluster.Entry) bool {
+	owners, err := rediscluster.SlotOwnership(entries)
+	return err == nil && len(owners) == 16384
 }
 
 func observedNodes(cluster *v1alpha1.RedisCluster, pods []corev1.Pod, entries []rediscluster.Entry) []plan.ObservedNode {

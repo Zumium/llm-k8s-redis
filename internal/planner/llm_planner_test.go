@@ -6,6 +6,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Zumium/llm-k8s-redis/internal/plan"
 )
@@ -30,6 +31,13 @@ func (c *recordingLLMClient) Complete(_ context.Context, req LLMRequest) (*LLMRe
 		return resp, nil
 	}
 	return c.resp, nil
+}
+
+type blockingLLMClient struct{}
+
+func (c blockingLLMClient) Complete(ctx context.Context, _ LLMRequest) (*LLMResponse, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
 }
 
 func sampleSpec() plan.ClusterSpec {
@@ -62,6 +70,13 @@ func validAnalysisJSON() string {
 func recordingClientWithPlan() *recordingLLMClient {
 	return &recordingLLMClient{resps: []*LLMResponse{
 		{Text: validAnalysisJSON()},
+		{Text: validMinimalPlanJSON()},
+	}}
+}
+
+func recordingClientWithAnalysis(analysis string) *recordingLLMClient {
+	return &recordingLLMClient{resps: []*LLMResponse{
+		{Text: analysis},
 		{Text: validMinimalPlanJSON()},
 	}}
 }
@@ -123,6 +138,14 @@ func TestLLMPlanner_NilClient(t *testing.T) {
 	}
 }
 
+func TestLLMPlanner_TimesOutLLMCall(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
+	defer cancel()
+	if _, err := NewLLMPlanner(blockingLLMClient{}).Plan(ctx, Request{Spec: sampleSpec()}); err == nil {
+		t.Fatal("expected timeout error")
+	}
+}
+
 func TestLLMPlanner_PromptContainsSpec(t *testing.T) {
 	llmClient := recordingClientWithPlan()
 	_, _ = NewLLMPlanner(llmClient).Plan(context.Background(), Request{
@@ -161,6 +184,53 @@ func TestLLMPlanner_PromptContainsSpec(t *testing.T) {
 	}
 	if !strings.Contains(llmClient.lastReq.Messages[3].Content, "analysis above") {
 		t.Fatalf("plan prompt does not reference analysis")
+	}
+}
+
+func TestLLMPlanner_AddsExamplesForSpecChangeAnalysis(t *testing.T) {
+	llmClient := recordingClientWithPlan()
+	_, _ = NewLLMPlanner(llmClient).Plan(context.Background(), Request{Spec: sampleSpec()})
+
+	content := llmClient.lastReq.Messages[3].Content
+	for _, want := range []string{"## Worked examples", "create-001", "replica-scaleout-001", "shard-scaleout-001"} {
+		if !strings.Contains(content, want) {
+			t.Fatalf("plan prompt missing %q", want)
+		}
+	}
+}
+
+func TestLLMPlanner_AddsExamplesForEachAnalysisLabel(t *testing.T) {
+	cases := []struct {
+		analysis string
+		want     string
+		dontWant string
+	}{
+		{`{"subprocesses":["repairTopology"],"summary":"repair only"}`, "repair-missing-replica-001", "cleanup-ghost-001"},
+		{`{"subprocesses":["cleanupGhostNodes"],"summary":"ghost cleanup"}`, "cleanup-ghost-001", "cleanup-dirty-001"},
+		{`{"subprocesses":["cleanupDirtyNodes"],"summary":"dirty cleanup"}`, "cleanup-dirty-001", "repair-missing-replica-001"},
+		{`{"subprocesses":["changeClusterSpec"],"summary":"spec change"}`, "shard-scaleout-001", "cleanup-ghost-001"},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.want, func(t *testing.T) {
+			llmClient := recordingClientWithAnalysis(testCase.analysis)
+			_, _ = NewLLMPlanner(llmClient).Plan(context.Background(), Request{Spec: sampleSpec()})
+			content := llmClient.lastReq.Messages[3].Content
+			if !strings.Contains(content, testCase.want) {
+				t.Fatalf("plan prompt missing %q", testCase.want)
+			}
+			if strings.Contains(content, testCase.dontWant) {
+				t.Fatalf("plan prompt unexpectedly contains %q", testCase.dontWant)
+			}
+		})
+	}
+}
+
+func TestLLMPlanner_SkipsExamplesForUnknownAnalysis(t *testing.T) {
+	llmClient := recordingClientWithAnalysis(`{"subprocesses":[],"summary":"no matching examples"}`)
+	_, _ = NewLLMPlanner(llmClient).Plan(context.Background(), Request{Spec: sampleSpec()})
+
+	if strings.Contains(llmClient.lastReq.Messages[3].Content, "## Worked examples") {
+		t.Fatalf("plan prompt should not include worked examples")
 	}
 }
 
@@ -246,10 +316,37 @@ func observedThreeShardOneReplica() []ObservedNode {
 	}
 }
 
-func systemPromptPlans(t *testing.T) []plan.Plan {
+func observedTwoShardOneReplica() []ObservedNode {
+	return []ObservedNode{
+		{Pod: "redis-0", PodExists: true, RedisSeen: true, NodeID: "node-0", Role: "master", Slots: "0-8191", Ready: true},
+		{Pod: "redis-1", PodExists: true, RedisSeen: true, NodeID: "node-1", Role: "replica", MasterID: "node-0", MasterPod: "redis-0", Ready: true},
+		{Pod: "redis-2", PodExists: true, RedisSeen: true, NodeID: "node-2", Role: "master", Slots: "8192-16383", Ready: true},
+		{Pod: "redis-3", PodExists: true, RedisSeen: true, NodeID: "node-3", Role: "replica", MasterID: "node-2", MasterPod: "redis-2", Ready: true},
+	}
+}
+
+func observedMissingReplica() []ObservedNode {
+	return []ObservedNode{
+		{Pod: "redis-0", PodExists: true, RedisSeen: true, NodeID: "node-0", Role: "master", Slots: "0-8191", Ready: true},
+		{Pod: "redis-1", PodExists: true, RedisSeen: true, NodeID: "node-1", Role: "replica", MasterID: "node-0", MasterPod: "redis-0", Ready: true},
+		{Pod: "redis-2", PodExists: true, RedisSeen: true, NodeID: "node-2", Role: "master", Slots: "8192-16383", Ready: true},
+	}
+}
+
+func observedWithGhost() []ObservedNode {
+	nodes := observedTwoShardOneReplica()
+	return append(nodes, ObservedNode{Pod: "redis-4", PodExists: false, RedisSeen: true, NodeID: "node-4", Role: "replica", Flags: []string{"slave", "fail"}})
+}
+
+func observedWithDirtyPod() []ObservedNode {
+	nodes := observedTwoShardOneReplica()
+	return append(nodes, ObservedNode{Pod: "redis-4", PodExists: true, RedisSeen: false, Ready: true})
+}
+
+func plansFromPrompt(t *testing.T, prompt string) []plan.Plan {
 	t.Helper()
 	var plans []plan.Plan
-	for _, part := range strings.Split(buildSystemPrompt(), "```json")[1:] {
+	for _, part := range strings.Split(prompt, "```json")[1:] {
 		block, _, ok := strings.Cut(part, "```")
 		if !ok {
 			t.Fatal("unterminated json fence")
@@ -262,15 +359,27 @@ func systemPromptPlans(t *testing.T) []plan.Plan {
 	return plans
 }
 
-func TestSystemPromptExamplesAreValid(t *testing.T) {
+func TestSystemPromptDoesNotIncludeWorkedExamples(t *testing.T) {
+	systemPrompt := buildSystemPrompt()
+	if strings.Contains(systemPrompt, "## Worked examples") {
+		t.Fatal("system prompt should not include worked examples")
+	}
+}
+
+func TestWorkedExamplesAreValid(t *testing.T) {
 	observed := observedThreeShardOneReplica()
+	twoShardSpec := plan.ClusterSpec{Name: "example", Generation: 1, Shards: 2, ReplicasPerShard: 1, Image: "redis:7.2", MemorySize: "2Gi"}
 	inputs := map[string]any{
-		"create-001":           plan.ClusterSpec{Name: "example", Generation: 1, Shards: 3, ReplicasPerShard: 1, Image: "redis:7", MemorySize: "1Gi"},
-		"replica-scaleout-001": plan.ValidationContext{Spec: plan.ClusterSpec{Name: "example", Generation: 2, Shards: 3, ReplicasPerShard: 2, Image: "redis:7", MemorySize: "1Gi"}, NextPodOrdinal: 6, ObservedNodes: observed},
-		"shard-scaleout-001":   plan.ValidationContext{Spec: plan.ClusterSpec{Name: "example", Generation: 3, Shards: 4, ReplicasPerShard: 1, Image: "redis:7", MemorySize: "1Gi"}, NextPodOrdinal: 6, ObservedNodes: observed},
+		"create-001":                 plan.ClusterSpec{Name: "example", Generation: 1, Shards: 3, ReplicasPerShard: 1, Image: "redis:7", MemorySize: "1Gi"},
+		"replica-scaleout-001":       plan.ValidationContext{Spec: plan.ClusterSpec{Name: "example", Generation: 2, Shards: 3, ReplicasPerShard: 2, Image: "redis:7", MemorySize: "1Gi"}, NextPodOrdinal: 6, ObservedNodes: observed},
+		"shard-scaleout-001":         plan.ValidationContext{Spec: plan.ClusterSpec{Name: "example", Generation: 3, Shards: 4, ReplicasPerShard: 1, Image: "redis:7", MemorySize: "1Gi"}, NextPodOrdinal: 6, ObservedNodes: observed},
+		"repair-missing-replica-001": plan.ValidationContext{Spec: twoShardSpec, NextPodOrdinal: 3, ObservedNodes: observedMissingReplica()},
+		"cleanup-ghost-001":          plan.ValidationContext{Spec: twoShardSpec, NextPodOrdinal: 4, ObservedNodes: observedWithGhost()},
+		"cleanup-dirty-001":          plan.ValidationContext{Spec: twoShardSpec, NextPodOrdinal: 5, ObservedNodes: observedWithDirtyPod()},
 	}
 	seen := map[string]bool{}
-	for _, p := range systemPromptPlans(t) {
+	allExamples := workedExamplesForAnalysis(`{"subprocesses":["repairTopology","cleanupGhostNodes","cleanupDirtyNodes","changeClusterSpec"],"summary":"all examples"}`)
+	for _, p := range plansFromPrompt(t, allExamples) {
 		input, ok := inputs[p.PlanID]
 		if !ok {
 			continue

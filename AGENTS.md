@@ -101,8 +101,10 @@ plan.Validator
 
 ## Verification
 
-Delegate local tests, deployment, and remote test-like verification to OpenCode
-using model `deepseek-v4-flash` with `--variant max`.
+Delegate local tests, deployment, and remote test-like verification completely to
+OpenCode using model `deepseek-v4-flash` with `--variant max`. Codex should not
+run verification commands directly; it should ask OpenCode to run them and report
+OpenCode's results.
 
 After touching `api/`, `internal/`, or `cmd/`:
 

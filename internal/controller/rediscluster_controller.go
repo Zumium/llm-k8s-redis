@@ -184,12 +184,14 @@ func (r *RedisClusterReconciler) handleActivePlan(ctx context.Context, cluster *
 		return res, err, true
 	case plan.PlanStateFailed:
 		if topologyMatchesSpec(cluster.Status.Topology, spec) {
+			r.event(cluster, "PlanFailedCleared", failedPlanMessage(active))
 			cluster.Status.ActivePlan = nil
 			markNoPlanNeeded(cluster, "topology already matches spec")
 			logger.Info("failed plan cleared because topology matches spec", "planID", active.ID)
 			res, err := r.finish(ctx, cluster, ctrl.Result{RequeueAfter: r.TopologyRefreshInterval}, nil)
 			return res, err, true
 		}
+		r.event(cluster, "PlanFailedCleared", failedPlanMessage(active))
 		cluster.Status.ActivePlan = nil
 		setCondition(cluster, ConditionReady, metav1.ConditionFalse, "Replanning", "topology drifted")
 		setCondition(cluster, ConditionPlanned, metav1.ConditionFalse, "PlanSuperseded", "existing plan no longer valid")

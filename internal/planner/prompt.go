@@ -56,9 +56,32 @@ func actionReference() string {
 }
 
 func safetyInvariants() string {
-	data, err := promptFS.ReadFile("prompts/invariants.md")
+	return promptFile("prompts/invariants.md")
+}
+
+func workedExamplesForAnalysis(analysisJSON string) string {
+	exampleFiles := []struct {
+		label string
+		file  string
+	}{
+		{`"repairTopology"`, "prompts/examples_repair_topology.md"},
+		{`"cleanupGhostNodes"`, "prompts/examples_cleanup_ghost_nodes.md"},
+		{`"cleanupDirtyNodes"`, "prompts/examples_cleanup_dirty_nodes.md"},
+		{`"changeClusterSpec"`, "prompts/examples_change_cluster_spec.md"},
+	}
+	var examples []string
+	for _, exampleFile := range exampleFiles {
+		if strings.Contains(analysisJSON, exampleFile.label) {
+			examples = append(examples, promptFile(exampleFile.file))
+		}
+	}
+	return strings.Join(examples, "\n\n")
+}
+
+func promptFile(name string) string {
+	data, err := promptFS.ReadFile(name)
 	if err != nil {
-		panic("invariants.md not found in embedded FS")
+		panic(fmt.Sprintf("%s not found in embedded FS", name))
 	}
 	return strings.TrimSpace(string(data))
 }

@@ -90,6 +90,18 @@ func planToStatus(p *plan.Plan) (*v1alpha1.PlanStatus, error) {
 	}, nil
 }
 
+func failedPlanMessage(active *v1alpha1.PlanStatus) string {
+	msg := "active plan failed"
+	if active != nil {
+		for _, s := range active.Steps {
+			if s.Status == string(plan.StepStateFailed) && s.Message != "" {
+				return s.Message
+			}
+		}
+	}
+	return msg
+}
+
 func statusToPlan(ps *v1alpha1.PlanStatus) (*plan.Plan, error) {
 	steps := make([]plan.Step, len(ps.Steps))
 	for i, s := range ps.Steps {

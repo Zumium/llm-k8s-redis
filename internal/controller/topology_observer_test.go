@@ -248,6 +248,45 @@ func TestCollectObservedNodes_JoinsPodsRedisAndLastKnownTopology(t *testing.T) {
 	}
 }
 
+func TestCollectObservedNodes_UsesMostCompleteSeedSnapshot(t *testing.T) {
+	ctx := context.Background()
+	cluster := testCluster()
+	cluster.Status.Topology = &api.ClusterTopology{Shards: []api.ShardTopology{
+		{Master: api.NodeTopology{Pod: "redis-14"}},
+	}}
+	pods := []*corev1.Pod{
+		vcPod("redis-14", "10.0.0.14", true),
+		vcPod("redis-0", "10.0.0.1", true),
+		vcPod("redis-1", "10.0.0.2", true),
+		vcPod("redis-2", "10.0.0.3", true),
+		vcPod("redis-3", "10.0.0.4", true),
+	}
+	exec := vcExec(t, cluster, pods, nil)
+	exec.RedisFactory = func(addr string) (redis.Client, error) {
+		if addr == "10.0.0.14:6379" {
+			return &fakeRedisClient{clusterNodes: func() (string, error) {
+				return "new 10.0.0.14:6379@16379 master - 0 0 1 connected\n" +
+					vcMaster0ID + " 10.0.0.1:6379@16379 master - 0 0 2 connected 0-8191\n", nil
+			}}, nil
+		}
+		return &fakeRedisClient{clusterNodes: func() (string, error) { return clusterOK(), nil }}, nil
+	}
+
+	nodes, err := exec.CollectObservedNodes(ctx, cluster)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(nodes) != 5 {
+		t.Fatalf("expected complete Redis snapshot plus replacement pod, got %#v", nodes)
+	}
+	if nodes[0].Pod != "redis-0" || nodes[0].NodeID != vcMaster0ID || nodes[0].Slots != "0-8191" {
+		t.Fatalf("expected complete seed facts for redis-0, got %#v", nodes[0])
+	}
+	if nodes[4].Pod != "redis-14" || nodes[4].RedisSeen {
+		t.Fatalf("expected redis-14 to remain pod-only, got %#v", nodes[4])
+	}
+}
+
 func TestObserveTopology_FactoryError(t *testing.T) {
 	ctx := context.Background()
 	cluster := testCluster()
