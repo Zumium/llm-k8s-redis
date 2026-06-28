@@ -21,7 +21,11 @@ func (p *LLMPlanner) Plan(ctx context.Context, req Request) (*plan.Plan, error) 
 		return nil, fmt.Errorf("llm planner: client is nil")
 	}
 
-	planJSON, err := p.askLLMForPlanJSON(ctx, req)
+	analysisJSON, err := p.askLLMForAnalysisJSON(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	planJSON, err := p.askLLMForPlanJSON(ctx, req, analysisJSON)
 	if err != nil {
 		return nil, err
 	}
@@ -33,12 +37,20 @@ func (p *LLMPlanner) Plan(ctx context.Context, req Request) (*plan.Plan, error) 
 	return generatedPlan, nil
 }
 
-func (p *LLMPlanner) askLLMForPlanJSON(ctx context.Context, req Request) (string, error) {
-	llmReq, err := buildLLMRequest(req)
+func (p *LLMPlanner) askLLMForAnalysisJSON(ctx context.Context, req Request) (string, error) {
+	return p.complete(ctx, buildAnalysisLLMRequest(req))
+}
+
+func (p *LLMPlanner) askLLMForPlanJSON(ctx context.Context, req Request, analysisJSON string) (string, error) {
+	llmReq, err := buildLLMRequest(req, analysisJSON)
 	if err != nil {
 		return "", err
 	}
-	response, err := p.LLMClient.Complete(ctx, llmReq)
+	return p.complete(ctx, llmReq)
+}
+
+func (p *LLMPlanner) complete(ctx context.Context, req LLMRequest) (string, error) {
+	response, err := p.LLMClient.Complete(ctx, req)
 	if err != nil {
 		return "", fmt.Errorf("llm complete: %w", err)
 	}
@@ -48,12 +60,21 @@ func (p *LLMPlanner) askLLMForPlanJSON(ctx context.Context, req Request) (string
 	return response.Text, nil
 }
 
-func buildLLMRequest(req Request) (LLMRequest, error) {
+func buildAnalysisLLMRequest(req Request) LLMRequest {
+	return LLMRequest{Messages: []LLMMessage{
+		{Role: "system", Content: buildSystemPrompt()},
+		{Role: "user", Content: buildAnalysisPrompt(req)},
+	}}
+}
+
+func buildLLMRequest(req Request, analysisJSON string) (LLMRequest, error) {
 	system := buildSystemPrompt()
 	prompt := buildUserPrompt(req)
 	messages := []LLMMessage{
 		{Role: "system", Content: system},
 		{Role: "user", Content: prompt},
+		{Role: "assistant", Content: analysisJSON},
+		{Role: "user", Content: "Use the subprocess analysis above as planning context. Return only the JSON plan."},
 	}
 	for _, feedback := range req.ValidationFeedback {
 		rejectedPlan, err := json.Marshal(feedback.RejectedPlan)

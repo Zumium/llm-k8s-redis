@@ -322,7 +322,7 @@ func TestFinish_StatusConflictRequeuesWithoutError(t *testing.T) {
 	scheme := newScheme(t)
 	base := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&api.RedisCluster{}).Build()
 	conflict := apierrors.NewConflict(schema.GroupResource{Group: "redis.example.com", Resource: "redisclusters"}, "example", errors.New("stale resourceVersion"))
-	r := &RedisClusterReconciler{Client: statusUpdateErrorClient{Client: base, err: conflict}}
+	r := &RedisClusterReconciler{Client: statusUpdateErrorClient{Client: base, err: conflict}, APIReader: base}
 
 	res, err := r.finish(ctx, &api.RedisCluster{ObjectMeta: metav1.ObjectMeta{Name: "example"}}, ctrl.Result{Requeue: true}, nil)
 	if err != nil {

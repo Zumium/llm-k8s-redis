@@ -55,8 +55,20 @@ func validMinimalPlanJSON() string {
 	return string(b)
 }
 
+func validAnalysisJSON() string {
+	return `{"subprocesses":["changeClusterSpec"],"summary":"scale toward desired spec"}`
+}
+
+func recordingClientWithPlan() *recordingLLMClient {
+	return &recordingLLMClient{resps: []*LLMResponse{
+		{Text: validAnalysisJSON()},
+		{Text: validMinimalPlanJSON()},
+	}}
+}
+
 func TestLLMPlanner_ValidPlan(t *testing.T) {
-	p := NewLLMPlanner(&recordingLLMClient{resp: &LLMResponse{Text: validMinimalPlanJSON()}})
+	llmClient := recordingClientWithPlan()
+	p := NewLLMPlanner(llmClient)
 
 	got, err := p.Plan(context.Background(), Request{Spec: sampleSpec()})
 	if err != nil {
@@ -65,6 +77,9 @@ func TestLLMPlanner_ValidPlan(t *testing.T) {
 	if got.TargetGeneration != 3 || len(got.Steps) != 1 {
 		t.Fatalf("plan = %#v", got)
 	}
+	if len(llmClient.reqs) != 2 {
+		t.Fatalf("llm calls = %d", len(llmClient.reqs))
+	}
 }
 
 func TestLLMPlanner_InvalidResponses(t *testing.T) {
@@ -72,7 +87,7 @@ func TestLLMPlanner_InvalidResponses(t *testing.T) {
 		name      string
 		llmClient *recordingLLMClient
 	}{
-		{name: "invalid json", llmClient: &recordingLLMClient{resp: &LLMResponse{Text: "not json"}}},
+		{name: "invalid plan json", llmClient: &recordingLLMClient{resps: []*LLMResponse{{Text: validAnalysisJSON()}, {Text: "not json"}}}},
 		{name: "empty text", llmClient: &recordingLLMClient{resp: &LLMResponse{Text: ""}}},
 		{name: "client error", llmClient: &recordingLLMClient{err: errors.New("network down")}},
 	}
@@ -93,7 +108,7 @@ func TestLLMPlanner_FixesDSLVersionAndGeneration(t *testing.T) {
 	m["targetGeneration"] = 999
 	fixed, _ := json.Marshal(m)
 
-	got, err := NewLLMPlanner(&recordingLLMClient{resp: &LLMResponse{Text: string(fixed)}}).Plan(context.Background(), Request{Spec: sampleSpec()})
+	got, err := NewLLMPlanner(&recordingLLMClient{resps: []*LLMResponse{{Text: validAnalysisJSON()}, {Text: string(fixed)}}}).Plan(context.Background(), Request{Spec: sampleSpec()})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -109,7 +124,7 @@ func TestLLMPlanner_NilClient(t *testing.T) {
 }
 
 func TestLLMPlanner_PromptContainsSpec(t *testing.T) {
-	llmClient := &recordingLLMClient{resp: &LLMResponse{Text: validMinimalPlanJSON()}}
+	llmClient := recordingClientWithPlan()
 	_, _ = NewLLMPlanner(llmClient).Plan(context.Background(), Request{
 		Spec: sampleSpec(),
 		ObservedState: ObservedState{
@@ -128,7 +143,7 @@ func TestLLMPlanner_PromptContainsSpec(t *testing.T) {
 		},
 	})
 
-	for _, want := range []string{"Redis Cluster operations planner", "redis.ops/v1alpha1", "CLUSTER NODES"} {
+	for _, want := range []string{"Redis Cluster operations planner", "redis.ops/v1alpha1", "CLUSTER NODES", "Repair observed topology drift", "ghost node"} {
 		if llmClient.lastReq.Messages[0].Role != "system" || !strings.Contains(llmClient.lastReq.Messages[0].Content, want) {
 			t.Errorf("system prompt missing %q", want)
 		}
@@ -138,10 +153,19 @@ func TestLLMPlanner_PromptContainsSpec(t *testing.T) {
 			t.Errorf("user prompt missing %q", want)
 		}
 	}
+	if !strings.Contains(llmClient.reqs[0].Messages[1].Content, "repairTopology, cleanupGhostNodes, cleanupDirtyNodes, changeClusterSpec") {
+		t.Fatalf("analysis prompt missing subprocess labels")
+	}
+	if !strings.Contains(llmClient.lastReq.Messages[2].Content, validAnalysisJSON()) {
+		t.Fatalf("plan prompt missing subprocess analysis")
+	}
+	if !strings.Contains(llmClient.lastReq.Messages[3].Content, "analysis above") {
+		t.Fatalf("plan prompt does not reference analysis")
+	}
 }
 
 func TestLLMPlanner_PromptContainsActionSemantics(t *testing.T) {
-	llmClient := &recordingLLMClient{resp: &LLMResponse{Text: validMinimalPlanJSON()}}
+	llmClient := recordingClientWithPlan()
 	_, _ = NewLLMPlanner(llmClient).Plan(context.Background(), Request{Spec: sampleSpec()})
 
 	systemPrompt := llmClient.lastReq.Messages[0].Content
@@ -171,7 +195,7 @@ func TestLLMPlanner_PromptContainsActionSemantics(t *testing.T) {
 }
 
 func TestLLMPlanner_FeedbackUsesMessageHistory(t *testing.T) {
-	llmClient := &recordingLLMClient{resp: &LLMResponse{Text: validMinimalPlanJSON()}}
+	llmClient := recordingClientWithPlan()
 	rejectedPlan := &plan.Plan{PlanID: "bad-plan", Steps: []plan.Step{{ID: "bad", Action: plan.ActionAddSlots}}}
 
 	_, err := NewLLMPlanner(llmClient).Plan(context.Background(), Request{
@@ -185,13 +209,13 @@ func TestLLMPlanner_FeedbackUsesMessageHistory(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	messages := llmClient.lastReq.Messages
-	if len(messages) != 4 {
+	if len(messages) != 6 {
 		t.Fatalf("messages = %#v", messages)
 	}
-	if messages[0].Role != "system" || messages[1].Role != "user" || messages[2].Role != "assistant" || messages[3].Role != "user" {
+	if messages[0].Role != "system" || messages[1].Role != "user" || messages[2].Role != "assistant" || messages[3].Role != "user" || messages[4].Role != "assistant" || messages[5].Role != "user" {
 		t.Fatalf("messages = %#v", messages)
 	}
-	for _, want := range []string{"RedisCluster name: example", "bad-plan", "slot coverage is incomplete"} {
+	for _, want := range []string{"RedisCluster name: example", validAnalysisJSON(), "bad-plan", "slot coverage is incomplete"} {
 		found := false
 		for _, message := range messages {
 			if strings.Contains(message.Content, want) {
@@ -208,5 +232,59 @@ func TestNoopPlanner(t *testing.T) {
 	_, err := NoopPlanner{}.Plan(context.Background(), Request{})
 	if !errors.Is(err, ErrNotConfigured) {
 		t.Fatalf("expected ErrNotConfigured, got %v", err)
+	}
+}
+
+func observedThreeShardOneReplica() []ObservedNode {
+	return []ObservedNode{
+		{Pod: "redis-0", PodExists: true, RedisSeen: true, NodeID: "n0", Role: "master", Slots: "0-5461", Ready: true, Flags: []string{"master"}, LinkState: "connected"},
+		{Pod: "redis-1", PodExists: true, RedisSeen: true, NodeID: "n1", Role: "replica", MasterPod: "redis-0", Ready: true, Flags: []string{"slave"}, LinkState: "connected"},
+		{Pod: "redis-2", PodExists: true, RedisSeen: true, NodeID: "n2", Role: "master", Slots: "5462-10922", Ready: true, Flags: []string{"master"}, LinkState: "connected"},
+		{Pod: "redis-3", PodExists: true, RedisSeen: true, NodeID: "n3", Role: "replica", MasterPod: "redis-2", Ready: true, Flags: []string{"slave"}, LinkState: "connected"},
+		{Pod: "redis-4", PodExists: true, RedisSeen: true, NodeID: "n4", Role: "master", Slots: "10923-16383", Ready: true, Flags: []string{"master"}, LinkState: "connected"},
+		{Pod: "redis-5", PodExists: true, RedisSeen: true, NodeID: "n5", Role: "replica", MasterPod: "redis-4", Ready: true, Flags: []string{"slave"}, LinkState: "connected"},
+	}
+}
+
+func systemPromptPlans(t *testing.T) []plan.Plan {
+	t.Helper()
+	var plans []plan.Plan
+	for _, part := range strings.Split(buildSystemPrompt(), "```json")[1:] {
+		block, _, ok := strings.Cut(part, "```")
+		if !ok {
+			t.Fatal("unterminated json fence")
+		}
+		var p plan.Plan
+		if err := json.Unmarshal([]byte(strings.TrimSpace(block)), &p); err == nil && p.PlanID != "" {
+			plans = append(plans, p)
+		}
+	}
+	return plans
+}
+
+func TestSystemPromptExamplesAreValid(t *testing.T) {
+	observed := observedThreeShardOneReplica()
+	inputs := map[string]any{
+		"create-001":           plan.ClusterSpec{Name: "example", Generation: 1, Shards: 3, ReplicasPerShard: 1, Image: "redis:7", MemorySize: "1Gi"},
+		"replica-scaleout-001": plan.ValidationContext{Spec: plan.ClusterSpec{Name: "example", Generation: 2, Shards: 3, ReplicasPerShard: 2, Image: "redis:7", MemorySize: "1Gi"}, NextPodOrdinal: 6, ObservedNodes: observed},
+		"shard-scaleout-001":   plan.ValidationContext{Spec: plan.ClusterSpec{Name: "example", Generation: 3, Shards: 4, ReplicasPerShard: 1, Image: "redis:7", MemorySize: "1Gi"}, NextPodOrdinal: 6, ObservedNodes: observed},
+	}
+	seen := map[string]bool{}
+	for _, p := range systemPromptPlans(t) {
+		input, ok := inputs[p.PlanID]
+		if !ok {
+			continue
+		}
+		seen[p.PlanID] = true
+		t.Run(p.PlanID, func(t *testing.T) {
+			if err := plan.NewValidator().Validate(&p, input); err != nil {
+				t.Fatalf("validate: %v", err)
+			}
+		})
+	}
+	for id := range inputs {
+		if !seen[id] {
+			t.Fatalf("system prompt missing example %s", id)
+		}
 	}
 }

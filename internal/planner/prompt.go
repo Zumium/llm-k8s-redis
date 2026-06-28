@@ -64,17 +64,34 @@ func safetyInvariants() string {
 }
 
 func buildUserPrompt(req Request) string {
+	return buildClusterContextPrompt(req) + `
+## Task
+Bring the cluster from the observed state to the desired spec. Pick whichever whitelisted action sequence you think is safest; the controller's Validator is the final safety net.
+Return only the JSON plan.
+`
+}
+
+func buildAnalysisPrompt(req Request) string {
+	return buildClusterContextPrompt(req) + `
+## Task
+Analyze which subprocesses are needed before writing the plan. Use only these subprocess labels: repairTopology, cleanupGhostNodes, cleanupDirtyNodes, changeClusterSpec.
+Return only JSON:
+{"subprocesses":["<label>"],"summary":"<one-line reason>"}
+`
+}
+
+func buildClusterContextPrompt(req Request) string {
 	var buf bytes.Buffer
 	var tableBuf strings.Builder
 	writeObservedNodesTable(&tableBuf, req.ObservedState.Nodes)
 	err := userTmpl.Execute(&buf, map[string]any{
-		"Name":              req.Spec.Name,
-		"Generation":        req.Spec.Generation,
-		"Shards":            req.Spec.Shards,
-		"ReplicasPerShard":  req.Spec.ReplicasPerShard,
-		"Image":             req.Spec.Image,
-		"MemorySize":        req.Spec.MemorySize,
-		"NextPodOrdinal":    req.ObservedState.NextPodOrdinal,
+		"Name":               req.Spec.Name,
+		"Generation":         req.Spec.Generation,
+		"Shards":             req.Spec.Shards,
+		"ReplicasPerShard":   req.Spec.ReplicasPerShard,
+		"Image":              req.Spec.Image,
+		"MemorySize":         req.Spec.MemorySize,
+		"NextPodOrdinal":     req.ObservedState.NextPodOrdinal,
 		"ObservedNodesTable": tableBuf.String(),
 	})
 	if err != nil {
