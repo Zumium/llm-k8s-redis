@@ -6,7 +6,6 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/labels"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1alpha1 "github.com/Zumium/llm-k8s-redis/api/v1alpha1"
@@ -33,15 +32,10 @@ func (r *RedisClusterReconciler) podSetDrifted(ctx context.Context, c *v1alpha1.
 	if c.Status.Topology == nil {
 		return false
 	}
-	selector, err := labels.Parse(labelCluster + "=" + c.Name)
-	if err != nil {
-		return false
-	}
 	var podList corev1.PodList
 	if err := r.List(ctx, &podList, &client.ListOptions{
-		Namespace:     c.Name,
-		LabelSelector: selector,
-	}); err != nil {
+		Namespace: c.Name,
+	}, client.MatchingLabels{labelCluster: c.Name}); err != nil {
 		return false
 	}
 	live := livePodSignature(podList.Items)

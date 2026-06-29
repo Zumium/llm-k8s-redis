@@ -89,6 +89,14 @@ func topologyWithThreeShards() *ClusterTopology {
 	}}
 }
 
+func topologyWithThreeShardMixedReplicas() *ClusterTopology {
+	return &ClusterTopology{Shards: []ShardTopology{
+		{ID: "shard-0", Master: NodeTopology{Pod: "redis-0", Slots: "0-5461", Ready: true}, Replicas: []NodeTopology{{Pod: "redis-3", Ready: true}, {Pod: "redis-4", Ready: true}}},
+		{ID: "shard-1", Master: NodeTopology{Pod: "redis-1", Slots: "5462-10922", Ready: true}, Replicas: []NodeTopology{{Pod: "redis-5", Ready: true}, {Pod: "redis-6", Ready: true}, {Pod: "redis-7", Ready: true}}},
+		{ID: "shard-2", Master: NodeTopology{Pod: "redis-2", Slots: "10923-16383", Ready: true}, Replicas: []NodeTopology{{Pod: "redis-8", Ready: true}, {Pod: "redis-9", Ready: true}}},
+	}}
+}
+
 func observedFromTopology(t *ClusterTopology) []ObservedNode {
 	var out []ObservedNode
 	for _, sh := range t.Shards {
@@ -298,6 +306,32 @@ func TestValidate_ReplicaScaleInHandlesMixedReplicaCounts(t *testing.T) {
 		{ID: "verify", Action: ActionVerifyCluster, Params: map[string]any{"expectedShards": 2, "expectedReplicasPerShard": 1, "requireClusterStateOk": true, "requireFullSlotCoverage": true, "requireAllSlotOwnersHaveReplicas": true}},
 	}
 	ctx := ctxWithObservedNodes(replicaScaleInSpec(), topologyWithMixedReplicas())
+	if err := validatePlan(p, ctx); err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+}
+
+func TestValidate_RepairHandlesThreeShardMixedReplicaCounts(t *testing.T) {
+	s := spec()
+	s.Shards = 3
+	s.ReplicasPerShard = 3
+	p := &Plan{
+		DSLVersion:       DSLVersion,
+		PlanID:           "repair-mixed-replicas",
+		TargetGeneration: 1,
+		Steps: []Step{
+			{ID: "ensure-redis-10", Action: ActionEnsureNode, Params: map[string]any{"namespace": "example", "pod": "redis-10", "image": "redis:7.2", "memorySize": "2Gi"}},
+			{ID: "ensure-redis-11", Action: ActionEnsureNode, Params: map[string]any{"namespace": "example", "pod": "redis-11", "image": "redis:7.2", "memorySize": "2Gi"}},
+			{ID: "wait-redis-10", Action: ActionWaitNodeReady, Params: map[string]any{"namespace": "example", "pod": "redis-10"}},
+			{ID: "wait-redis-11", Action: ActionWaitNodeReady, Params: map[string]any{"namespace": "example", "pod": "redis-11"}},
+			{ID: "meet-redis-10", Action: ActionMeetNode, Params: map[string]any{"namespace": "example", "sourcePod": "redis-0", "targetPod": "redis-10"}},
+			{ID: "meet-redis-11", Action: ActionMeetNode, Params: map[string]any{"namespace": "example", "sourcePod": "redis-2", "targetPod": "redis-11"}},
+			{ID: "replicate-redis-10", Action: ActionReplicateNode, Params: map[string]any{"namespace": "example", "masterPod": "redis-0", "replicaPod": "redis-10"}},
+			{ID: "replicate-redis-11", Action: ActionReplicateNode, Params: map[string]any{"namespace": "example", "masterPod": "redis-2", "replicaPod": "redis-11"}},
+			{ID: "verify", Action: ActionVerifyCluster, Params: map[string]any{"expectedShards": 3, "expectedReplicasPerShard": 3, "requireClusterStateOk": true, "requireFullSlotCoverage": true, "requireAllSlotOwnersHaveReplicas": true}},
+		},
+	}
+	ctx := ctxWithObservedNodes(s, topologyWithThreeShardMixedReplicas())
 	if err := validatePlan(p, ctx); err != nil {
 		t.Fatalf("expected no error, got %v", err)
 	}
@@ -774,6 +808,7 @@ func TestValidateStepSchema_Actions(t *testing.T) {
 		{Action: ActionMigrateSlots, Params: map[string]any{"namespace": "example", "sourcePod": "redis-0", "targetPod": "redis-2", "slots": "0-1"}},
 		{Action: ActionForgetNode, Params: map[string]any{"namespace": "example", "pod": "redis-1"}},
 		{Action: ActionForgetNode, Params: map[string]any{"namespace": "example", "pod": "redis-1", "lastKnownNodeId": "node-1"}},
+		{Action: ActionForgetNode, Params: map[string]any{"namespace": "example", "lastKnownNodeId": "node-1"}},
 		{Action: ActionDeleteNode, Params: map[string]any{"namespace": "example", "pod": "redis-1"}},
 		{Action: ActionVerifyCluster, Params: map[string]any{"expectedShards": 2, "expectedReplicasPerShard": 1, "requireClusterStateOk": true, "requireFullSlotCoverage": true, "requireAllSlotOwnersHaveReplicas": true}},
 	}
@@ -812,6 +847,7 @@ func TestValidateStepSchema_ActionFailures(t *testing.T) {
 		{name: "ForgetNode bad pod", step: Step{Action: ActionForgetNode, Params: map[string]any{"namespace": "example", "pod": "example-1"}}},
 		{name: "DeleteNode missing pod", step: Step{Action: ActionDeleteNode, Params: map[string]any{"namespace": "example"}}},
 		{name: "DeleteNode bad pod", step: Step{Action: ActionDeleteNode, Params: map[string]any{"namespace": "example", "pod": "example-1"}}},
+		{name: "DeleteNode node id only", step: Step{Action: ActionDeleteNode, Params: map[string]any{"namespace": "example", "lastKnownNodeId": "node-1"}}},
 		{name: "VerifyCluster missing expectedShards", step: Step{Action: ActionVerifyCluster, Params: map[string]any{"expectedReplicasPerShard": 1, "requireClusterStateOk": true, "requireFullSlotCoverage": true, "requireAllSlotOwnersHaveReplicas": true}}},
 		{name: "VerifyCluster false bool", step: Step{Action: ActionVerifyCluster, Params: map[string]any{"expectedShards": 2, "expectedReplicasPerShard": 1, "requireClusterStateOk": false, "requireFullSlotCoverage": true, "requireAllSlotOwnersHaveReplicas": true}}},
 	}
@@ -1014,6 +1050,42 @@ func validHealPlan() *Plan {
 func TestValidate_HealRepairAcceptsValidPlan(t *testing.T) {
 	if err := validatePlan(validHealPlan(), healCtx()); err != nil {
 		t.Fatalf("expected heal plan to pass, got %v", err)
+	}
+}
+
+func TestValidate_HealRepairRejectsOverReplenishedPromotedMaster(t *testing.T) {
+	ctx := ValidationContext{
+		Spec:           ClusterSpec{Name: "redis-3s1r", Generation: 1, Shards: 3, ReplicasPerShard: 1, Image: "redis:7.2", MemorySize: "2Gi"},
+		NextPodOrdinal: 9,
+		ObservedNodes: []ObservedNode{
+			{Pod: "redis-6", PodExists: true, RedisSeen: true, NodeID: "node-6", Role: "master", Slots: "0-5461", Ready: true},
+			{Pod: "redis-3", PodExists: true, RedisSeen: true, NodeID: "node-3", Role: "master", Slots: "5462-10922", Ready: true},
+			{Pod: "redis-7", PodExists: true, RedisSeen: true, NodeID: "node-7", Role: "replica", MasterPod: "redis-3", Ready: true},
+			{Pod: "redis-4", PodExists: true, RedisSeen: true, NodeID: "node-4", Role: "master", Slots: "10923-16383", Ready: true},
+			{Pod: "redis-5", PodExists: true, RedisSeen: true, NodeID: "node-5", Role: "replica", MasterPod: "redis-4", Ready: true},
+			{Pod: "redis-1", PodExists: false, RedisSeen: true, NodeID: "node-1", Role: "master", Slots: "", Flags: []string{"master", "fail"}},
+		},
+	}
+	p := &Plan{
+		DSLVersion:       DSLVersion,
+		PlanID:           "heal-over-replica",
+		TargetGeneration: 1,
+		Steps: []Step{
+			{ID: "ensure-redis-9", Action: ActionEnsureNode, Params: map[string]any{"namespace": "redis-3s1r", "pod": "redis-9", "image": "redis:7.2", "memorySize": "2Gi"}},
+			{ID: "ensure-redis-10", Action: ActionEnsureNode, Params: map[string]any{"namespace": "redis-3s1r", "pod": "redis-10", "image": "redis:7.2", "memorySize": "2Gi"}},
+			{ID: "wait-redis-9", Action: ActionWaitNodeReady, Params: map[string]any{"namespace": "redis-3s1r", "pod": "redis-9"}},
+			{ID: "wait-redis-10", Action: ActionWaitNodeReady, Params: map[string]any{"namespace": "redis-3s1r", "pod": "redis-10"}},
+			{ID: "meet-redis-9", Action: ActionMeetNode, Params: map[string]any{"namespace": "redis-3s1r", "sourcePod": "redis-6", "targetPod": "redis-9"}},
+			{ID: "meet-redis-10", Action: ActionMeetNode, Params: map[string]any{"namespace": "redis-3s1r", "sourcePod": "redis-6", "targetPod": "redis-10"}},
+			{ID: "replicate-redis-9", Action: ActionReplicateNode, Params: map[string]any{"namespace": "redis-3s1r", "masterPod": "redis-6", "replicaPod": "redis-9"}},
+			{ID: "replicate-redis-10", Action: ActionReplicateNode, Params: map[string]any{"namespace": "redis-3s1r", "masterPod": "redis-6", "replicaPod": "redis-10"}},
+			{ID: "forget-redis-1", Action: ActionForgetNode, Params: map[string]any{"namespace": "redis-3s1r", "pod": "redis-1", "lastKnownNodeId": "node-1"}},
+			{ID: "delete-redis-1", Action: ActionDeleteNode, Params: map[string]any{"namespace": "redis-3s1r", "pod": "redis-1"}},
+			{ID: "verify", Action: ActionVerifyCluster, Params: map[string]any{"expectedShards": 3, "expectedReplicasPerShard": 1, "requireClusterStateOk": true, "requireFullSlotCoverage": true, "requireAllSlotOwnersHaveReplicas": true}},
+		},
+	}
+	if err := validatePlan(p, ctx); err == nil {
+		t.Fatal("expected over-replenished promoted master to be rejected")
 	}
 }
 

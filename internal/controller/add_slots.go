@@ -30,8 +30,8 @@ func (e *ActionExecutor) addSlots(ctx context.Context, cluster *v1alpha1.RedisCl
 		return outcome, err
 	}
 
-	if ns != cluster.Name {
-		return paramErr("namespace %q must equal cluster name %q", ns, cluster.Name)
+	if outcome, err, ok := validateClusterNamespace(cluster, ns); !ok {
+		return outcome, err
 	}
 	if !precededEnsureNode(p, stepIndex, ns, podName) {
 		return paramErr("pod %s/%s was not declared by a preceding EnsureNode", ns, podName)
@@ -207,25 +207,4 @@ func stringOrEmpty(params map[string]any, key string) string {
 		return ""
 	}
 	return v
-}
-
-func refreshExistingTopologySlots(cluster *v1alpha1.RedisCluster, podName, nodeID, slots string) {
-	if cluster.Status.Topology == nil {
-		return
-	}
-	for i := range cluster.Status.Topology.Shards {
-		sh := &cluster.Status.Topology.Shards[i]
-		if sh.Master.Pod == podName {
-			sh.Master.NodeID = nodeID
-			sh.Master.Ready = true
-			sh.Master.Slots = slots
-		}
-		for j := range sh.Replicas {
-			if sh.Replicas[j].Pod == podName {
-				sh.Replicas[j].NodeID = nodeID
-				sh.Replicas[j].Ready = true
-				sh.Replicas[j].Slots = slots
-			}
-		}
-	}
 }

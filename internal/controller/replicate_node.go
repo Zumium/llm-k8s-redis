@@ -28,24 +28,22 @@ func (e *ActionExecutor) replicateNode(ctx context.Context, cluster *v1alpha1.Re
 		return outcome, err
 	}
 
-	if ns != cluster.Name {
-		return paramErr("namespace %q must equal cluster name %q", ns, cluster.Name)
+	if outcome, err, ok := validateClusterNamespace(cluster, ns); !ok {
+		return outcome, err
 	}
 	if masterPod == replicaPod {
 		return paramErr("masterPod %q and replicaPod must differ", masterPod)
 	}
-	masterExists := podInTopology(cluster, masterPod)
-	replicaExists := podInTopology(cluster, replicaPod)
-	if !masterExists && !precededEnsureNode(p, stepIndex, ns, masterPod) {
+	if !podDeclaredOrInTopology(cluster, p, stepIndex, ns, masterPod) {
 		return paramErr("master pod %s/%s was not declared by a preceding EnsureNode", ns, masterPod)
 	}
-	if !replicaExists && !precededEnsureNode(p, stepIndex, ns, replicaPod) {
+	if !podDeclaredOrInTopology(cluster, p, stepIndex, ns, replicaPod) {
 		return paramErr("replica pod %s/%s was not declared by a preceding EnsureNode", ns, replicaPod)
 	}
-	if !masterExists && !precededWaitNodeReady(p, stepIndex, ns, masterPod) {
+	if !podWaitedOrInTopology(cluster, p, stepIndex, ns, masterPod) {
 		return paramErr("master pod %s/%s has not completed a preceding WaitNodeReady", ns, masterPod)
 	}
-	if !replicaExists && !precededWaitNodeReady(p, stepIndex, ns, replicaPod) {
+	if !podWaitedOrInTopology(cluster, p, stepIndex, ns, replicaPod) {
 		return paramErr("replica pod %s/%s has not completed a preceding WaitNodeReady", ns, replicaPod)
 	}
 

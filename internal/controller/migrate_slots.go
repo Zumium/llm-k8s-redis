@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -42,8 +43,8 @@ func (e *ActionExecutor) migrateSlots(ctx context.Context, cluster *v1alpha1.Red
 	if !ok {
 		return outcome, err
 	}
-	if ns != cluster.Name {
-		return paramErr("namespace %q must equal cluster name %q", ns, cluster.Name)
+	if outcome, err, ok := validateClusterNamespace(cluster, ns); !ok {
+		return outcome, err
 	}
 	if sourcePodName == targetPodName {
 		return paramErr("sourcePod and targetPod must differ")
@@ -54,7 +55,7 @@ func (e *ActionExecutor) migrateSlots(ctx context.Context, cluster *v1alpha1.Red
 	if !podDeclaredOrInTopology(cluster, p, stepIndex, ns, targetPodName) {
 		return paramErr("target pod %s/%s was not declared by a preceding EnsureNode and is not in topology", ns, targetPodName)
 	}
-	if !precededWaitNodeReady(p, stepIndex, ns, targetPodName) && !podInTopology(cluster, targetPodName) {
+	if !podWaitedOrInTopology(cluster, p, stepIndex, ns, targetPodName) {
 		return paramErr("target pod %s/%s has not completed a preceding WaitNodeReady", ns, targetPodName)
 	}
 	desired, err := rediscluster.ParseSlotSpec(slotsSpec)
@@ -150,17 +151,75 @@ func (e *ActionExecutor) migrateSlots(ctx context.Context, cluster *v1alpha1.Red
 		logger.Error(err, "parse slot ownership before migrate slots failed")
 		return StepOutcome{Status: plan.StepStateFailed, Message: fmt.Sprintf("parse slot ownership: %v", err)}, err
 	}
+	pods, outcome, ok := e.listManagedPods(ctx, cluster)
+	if !ok {
+		return outcome, fmt.Errorf("%s", outcome.Message)
+	}
+	podsByIP := mapPodsByIP(pods)
+	entriesByID := map[string]rediscluster.Entry{}
+	for _, entry := range entries {
+		entriesByID[entry.ID] = entry
+	}
 	markers := rediscluster.SlotMigrationMarkers(entries)
+	missing := []int{}
+	sources := map[int]corev1.Pod{}
 	for _, slot := range desired {
-		if marker, ok := markers[slot]; ok && (marker.SourceID != source.ID || marker.TargetID != target.ID) {
-			return paramErr("slot %d is migrating/importing between %s and %s, not requested %s->%s", slot, marker.SourceID, marker.TargetID, source.ID, target.ID)
-		}
 		cur, ok := owner[slot]
 		if !ok {
-			return paramErr("slot %d has no owner", slot)
+			if marker, ok := markers[slot]; ok && marker.TargetID != target.ID {
+				return paramErr("slot %d is migrating/importing between %s and %s, not requested target %s", slot, marker.SourceID, marker.TargetID, target.ID)
+			}
+			missing = append(missing, slot)
+			continue
 		}
-		if cur != source.ID && cur != target.ID {
-			return paramErr("slot %d owned by node %s, not source %s or target %s", slot, cur, source.ID, target.ID)
+		if marker, ok := markers[slot]; ok && (marker.SourceID != cur || marker.TargetID != target.ID) {
+			return paramErr("slot %d is migrating/importing between %s and %s, not requested %s->%s", slot, marker.SourceID, marker.TargetID, cur, target.ID)
+		}
+		if cur == target.ID {
+			continue
+		}
+		sourceEntry := entriesByID[cur]
+		sourceIP := rediscluster.IPFromAddr(rediscluster.RedisAddrFromClusterAddr(sourceEntry.Addr))
+		sourcePod := podsByIP[sourceIP]
+		if sourcePod == nil || !sourceEntry.IsMaster() || !sourceEntry.Healthy() {
+			return paramErr("slot %d owned by unmanaged or unhealthy node %s, not source %s or target %s", slot, cur, source.ID, target.ID)
+		}
+		sources[slot] = *sourcePod
+	}
+	if len(missing) > 0 {
+		targetNodesOut, err := targetRC.ClusterNodes(ctx)
+		if err != nil {
+			logger.Info("target cluster nodes before missing slot repair failed", "addr", podRedisAddr(targetPod), "error", err)
+			return running("target redis at %s CLUSTER NODES before missing slot repair failed: %v", podRedisAddr(targetPod), err), nil
+		}
+		targetOwner, err := rediscluster.SlotOwnership(rediscluster.ParseNodes(targetNodesOut))
+		if err != nil {
+			logger.Error(err, "parse target slot ownership before missing slot repair failed")
+			return StepOutcome{Status: plan.StepStateFailed, Message: fmt.Sprintf("parse target slot ownership: %v", err)}, err
+		}
+		toAdd := []int{}
+		for _, slot := range missing {
+			cur, ok := targetOwner[slot]
+			switch {
+			case !ok:
+				toAdd = append(toAdd, slot)
+			case cur == target.ID:
+				owner[slot] = target.ID
+			case cur == source.ID:
+				return running("slot %d ownership is not yet consistent between source and target", slot), nil
+			default:
+				return paramErr("slot %d owned by node %s, not source %s or target %s", slot, cur, source.ID, target.ID)
+			}
+		}
+		if len(toAdd) > 0 {
+			logger.Info("repairing unowned slots before migrate", "targetPod", targetPodName, "targetID", target.ID, "slotCount", len(toAdd))
+			if err := targetRC.ClusterAddSlots(ctx, toAdd); err != nil {
+				logger.Error(err, "cluster addslots for unowned migrate slots failed", "targetPod", targetPodName, "slotCount", len(toAdd))
+				return StepOutcome{Status: plan.StepStateFailed, Message: fmt.Sprintf("CLUSTER ADDSLOTS missing migrate slots: %v", err)}, err
+			}
+			for _, slot := range toAdd {
+				owner[slot] = target.ID
+			}
 		}
 	}
 
@@ -176,6 +235,52 @@ func (e *ActionExecutor) migrateSlots(ctx context.Context, cluster *v1alpha1.Red
 		todo = append(todo, slot)
 	}
 
+	sourceClients := map[string]redis.Client{}
+	defer func() {
+		for _, rc := range sourceClients {
+			_ = rc.Close()
+		}
+	}()
+	for _, slot := range todo {
+		pod := sources[slot]
+		addr := podRedisAddr(&pod)
+		if _, ok := sourceClients[addr]; ok {
+			continue
+		}
+		rc, err := e.RedisFactory(addr)
+		if err != nil {
+			logger.Error(err, "build redis client for live slot owner failed", "addr", addr)
+			return StepOutcome{Status: plan.StepStateFailed, Message: fmt.Sprintf("build redis client for live slot owner %s: %v", addr, err)}, err
+		}
+		sourceClients[addr] = rc
+	}
+	extraNodeClients := map[string]redis.Client{}
+	defer func() {
+		for _, rc := range extraNodeClients {
+			_ = rc.Close()
+		}
+	}()
+	targetAddr := podRedisAddr(targetPod)
+	for _, entry := range entries {
+		if !entry.IsMaster() || !entry.Healthy() {
+			continue
+		}
+		addr := rediscluster.RedisAddrFromClusterAddr(entry.Addr)
+		if addr == targetAddr || sourceClients[addr] != nil {
+			continue
+		}
+		ip := rediscluster.IPFromAddr(addr)
+		if podsByIP[ip] == nil {
+			continue
+		}
+		rc, err := e.RedisFactory(addr)
+		if err != nil {
+			logger.Error(err, "build redis client for migrate slot owner propagation failed", "addr", addr)
+			return StepOutcome{Status: plan.StepStateFailed, Message: fmt.Sprintf("build redis client for slot owner propagation %s: %v", addr, err)}, err
+		}
+		extraNodeClients[addr] = rc
+	}
+
 	slotCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -188,7 +293,9 @@ func (e *ActionExecutor) migrateSlots(ctx context.Context, cluster *v1alpha1.Red
 		wg.Add(1)
 		go func(slot int) {
 			defer wg.Done()
-			result := e.migrateSlot(slotCtx, sourceRC, targetRC, source.ID, target.ID, target.Addr, slot)
+			pod := sources[slot]
+			sourceEntry := entriesByID[owner[slot]]
+			result := e.migrateSlot(slotCtx, sourceClients[podRedisAddr(&pod)], targetRC, extraNodeClients, sourceEntry.ID, target.ID, target.Addr, slot)
 			mu.Lock()
 			if firstErr.err == nil && result.err != nil {
 				firstErr = result
@@ -211,29 +318,9 @@ func (e *ActionExecutor) migrateSlots(ctx context.Context, cluster *v1alpha1.Red
 		return running("migrated %d keys across %d slots; waiting to finish slot ownership", migratedKeys, len(todo)-completedSlots), nil
 	}
 
-	afterStart := time.Now()
-	nodesOut, err = sourceRC.ClusterNodes(ctx)
-	if err != nil {
-		logger.Info("cluster nodes after migrate slots failed", "addr", podRedisAddr(sourcePod), "duration", time.Since(afterStart), "error", err)
-		return running("source redis at %s CLUSTER NODES after migration failed: %v", podRedisAddr(sourcePod), err), nil
-	}
-	entries = rediscluster.ParseNodes(nodesOut)
-	logger.Info("cluster nodes after migrate slots read", "addr", podRedisAddr(sourcePod), "duration", time.Since(afterStart), "entries", len(entries))
-	owner, err = rediscluster.SlotOwnership(entries)
-	if err != nil {
-		logger.Error(err, "parse slot ownership after migrate slots failed")
-		return StepOutcome{Status: plan.StepStateFailed, Message: fmt.Sprintf("parse slot ownership after migration: %v", err)}, err
-	}
-	target = rediscluster.FindByIP(entries, targetPod.Status.PodIP)
-	if target == nil {
-		logger.Info("target disappeared after migrate slots", "targetPod", targetPodName)
-		return running("target %s/%s disappeared after migration", ns, targetPodName), nil
-	}
-	for _, slot := range desired {
-		if owner[slot] != target.ID {
-			logger.Info("slot not yet owned by target after migrate slots", "slot", slot, "targetID", target.ID)
-			return running("slot %d not yet owned by target %s/%s", slot, ns, targetPodName), nil
-		}
+	outcome, err, ok = e.verifyMigratedSlots(ctx, cluster, entries, sourcePodName, targetPodName, target.ID, desired)
+	if !ok {
+		return outcome, err
 	}
 	logger.Info("migrate slots verified", "sourcePod", sourcePodName, "targetPod", targetPodName, "targetID", target.ID, "slotCount", len(desired))
 	refreshExistingTopologySlots(cluster, targetPodName, target.ID, slotsSpec)
@@ -246,7 +333,81 @@ type migrateSlotResult struct {
 	keys    int
 }
 
-func (e *ActionExecutor) migrateSlot(ctx context.Context, sourceRC, targetRC redis.Client, sourceID, targetID, targetAddr string, slot int) migrateSlotResult {
+func (e *ActionExecutor) verifyMigratedSlots(ctx context.Context, cluster *v1alpha1.RedisCluster, entries []rediscluster.Entry, sourcePodName, targetPodName, targetID string, desired []int) (StepOutcome, error, bool) {
+	pods, outcome, ok := e.listManagedPods(ctx, cluster)
+	if !ok {
+		return outcome, fmt.Errorf("%s", outcome.Message), false
+	}
+	candidates := migrateVerifyPods(cluster, pods, entries, sourcePodName, targetPodName)
+	if len(candidates) == 0 {
+		return running("no healthy master available to verify migrated slots"), nil, false
+	}
+	if len(candidates) > 3 {
+		candidates = candidates[:3]
+	}
+
+	logger := log.FromContext(ctx)
+	for _, pod := range candidates {
+		addr := podRedisAddr(&pod)
+		start := time.Now()
+		rc, err := e.RedisFactory(addr)
+		if err != nil {
+			logger.Info("build redis client for migrate slot verification failed", "addr", addr, "error", err)
+			return running("master %s CLUSTER NODES verification not ready: %v", addr, err), nil, false
+		}
+		nodesOut, err := rc.ClusterNodes(ctx)
+		closeErr := rc.Close()
+		if err != nil {
+			logger.Info("cluster nodes verification after migrate slots failed", "addr", addr, "duration", time.Since(start), "error", err)
+			return running("master %s CLUSTER NODES after migration failed: %v", addr, err), nil, false
+		}
+		if closeErr != nil {
+			logger.Info("close redis client after migrate slot verification failed", "addr", addr, "error", closeErr)
+		}
+		owner, err := rediscluster.SlotOwnership(rediscluster.ParseNodes(nodesOut))
+		if err != nil {
+			logger.Info("parse slot ownership during migrate verification failed", "addr", addr, "error", err)
+			return running("master %s slot ownership not yet consistent: %v", addr, err), nil, false
+		}
+		for _, slot := range desired {
+			if owner[slot] != targetID {
+				logger.Info("slot not yet owned by target in master view", "addr", addr, "slot", slot, "targetID", targetID, "ownerID", owner[slot])
+				return running("slot %d not yet owned by target in master %s view", slot, addr), nil, false
+			}
+		}
+	}
+	logger.Info("migrate slots verified from master views", "masters", len(candidates), "targetID", targetID, "slotCount", len(desired))
+	return StepOutcome{}, nil, true
+}
+
+func migrateVerifyPods(cluster *v1alpha1.RedisCluster, pods []corev1.Pod, entries []rediscluster.Entry, sourcePodName, targetPodName string) []corev1.Pod {
+	podsByName := map[string]corev1.Pod{}
+	for _, pod := range pods {
+		podsByName[pod.Name] = pod
+	}
+	out := []corev1.Pod{}
+	seen := map[string]bool{}
+	add := func(name string) {
+		pod, ok := podsByName[name]
+		if !ok || seen[pod.Name] || !podReady(&pod) || pod.Status.PodIP == "" {
+			return
+		}
+		entry := rediscluster.FindByIP(entries, pod.Status.PodIP)
+		if entry == nil || !entry.IsMaster() || !entry.Healthy() {
+			return
+		}
+		seen[pod.Name] = true
+		out = append(out, pod)
+	}
+	add(sourcePodName)
+	add(targetPodName)
+	for _, pod := range observationSeedPods(cluster, pods) {
+		add(pod.Name)
+	}
+	return out
+}
+
+func (e *ActionExecutor) migrateSlot(ctx context.Context, sourceRC, targetRC redis.Client, extraNodeClients map[string]redis.Client, sourceID, targetID, targetAddr string, slot int) migrateSlotResult {
 	logger := log.FromContext(ctx)
 	slotStart := time.Now()
 	logger.Info("migrating slot started", "slot", slot, "sourceID", sourceID, "targetID", targetID)
@@ -283,6 +444,18 @@ func (e *ActionExecutor) migrateSlot(ctx context.Context, sourceRC, targetRC red
 		logger.Error(err, "target setslot node failed", "slot", slot, "duration", time.Since(slotStart))
 		return migrateSlotResult{outcome: StepOutcome{Status: plan.StepStateFailed, Message: fmt.Sprintf("target SETSLOT NODE slot %d: %v", slot, err)}, err: err}
 	}
+	addrs := make([]string, 0, len(extraNodeClients))
+	for addr := range extraNodeClients {
+		addrs = append(addrs, addr)
+	}
+	sort.Strings(addrs)
+	for _, addr := range addrs {
+		rc := extraNodeClients[addr]
+		if err := rc.ClusterSetSlotNode(ctx, slot, targetID); err != nil {
+			logger.Error(err, "peer setslot node failed", "addr", addr, "slot", slot, "duration", time.Since(slotStart))
+			return migrateSlotResult{outcome: StepOutcome{Status: plan.StepStateFailed, Message: fmt.Sprintf("peer %s SETSLOT NODE slot %d: %v", addr, slot, err)}, err: err}
+		}
+	}
 	logger.Info("migrating slot finished", "slot", slot, "duration", time.Since(slotStart))
 	return migrateSlotResult{}
 }
@@ -303,8 +476,4 @@ func (e *ActionExecutor) getPod(ctx context.Context, ns, podName string) (*corev
 	}
 	logger.Info("pod found", "duration", time.Since(start), "ready", podReady(pod), "ip", pod.Status.PodIP)
 	return pod, StepOutcome{}, nil, true
-}
-
-func podDeclaredOrInTopology(cluster *v1alpha1.RedisCluster, p *plan.Plan, stepIndex int, ns, podName string) bool {
-	return precededEnsureNode(p, stepIndex, ns, podName) || podInTopology(cluster, podName)
 }

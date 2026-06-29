@@ -64,6 +64,7 @@ type fakeRedisClient struct {
 	configSet        func(key, value string) error
 	clusterMyID      func() (string, error)
 	clusterNodes     func() (string, error)
+	clusterNodesAddr func(addr string) (string, error)
 	clusterInfo      func() (string, error)
 	clusterMeet      func(host string, port int) error
 	clusterReplicate func(masterNodeID string) error
@@ -233,6 +234,13 @@ func (f *addrFakeRedisClient) ClusterSetSlotNode(_ context.Context, slot int, no
 	return f.setSlotNode(slot, nodeID)
 }
 
+func (f *addrFakeRedisClient) ClusterNodes(ctx context.Context) (string, error) {
+	if f.clusterNodesAddr != nil {
+		return f.clusterNodesAddr(f.addr)
+	}
+	return f.fakeRedisClient.ClusterNodes(ctx)
+}
+
 func fakeFactory(fc *fakeRedisClient) redis.Factory {
 	return func(addr string) (redis.Client, error) {
 		return &addrFakeRedisClient{fakeRedisClient: fc, addr: addr}, nil
@@ -389,7 +397,7 @@ func TestEnsureNode_RedisPingFailsReturnsRunning(t *testing.T) {
 	}
 }
 
-func TestEnsureNode_ImageDriftFails(t *testing.T) {
+func TestEnsureNode_ImageDriftDeletesUnstartedManagedPod(t *testing.T) {
 	ctx := context.Background()
 	cluster := testCluster()
 	scheme := newExecutorScheme(t)
@@ -401,9 +409,62 @@ func TestEnsureNode_ImageDriftFails(t *testing.T) {
 	fc := &fakeRedisClient{}
 	exec := newExecutor(t, []client.Object{cluster, driftPod}, fc)
 
+	outcome, err := exec.ExecuteStep(ctx, cluster, &plan.Plan{Steps: []plan.Step{ensureStep(baseParams())}}, 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if outcome.Status != plan.StepStateRunning {
+		t.Fatalf("expected Running on image drift deletion, got %q: %s", outcome.Status, outcome.Message)
+	}
+	var pod corev1.Pod
+	if err := exec.Get(ctx, client.ObjectKey{Namespace: "example", Name: "redis-0"}, &pod); err == nil {
+		t.Fatal("expected drifted pod to be deleted")
+	}
+}
+
+func TestEnsureNode_ImageDriftWithIPFails(t *testing.T) {
+	ctx := context.Background()
+	cluster := testCluster()
+	scheme := newExecutorScheme(t)
+	driftPod := desiredPod(cluster, "example", "redis-0", "redis:7.2", "2Gi", twoGiBytes)
+	driftPod.Spec.Containers[0].Image = "redis:6.2"
+	driftPod.Status.PodIP = "10.0.0.9"
+	if err := ctrl.SetControllerReference(cluster, driftPod, scheme); err != nil {
+		t.Fatalf("set owner ref: %v", err)
+	}
+	exec := newExecutor(t, []client.Object{cluster, driftPod}, nil)
+
 	outcome, _ := exec.ExecuteStep(ctx, cluster, &plan.Plan{Steps: []plan.Step{ensureStep(baseParams())}}, 0)
 	if outcome.Status != plan.StepStateFailed {
-		t.Fatalf("expected Failed on image drift, got %q: %s", outcome.Status, outcome.Message)
+		t.Fatalf("expected Failed on image drift with IP, got %q: %s", outcome.Status, outcome.Message)
+	}
+	var pod corev1.Pod
+	if err := exec.Get(ctx, client.ObjectKey{Namespace: "example", Name: "redis-0"}, &pod); err != nil {
+		t.Fatalf("expected drifted pod to remain: %v", err)
+	}
+}
+
+func TestEnsureNode_ImageDriftInLastKnownTopologyFails(t *testing.T) {
+	ctx := context.Background()
+	cluster := testCluster()
+	cluster.Status.Topology = &api.ClusterTopology{Shards: []api.ShardTopology{{
+		Master: api.NodeTopology{Pod: "redis-0", NodeID: "node-0", Ready: true},
+	}}}
+	scheme := newExecutorScheme(t)
+	driftPod := desiredPod(cluster, "example", "redis-0", "redis:7.2", "2Gi", twoGiBytes)
+	driftPod.Spec.Containers[0].Image = "redis:6.2"
+	if err := ctrl.SetControllerReference(cluster, driftPod, scheme); err != nil {
+		t.Fatalf("set owner ref: %v", err)
+	}
+	exec := newExecutor(t, []client.Object{cluster, driftPod}, nil)
+
+	outcome, _ := exec.ExecuteStep(ctx, cluster, &plan.Plan{Steps: []plan.Step{ensureStep(baseParams())}}, 0)
+	if outcome.Status != plan.StepStateFailed {
+		t.Fatalf("expected Failed on image drift in topology, got %q: %s", outcome.Status, outcome.Message)
+	}
+	var pod corev1.Pod
+	if err := exec.Get(ctx, client.ObjectKey{Namespace: "example", Name: "redis-0"}, &pod); err != nil {
+		t.Fatalf("expected drifted pod to remain: %v", err)
 	}
 }
 

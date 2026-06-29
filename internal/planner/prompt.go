@@ -45,7 +45,7 @@ func actionReference() string {
 		{plan.ActionReplicateNode, "Make replicaPod replicate from masterPod; replicaPod must not own slots.", `{"namespace":"<cluster>","masterPod":"<name>","replicaPod":"<name>"}`},
 		{plan.ActionAddSlots, "Assign only unowned slots to a master; do not use it to move slots already owned by another master.", `{"namespace":"<cluster>","pod":"<name>","slots":"<start-end>"}`},
 		{plan.ActionMigrateSlots, "Move slots from source master to target master; slots already on target are treated as done and execution continues in batches.", `{"namespace":"<cluster>","sourcePod":"<name>","targetPod":"<name>","slots":"<start-end>"}`},
-		{plan.ActionForgetNode, "Remove a node from Redis Cluster membership without deleting its Pod; include lastKnownNodeId when the Pod is gone.", `{"namespace":"<cluster>","pod":"<name>","lastKnownNodeId":"<optional last-known node id only when pod is gone>"}`},
+		{plan.ActionForgetNode, "Remove a node from Redis Cluster membership without deleting its Pod; use lastKnownNodeId when the Pod is gone or unmapped.", `{"namespace":"<cluster>","pod":"<optional name>","lastKnownNodeId":"<optional node id required when pod is gone or unmapped>"}`},
 		{plan.ActionDeleteNode, "Delete the Kubernetes resources for a node; only safe after ForgetNode or if the node never joined Redis Cluster.", `{"namespace":"<cluster>","pod":"<name>"}`},
 		{plan.ActionVerifyCluster, "Verify final state without changing topology; count only slot-owning masters, and wait for extra no-slot masters as gossip convergence instead of immediate shard mismatch.", `{"expectedShards":<n>,"expectedReplicasPerShard":<n>,"requireClusterStateOk":true,"requireFullSlotCoverage":true,"requireAllSlotOwnersHaveReplicas":true}`},
 	}

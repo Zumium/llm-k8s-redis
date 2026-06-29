@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -107,6 +108,23 @@ func (e *ActionExecutor) createPod(ctx context.Context, cluster *v1alpha1.RedisC
 func (e *ActionExecutor) reconcileExistingPod(ctx context.Context, cluster *v1alpha1.RedisCluster, pod *corev1.Pod, image, memorySize string, wantBytes int64) (StepOutcome, error) {
 	logger := log.FromContext(ctx).WithValues("namespace", pod.Namespace, "pod", pod.Name)
 	logger.Info("reconciling existing pod")
+	if drift := podSpecDrift(pod, image, memorySize); drift != "" {
+		logger.Info("pod spec drift detected", "drift", drift)
+		if canRecreateDriftedPod(cluster, pod) {
+			start := time.Now()
+			logger.Info("deleting drifted pod")
+			if err := e.Delete(ctx, pod); err != nil {
+				if errors.IsNotFound(err) {
+					return running("pod %s/%s already deleted after spec drift: %s", pod.Namespace, pod.Name, drift), nil
+				}
+				logger.Error(err, "delete drifted pod failed", "duration", time.Since(start))
+				return StepOutcome{Status: plan.StepStateFailed, Message: fmt.Sprintf("delete drifted pod: %v", err)}, err
+			}
+			logger.Info("drifted pod deletion requested", "duration", time.Since(start))
+			return running("pod %s/%s spec drift: %s; deletion requested", pod.Namespace, pod.Name, drift), nil
+		}
+		return paramErr("pod %s/%s spec drift: %s", pod.Namespace, pod.Name, drift)
+	}
 	if !metav1.IsControlledBy(pod, cluster) {
 		patched := pod.DeepCopy()
 		if err := ctrl.SetControllerReference(cluster, patched, e.Scheme); err != nil {
@@ -120,10 +138,6 @@ func (e *ActionExecutor) reconcileExistingPod(ctx context.Context, cluster *v1al
 		}
 		logger.Info("pod owner reference updated", "duration", time.Since(start))
 	}
-	if drift := podSpecDrift(pod, image, memorySize); drift != "" {
-		logger.Info("pod spec drift detected", "drift", drift)
-		return paramErr("pod %s/%s spec drift: %s", pod.Namespace, pod.Name, drift)
-	}
 	if msg := ensurePodMetadata(pod, cluster.Name, pod.Name, image, memorySize, wantBytes); msg != "" {
 		patched := pod.DeepCopy()
 		ensurePodMetadata(patched, cluster.Name, patched.Name, image, memorySize, wantBytes)
@@ -136,6 +150,14 @@ func (e *ActionExecutor) reconcileExistingPod(ctx context.Context, cluster *v1al
 		logger.Info("pod metadata updated", "duration", time.Since(start))
 	}
 	return e.ensureMaxmemory(ctx, pod, wantBytes)
+}
+
+func canRecreateDriftedPod(cluster *v1alpha1.RedisCluster, pod *corev1.Pod) bool {
+	if pod.Status.PodIP != "" || podInTopology(cluster, pod.Name) {
+		return false
+	}
+	return metav1.IsControlledBy(pod, cluster) ||
+		pod.Labels[labelCluster] == cluster.Name && pod.Labels[labelManagedBy] == "redis-cluster-controller"
 }
 
 func (e *ActionExecutor) ensureMaxmemory(ctx context.Context, pod *corev1.Pod, wantBytes int64) (StepOutcome, error) {
@@ -287,10 +309,10 @@ func podSpecDrift(pod *corev1.Pod, image, memorySize string) string {
 	if c.Image != image {
 		return fmt.Sprintf("image %q != desired %q", c.Image, image)
 	}
-	if !stringSliceEqual(c.Command, redisCommand()) {
+	if !slices.Equal(c.Command, redisCommand()) {
 		return "command mismatch"
 	}
-	if !stringSliceEqual(c.Args, redisArgs()) {
+	if !slices.Equal(c.Args, redisArgs()) {
 		return "args mismatch"
 	}
 	wantQ := resource.MustParse(memorySize)
@@ -353,16 +375,4 @@ func memoryBytes(s string) (int64, error) {
 		return 0, err
 	}
 	return q.Value(), nil
-}
-
-func stringSliceEqual(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
 }

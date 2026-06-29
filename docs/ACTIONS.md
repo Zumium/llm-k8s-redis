@@ -77,7 +77,7 @@ Params：
 - Controller 必须在 Pod 上设置 `ownerReference` 指向 RedisCluster CR，建立 K8S 层面的从属关系
 - Controller 必须在 Pod 上设置 labels/annotations，标识其所属 RedisCluster、Pod 名称、计划角色等信息，便于后续查询和状态重建
 - `memorySize`的值通过Redis命令`CONFIG SET maxmemory xxx`设置到节点中
-- 如果 Pod 已存在，则校验 image、memorySize、labels、annotations、ownerReference 等是否符合期望（查询命令`CONFIG GET maxmemory`）
+- 如果 Pod 已存在，则修复 labels、annotations、ownerReference；若 image、command、args、memorySize 等不可变字段漂移，未入群 Pod 会删除后重建，疑似已入群 Pod 失败并交给安全删除/替换流程处理（查询命令`CONFIG GET maxmemory`）
 - `EnsureNode` 只负责确保 Redis 进程资源存在，不负责 Redis Cluster meet、replica 关系或 slots 分配
 
 安全校验：
@@ -221,24 +221,25 @@ Params：
 
 实现简述：
 
-- Controller 解析 `slots` 范围，并查询每个 slot 当前归属
+- Controller 解析 `slots` 范围，并查询每个 slot 当前归属；如果 live owner 已不是计划里的 `sourcePod`，但仍是 healthy managed Master，则从 live owner 继续迁移
 - 如果某个目标 slot 已经归属于目标 Master，则该 slot 视为已完成
+- 如果某个目标 slot 暂无 owner，则在目标 Master 上执行 `CLUSTER ADDSLOTS` 修复缺口
 - 对每个需要迁移的 slot，将目标 Master 标记为 `IMPORTING`，源 Master 标记为 `MIGRATING`
 - 从源 Master 扫描属于该 slot 的 keys，并使用受控 Redis 迁移流程迁移到目标 Master
 - 每次 reconcile 中，单个 `MigrateSlots` 最多并发处理 8 个 slots；每个 slot 每批最多迁移 100 个 keys，未完成时返回 `Running`，下一轮 reconcile 从 live Redis 状态继续
 - 连续的多个 `MigrateSlots` step 如果 source Pod 和 target Pod 都互不重复，可以在同一次 reconcile 中并发执行
 - key 迁移完成后，将该 slot 的 owner 切换为目标 Master
 - 每迁移一批 slots 后重新观察 cluster 状态，确保可以从中断处继续执行
-- 所有 slots 迁移完成后，清理临时迁移状态并确认 slot owner 已变为 `target`
+- 所有 slots 迁移完成后，从最多 3 个独立 healthy Master 读取 `CLUSTER NODES`，全部确认 slot owner 已变为 `target` 后才完成；不足 3 个 Master 时要求所有可用 Master 全部确认
 
 安全校验：
 
 - source Pod 和 target Pod 必须已被 `EnsureNode` 声明，或存在于当前 Redis Cluster 拓扑中
 - source Pod 和 target Pod 必须是 Master
-- source Pod 必须当前持有 `slots`
+- source Pod 必须是计划生成时的 Master；执行时 slots 可以已被其他 healthy managed Master 持有，Controller 会按 live owner 继续迁移；暂无 owner 的目标 slots 可直接补到 target
 - target Pod 必须已经至少有一个 Replica
 - source Pod 和 target Pod 不能是同一个 Pod
-- 如果目标 slot 归属于第三个 Master，`MigrateSlots` 必须失败
+- 如果目标 slot 归属于无法映射到 managed healthy Master 的第三方节点，`MigrateSlots` 必须失败
 - 如果目标 slot 已处于与当前 source/target 不一致的 migrating/importing 状态，`MigrateSlots` 必须失败
 - `slots` 必须在 `0-16383` 范围内
 - `namespace` 必须等于 Redis Cluster 集群名

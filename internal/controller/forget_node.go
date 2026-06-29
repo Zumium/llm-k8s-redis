@@ -21,9 +21,13 @@ func (e *ActionExecutor) forgetNode(ctx context.Context, cluster *v1alpha1.Redis
 	if !ok {
 		return outcome, err
 	}
-	podName, outcome, err, ok := requireString(step.Params, "pod")
-	if !ok {
-		return outcome, err
+	podName, _ := paramString(step.Params, "pod")
+	targetName := podName
+	if targetName == "" {
+		targetName, _ = paramString(step.Params, "lastKnownNodeId")
+	}
+	if targetName == "" {
+		return paramErr("pod or lastKnownNodeId is required")
 	}
 	if ns != cluster.Name {
 		return paramErr("namespace %q must equal cluster name %q", ns, cluster.Name)
@@ -35,10 +39,10 @@ func (e *ActionExecutor) forgetNode(ctx context.Context, cluster *v1alpha1.Redis
 	}
 	seed, ok := pickSeedPod(pods)
 	if !ok {
-		logger.Info("no seed pod available for forget node", "pod", podName, "pods", len(pods))
-		return running("no ready managed pod available to forget %s", podName), nil
+		logger.Info("no seed pod available for forget node", "target", targetName, "pods", len(pods))
+		return running("no ready managed pod available to forget %s", targetName), nil
 	}
-	logger.Info("forget node seed selected", "seedPod", seed.Name, "addr", podRedisAddr(&seed), "targetPod", podName)
+	logger.Info("forget node seed selected", "seedPod", seed.Name, "addr", podRedisAddr(&seed), "target", targetName)
 	rc, err := e.RedisFactory(podRedisAddr(&seed))
 	if err != nil {
 		logger.Error(err, "build redis client for forget node failed", "seedPod", seed.Name)

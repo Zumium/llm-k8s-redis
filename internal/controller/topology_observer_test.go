@@ -287,6 +287,36 @@ func TestCollectObservedNodes_UsesMostCompleteSeedSnapshot(t *testing.T) {
 	}
 }
 
+func TestCollectObservedNodes_IgnoresTransientMasterSlotDisagreement(t *testing.T) {
+	ctx := context.Background()
+	cluster := testCluster()
+	pods := vcFourReadyPods()
+	exec := vcExec(t, cluster, pods, nil)
+	exec.RedisFactory = func(addr string) (redis.Client, error) {
+		switch addr {
+		case "10.0.0.1:6379":
+			return &fakeRedisClient{clusterNodes: func() (string, error) { return clusterOK(), nil }}, nil
+		default:
+			return &fakeRedisClient{
+				clusterNodes: func() (string, error) {
+					return vcMaster0ID + " 10.0.0.1:6379@16379 master - 0 0 1 connected 0-8191\n" +
+						vcMaster1ID + " 10.0.0.2:6379@16379 master - 0 0 2 connected 8193-16383\n" +
+						vcReplica0ID + " 10.0.0.3:6379@16379 slave " + vcMaster0ID + " 0 0 3 connected\n" +
+						vcReplica1ID + " 10.0.0.4:6379@16379 slave " + vcMaster1ID + " 0 0 4 connected\n", nil
+				},
+			}, nil
+		}
+	}
+
+	nodes, err := exec.CollectObservedNodes(ctx, cluster)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(nodes) != 4 {
+		t.Fatalf("expected observed nodes from seed snapshot, got %#v", nodes)
+	}
+}
+
 func TestObserveTopology_FactoryError(t *testing.T) {
 	ctx := context.Background()
 	cluster := testCluster()

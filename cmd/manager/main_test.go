@@ -2,8 +2,11 @@ package main
 
 import (
 	"context"
+	"errors"
 	"testing"
 
+	"github.com/Zumium/llm-k8s-redis/internal/plan"
+	"github.com/Zumium/llm-k8s-redis/internal/planner"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -53,5 +56,23 @@ func TestNewLLMPlannerFromConfigMap(t *testing.T) {
 	}
 	if p.LLMClient == nil {
 		t.Fatal("client is nil")
+	}
+}
+
+func TestPlannerForModeDisabledKeepsGoPlanner(t *testing.T) {
+	p := plannerForMode(true, nil)
+	spec := plan.ClusterSpec{Name: "example", Generation: 3, Shards: 2, ReplicasPerShard: 1, Image: "redis:7.2", MemorySize: "2Gi"}
+
+	got, err := p.Plan(context.Background(), planner.Request{Spec: spec})
+	if err != nil {
+		t.Fatalf("deterministic create should work with llm disabled: %v", err)
+	}
+	if got.PlanID != "go-create-3" {
+		t.Fatalf("planID = %q", got.PlanID)
+	}
+
+	_, err = p.Plan(context.Background(), planner.Request{Spec: plan.ClusterSpec{Name: "example", Generation: 3, Shards: 2, ReplicasPerShard: 0, Image: "redis:7.2", MemorySize: "2Gi"}})
+	if !errors.Is(err, planner.ErrNotConfigured) {
+		t.Fatalf("unsupported disabled plan err = %v", err)
 	}
 }

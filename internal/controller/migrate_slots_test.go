@@ -88,6 +88,119 @@ func TestMigrateSlots_AlreadyOwnedByTargetCompletes(t *testing.T) {
 	}
 }
 
+func TestMigrateSlots_WaitsForTargetMasterView(t *testing.T) {
+	ctx := context.Background()
+	cluster := testCluster()
+	migrateTopology(cluster)
+	fc := &fakeRedisClient{
+		clusterNodesAddr: func(addr string) (string, error) {
+			if addr == "10.0.0.3:6379" {
+				return migrateClusterNodes("0-8191", "8192-16383"), nil
+			}
+			return migrateClusterNodes("1-8191", "0 8192-16383"), nil
+		},
+	}
+	exec := migrateExec(t, cluster, fc)
+
+	outcome, err := exec.ExecuteStep(ctx, cluster, migratePlan(), 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if outcome.Status != plan.StepStateRunning {
+		t.Fatalf("expected Running, got %q: %s", outcome.Status, outcome.Message)
+	}
+	if len(fc.setSlotCalls) != 0 || len(fc.migrateCalls) != 0 {
+		t.Fatalf("expected no redis mutations, got setslot=%v migrate=%v", fc.setSlotCalls, fc.migrateCalls)
+	}
+}
+
+func TestMigrateSlots_WaitsForThirdMasterView(t *testing.T) {
+	ctx := context.Background()
+	cluster := testCluster()
+	migrateTopology(cluster)
+	fc := &fakeRedisClient{
+		clusterNodesAddr: func(addr string) (string, error) {
+			base := migrateClusterNodes("1-8191", "0 8192-16383")
+			third := "third333 10.0.0.5:6379@16379 master - 0 0 5 connected\n"
+			if addr == "10.0.0.5:6379" {
+				return migrateClusterNodes("0-8191", "8192-16383") + third, nil
+			}
+			return base + third, nil
+		},
+	}
+	exec := migrateExec(t, cluster, fc)
+	thirdPod := readyPodWithIP(cluster, "redis-4", "10.0.0.5")
+	if err := ctrl.SetControllerReference(cluster, thirdPod, exec.Scheme); err != nil {
+		t.Fatalf("set owner ref: %v", err)
+	}
+	if err := exec.Create(ctx, thirdPod); err != nil {
+		t.Fatalf("create third pod: %v", err)
+	}
+
+	outcome, err := exec.ExecuteStep(ctx, cluster, migratePlan(), 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if outcome.Status != plan.StepStateRunning {
+		t.Fatalf("expected Running, got %q: %s", outcome.Status, outcome.Message)
+	}
+}
+
+func TestMigrateSlots_UsesLiveManagedOwnerWhenPlanSourceIsStale(t *testing.T) {
+	ctx := context.Background()
+	cluster := testCluster()
+	migrateTopology(cluster)
+	thirdID := "third333"
+	before := thirdID + " 10.0.0.5:6379@16379 master - 0 0 5 connected 0\n" +
+		migrateClusterNodes("1-8191", "8192-16383")
+	after := thirdID + " 10.0.0.5:6379@16379 master - 0 0 5 connected\n" +
+		migrateClusterNodes("1-8191", "0 8192-16383")
+	fc := &fakeRedisClient{}
+	exec := migrateExec(t, cluster, fc)
+	exec.RedisFactory = func(addr string) (redis.Client, error) {
+		return &addrFakeRedisClient{fakeRedisClient: fc, addr: addr}, nil
+	}
+	thirdPod := readyPodWithIP(cluster, "redis-4", "10.0.0.5")
+	if err := ctrl.SetControllerReference(cluster, thirdPod, exec.Scheme); err != nil {
+		t.Fatalf("set owner ref: %v", err)
+	}
+	if err := exec.Create(ctx, thirdPod); err != nil {
+		t.Fatalf("create third pod: %v", err)
+	}
+	fc.clusterNodesAddr = func(string) (string, error) {
+		fc.mu.Lock()
+		calls := len(fc.setSlotCalls)
+		fc.mu.Unlock()
+		if calls >= 4 {
+			return after, nil
+		}
+		return before, nil
+	}
+
+	outcome, err := exec.ExecuteStep(ctx, cluster, migratePlan(), 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if outcome.Status != plan.StepStateCompleted {
+		t.Fatalf("expected Completed, got %q: %s", outcome.Status, outcome.Message)
+	}
+	want := []setSlotCall{
+		{mode: "IMPORTING", slot: 0, nodeID: thirdID},
+		{mode: "MIGRATING", slot: 0, nodeID: migrateTargetID},
+		{addr: "10.0.0.5:6379", mode: "NODE", slot: 0, nodeID: migrateTargetID},
+		{addr: "10.0.0.3:6379", mode: "NODE", slot: 0, nodeID: migrateTargetID},
+		{addr: "10.0.0.1:6379", mode: "NODE", slot: 0, nodeID: migrateTargetID},
+	}
+	if len(fc.setSlotCalls) != len(want) {
+		t.Fatalf("expected %d setslot calls, got %d: %v", len(want), len(fc.setSlotCalls), fc.setSlotCalls)
+	}
+	for i := range want {
+		if fc.setSlotCalls[i] != want[i] {
+			t.Fatalf("setslot call %d = %+v, want %+v", i, fc.setSlotCalls[i], want[i])
+		}
+	}
+}
+
 func TestMigrateSlots_EmptySlotSwitchesOwner(t *testing.T) {
 	ctx := context.Background()
 	cluster := testCluster()
@@ -124,6 +237,37 @@ func TestMigrateSlots_EmptySlotSwitchesOwner(t *testing.T) {
 		if fc.setSlotCalls[i] != want[i] {
 			t.Fatalf("setslot call %d = %+v, want %+v", i, fc.setSlotCalls[i], want[i])
 		}
+	}
+}
+
+func TestMigrateSlots_UnownedSlotAddsToTarget(t *testing.T) {
+	ctx := context.Background()
+	cluster := testCluster()
+	migrateTopology(cluster)
+	calls := 0
+	fc := &fakeRedisClient{
+		clusterNodes: func() (string, error) {
+			calls++
+			if calls <= 2 {
+				return migrateClusterNodes("1-8191", "8192-16383"), nil
+			}
+			return migrateClusterNodes("1-8191", "0 8192-16383"), nil
+		},
+	}
+	exec := migrateExec(t, cluster, fc)
+
+	outcome, err := exec.ExecuteStep(ctx, cluster, migratePlan(), 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if outcome.Status != plan.StepStateCompleted {
+		t.Fatalf("expected Completed, got %q: %s", outcome.Status, outcome.Message)
+	}
+	if len(fc.addSlotsCalls) != 1 || len(fc.addSlotsCalls[0]) != 1 || fc.addSlotsCalls[0][0] != 0 {
+		t.Fatalf("expected one ADDSLOTS call for slot 0, got %v", fc.addSlotsCalls)
+	}
+	if len(fc.setSlotCalls) != 0 || len(fc.migrateCalls) != 0 {
+		t.Fatalf("expected no migration commands, got setslot=%v migrate=%v", fc.setSlotCalls, fc.migrateCalls)
 	}
 }
 

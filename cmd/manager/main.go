@@ -73,7 +73,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	var p planner.Planner = planner.NoopPlanner{}
+	var p planner.Planner
 	planValidationRetries := 0
 	if !disableLLMPlanner {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -83,9 +83,9 @@ func main() {
 			setupLog.Error(err, "unable to load llm config")
 			os.Exit(1)
 		}
-		p = llmPlanner
+		p = plannerForMode(false, llmPlanner)
 		planValidationRetries = config.PlanValidationRetries
-		setupLog.Info("using fixed llm planner backed by configmap", "name", llmConfigMapName, "namespace", llmConfigMapNS, "model", config.Model)
+		setupLog.Info("using go planner with llm fallback backed by configmap", "name", llmConfigMapName, "namespace", llmConfigMapNS, "model", config.Model)
 
 		if config.HasEmbeddingConfig() {
 			ret, err := newPlanRetrieverFromConfig(config)
@@ -97,7 +97,8 @@ func main() {
 			_ = ret
 		}
 	} else {
-		setupLog.Info("llm planner disabled; using NoopPlanner")
+		p = plannerForMode(true, nil)
+		setupLog.Info("llm planner disabled; using go planner with NoopPlanner fallback")
 	}
 
 	executor := &controller.ActionExecutor{Client: mgr.GetClient(), Scheme: scheme, RedisFactory: redis.DefaultFactory}
@@ -131,6 +132,13 @@ func main() {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
 	}
+}
+
+func plannerForMode(disableLLM bool, llmPlanner planner.Planner) planner.Planner {
+	if disableLLM {
+		return planner.NewGoPlanner(planner.NoopPlanner{})
+	}
+	return planner.NewGoPlanner(llmPlanner)
 }
 
 func newLLMPlannerFromConfigMap(ctx context.Context, reader client.Reader, key types.NamespacedName) (*planner.LLMPlanner, planner.Config, error) {

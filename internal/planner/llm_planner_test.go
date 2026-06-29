@@ -251,7 +251,7 @@ func TestLLMPlanner_PromptContainsActionSemantics(t *testing.T) {
 		"MigrateSlots: Move slots from source master to target master",
 		"execution continues in batches",
 		"ForgetNode: Remove a node from Redis Cluster membership without deleting its Pod",
-		"include lastKnownNodeId when the Pod is gone",
+		"use lastKnownNodeId when the Pod is gone or unmapped",
 		"DeleteNode: Delete the Kubernetes resources for a node",
 		"only safe after ForgetNode or if the node never joined Redis Cluster",
 		"VerifyCluster: Verify final state without changing topology",

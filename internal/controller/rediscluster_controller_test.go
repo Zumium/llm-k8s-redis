@@ -639,7 +639,7 @@ func TestExecuteNextStep_PersistsUpdatedParams(t *testing.T) {
 	}
 }
 
-func TestExecuteNextStep_RunsIndependentMigrateStepsTogether(t *testing.T) {
+func TestExecuteNextStep_RunsOnlyCurrentMigrateStep(t *testing.T) {
 	ctx := context.Background()
 	scheme := newScheme(t)
 	cluster := testCluster()
@@ -667,10 +667,10 @@ func TestExecuteNextStep_RunsIndependentMigrateStepsTogether(t *testing.T) {
 	exec.mu.Lock()
 	got := append([]int{}, exec.indices...)
 	exec.mu.Unlock()
-	if len(got) != 2 || !containsIndex(got, 0) || !containsIndex(got, 1) {
-		t.Fatalf("expected steps 0 and 1 to run, got %v", got)
+	if len(got) != 1 || got[0] != 0 {
+		t.Fatalf("expected only step 0 to run, got %v", got)
 	}
-	if active.Steps[0].Status != string(plan.StepStateCompleted) || active.Steps[1].Status != string(plan.StepStateCompleted) || active.Steps[2].Status != string(plan.StepStatePending) {
+	if active.Steps[0].Status != string(plan.StepStateCompleted) || active.Steps[1].Status != string(plan.StepStatePending) || active.Steps[2].Status != string(plan.StepStatePending) {
 		t.Fatalf("unexpected statuses: %#v", active.Steps)
 	}
 }
@@ -703,58 +703,6 @@ func TestExecuteNextStep_DoesNotBatchConflictingMigrateSteps(t *testing.T) {
 	}
 	if active.Steps[0].Status != string(plan.StepStateCompleted) || active.Steps[1].Status != string(plan.StepStatePending) {
 		t.Fatalf("unexpected statuses: %#v", active.Steps)
-	}
-}
-
-func containsIndex(items []int, want int) bool {
-	for _, item := range items {
-		if item == want {
-			return true
-		}
-	}
-	return false
-}
-
-func TestExecuteNextStep_LimitsMigrateBatchSizeToFour(t *testing.T) {
-	ctx := context.Background()
-	scheme := newScheme(t)
-	cluster := testCluster()
-	p := &plan.Plan{PlanID: "migrate", TargetGeneration: 1, Steps: []plan.Step{
-		{ID: "m0", Action: plan.ActionMigrateSlots, Params: map[string]any{"namespace": "example", "sourcePod": "redis-0", "targetPod": "redis-10", "slots": "0-1"}},
-		{ID: "m1", Action: plan.ActionMigrateSlots, Params: map[string]any{"namespace": "example", "sourcePod": "redis-1", "targetPod": "redis-11", "slots": "2-3"}},
-		{ID: "m2", Action: plan.ActionMigrateSlots, Params: map[string]any{"namespace": "example", "sourcePod": "redis-2", "targetPod": "redis-12", "slots": "4-5"}},
-		{ID: "m3", Action: plan.ActionMigrateSlots, Params: map[string]any{"namespace": "example", "sourcePod": "redis-3", "targetPod": "redis-13", "slots": "6-7"}},
-		{ID: "m4", Action: plan.ActionMigrateSlots, Params: map[string]any{"namespace": "example", "sourcePod": "redis-4", "targetPod": "redis-14", "slots": "8-9"}},
-	}}
-	active, err := planToStatus(p)
-	if err != nil {
-		t.Fatalf("planToStatus: %v", err)
-	}
-	cluster.Status.ActivePlan = active
-	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster).WithStatusSubresource(&api.RedisCluster{}).Build()
-	exec := &recordingExecutor{}
-	r := &RedisClusterReconciler{Client: cl, Scheme: scheme, Driver: exec}
-
-	res, err := r.executeNextStep(ctx, cluster, active)
-	if err != nil {
-		t.Fatalf("executeNextStep: %v", err)
-	}
-	if !res.Requeue {
-		t.Fatal("expected requeue after completed migrate batch")
-	}
-	exec.mu.Lock()
-	got := append([]int{}, exec.indices...)
-	exec.mu.Unlock()
-	if len(got) != 4 {
-		t.Fatalf("expected 4 steps to run, got %v", got)
-	}
-	for i := 0; i < 4; i++ {
-		if !containsIndex(got, i) {
-			t.Fatalf("expected step %d to run, got %v", i, got)
-		}
-	}
-	if active.Steps[4].Status != string(plan.StepStatePending) {
-		t.Fatalf("expected step 4 to remain pending, got %#v", active.Steps[4])
 	}
 }
 

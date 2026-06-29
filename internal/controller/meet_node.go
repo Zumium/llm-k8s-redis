@@ -28,24 +28,22 @@ func (e *ActionExecutor) meetNode(ctx context.Context, cluster *v1alpha1.RedisCl
 		return outcome, err
 	}
 
-	if ns != cluster.Name {
-		return paramErr("namespace %q must equal cluster name %q", ns, cluster.Name)
+	if outcome, err, ok := validateClusterNamespace(cluster, ns); !ok {
+		return outcome, err
 	}
 	if sourcePod == targetPod {
 		return paramErr("sourcePod %q and targetPod must differ", sourcePod)
 	}
-	sourceExists := podInTopology(cluster, sourcePod)
-	targetExists := podInTopology(cluster, targetPod)
-	if !sourceExists && !precededEnsureNode(p, stepIndex, ns, sourcePod) {
+	if !podDeclaredOrInTopology(cluster, p, stepIndex, ns, sourcePod) {
 		return paramErr("source pod %s/%s was not declared by a preceding EnsureNode", ns, sourcePod)
 	}
-	if !targetExists && !precededEnsureNode(p, stepIndex, ns, targetPod) {
+	if !podDeclaredOrInTopology(cluster, p, stepIndex, ns, targetPod) {
 		return paramErr("target pod %s/%s was not declared by a preceding EnsureNode", ns, targetPod)
 	}
-	if !sourceExists && !precededWaitNodeReady(p, stepIndex, ns, sourcePod) {
+	if !podWaitedOrInTopology(cluster, p, stepIndex, ns, sourcePod) {
 		return paramErr("source pod %s/%s has not completed a preceding WaitNodeReady", ns, sourcePod)
 	}
-	if !targetExists && !precededWaitNodeReady(p, stepIndex, ns, targetPod) {
+	if !podWaitedOrInTopology(cluster, p, stepIndex, ns, targetPod) {
 		return paramErr("target pod %s/%s has not completed a preceding WaitNodeReady", ns, targetPod)
 	}
 
@@ -149,6 +147,22 @@ func podInTopology(cluster *v1alpha1.RedisCluster, podName string) bool {
 		}
 	}
 	return false
+}
+
+func validateClusterNamespace(cluster *v1alpha1.RedisCluster, ns string) (StepOutcome, error, bool) {
+	if ns == cluster.Name {
+		return StepOutcome{}, nil, true
+	}
+	outcome, err := paramErr("namespace %q must equal cluster name %q", ns, cluster.Name)
+	return outcome, err, false
+}
+
+func podDeclaredOrInTopology(cluster *v1alpha1.RedisCluster, p *plan.Plan, stepIndex int, ns, podName string) bool {
+	return podInTopology(cluster, podName) || precededEnsureNode(p, stepIndex, ns, podName)
+}
+
+func podWaitedOrInTopology(cluster *v1alpha1.RedisCluster, p *plan.Plan, stepIndex int, ns, podName string) bool {
+	return podInTopology(cluster, podName) || precededWaitNodeReady(p, stepIndex, ns, podName)
 }
 
 func clusterNodesContainsIP(nodesOut, ip string) bool {

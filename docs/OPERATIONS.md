@@ -364,9 +364,9 @@ Shard ScaleIn 安全校验：
 - Plan 只能包含 `EnsureNode`、`WaitNodeReady`、`MeetNode`、`ReplicateNode`、`MigrateSlots`、`ForgetNode`、`DeleteNode`、`VerifyCluster`
 - 新 Pod 数量必须等于 `spec.shards * (1 + spec.replicasPerShard)`，并从历史最大 `redis-N + 1` 开始连续命名
 - 每个新 Master 必须在迁移 slots 前拥有目标数量的 Replica
-- `MigrateSlots` 的 source 必须是旧 Master，target 必须是新 Master
+- `MigrateSlots` 的 source 必须是计划生成时的旧 Master，target 必须是新 Master；执行时按 live slot owner 续迁，避免前序迁移导致 source 参数过期
 - `MigrateSlots` 的 slots 必须精确匹配 Controller 按新 Master 顺序计算出的迁移矩阵
-- 每个旧 Master 和旧 Replica 必须先 `ForgetNode`，再 `DeleteNode`
+- 每个旧 Master 和旧 Replica 必须先 `ForgetNode`，再 `DeleteNode`；`ForgetNode` 应携带 `lastKnownNodeId` 以便 Pod 已删除时仍能清理 Redis gossip
 - Plan 最后必须包含 `VerifyCluster`
 
 ## Repair
@@ -416,5 +416,5 @@ Controller 在执行这类 Plan 前必须做 schema 校验和安全校验：
 - Master 删除且没有健康 Replica 时，Plan 必须被拒绝
 - replacement Pod 必须使用历史最大 ordinal + 1 的新名称，不能复用被删除 Pod 名或填补历史 ordinal 空洞
 - `ForgetNode` 只能清理已不存在、已失去角色、或不再持有 slots 的旧节点
-- 用于清理已删除 Pod 的 `ForgetNode` 必须携带 `lastKnownNodeId`
+- 用于清理已删除或无法映射回 Pod 名的 Redis ghost 的 `ForgetNode` 必须携带 `lastKnownNodeId`
 - Plan 最后必须包含 `VerifyCluster`，并按当前 `spec` 校验

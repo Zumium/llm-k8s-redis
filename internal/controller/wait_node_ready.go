@@ -25,8 +25,8 @@ func (e *ActionExecutor) waitNodeReady(ctx context.Context, cluster *v1alpha1.Re
 		return outcome, err
 	}
 
-	if ns != cluster.Name {
-		return paramErr("namespace %q must equal cluster name %q", ns, cluster.Name)
+	if outcome, err, ok := validateClusterNamespace(cluster, ns); !ok {
+		return outcome, err
 	}
 	if !precededEnsureNode(p, stepIndex, ns, podName) {
 		return paramErr("step %q: pod %s/%s was not declared by a preceding EnsureNode", p.Steps[stepIndex].ID, ns, podName)
@@ -102,19 +102,32 @@ func podReady(pod *corev1.Pod) bool {
 }
 
 func refreshExistingTopologyNode(cluster *v1alpha1.RedisCluster, podName, nodeID string) {
+	refreshExistingTopologyPod(cluster, podName, func(node *v1alpha1.NodeTopology) {
+		node.NodeID = nodeID
+		node.Ready = true
+	})
+}
+
+func refreshExistingTopologySlots(cluster *v1alpha1.RedisCluster, podName, nodeID, slots string) {
+	refreshExistingTopologyPod(cluster, podName, func(node *v1alpha1.NodeTopology) {
+		node.NodeID = nodeID
+		node.Ready = true
+		node.Slots = slots
+	})
+}
+
+func refreshExistingTopologyPod(cluster *v1alpha1.RedisCluster, podName string, edit func(*v1alpha1.NodeTopology)) {
 	if cluster.Status.Topology == nil {
 		return
 	}
 	for i := range cluster.Status.Topology.Shards {
 		sh := &cluster.Status.Topology.Shards[i]
 		if sh.Master.Pod == podName {
-			sh.Master.NodeID = nodeID
-			sh.Master.Ready = true
+			edit(&sh.Master)
 		}
 		for j := range sh.Replicas {
 			if sh.Replicas[j].Pod == podName {
-				sh.Replicas[j].NodeID = nodeID
-				sh.Replicas[j].Ready = true
+				edit(&sh.Replicas[j])
 			}
 		}
 	}

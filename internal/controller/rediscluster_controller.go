@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -55,30 +54,7 @@ func (r *RedisClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	}()
 	logger.Info("reconcile started")
 
-	if r.Planner == nil {
-		r.Planner = planner.NoopPlanner{}
-		logger.Info("default planner initialized")
-	}
-	if r.APIReader == nil {
-		r.APIReader = r.Client
-		logger.Info("default api reader initialized")
-	}
-	if r.Driver == nil {
-		r.Driver = &ActionExecutor{Client: r.Client, Scheme: r.Scheme}
-		logger.Info("default driver initialized")
-	}
-	if r.ValidatePlan == nil {
-		r.ValidatePlan = plan.NewValidator().Validate
-		logger.Info("default plan validator initialized")
-	}
-	if r.TopologyRefreshInterval <= 0 {
-		r.TopologyRefreshInterval = 60 * time.Second
-		logger.Info("default topology refresh interval initialized", "interval", r.TopologyRefreshInterval)
-	}
-	if r.TopologyStaleThreshold <= 0 {
-		r.TopologyStaleThreshold = 10 * time.Second
-		logger.Info("default topology stale threshold initialized", "threshold", r.TopologyStaleThreshold)
-	}
+	r.initDefaults(ctx)
 
 	var cluster v1alpha1.RedisCluster
 	if err := r.Get(ctx, req.NamespacedName, &cluster); err != nil {
@@ -146,6 +122,34 @@ func (r *RedisClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	return r.finish(ctx, &cluster, ctrl.Result{RequeueAfter: r.TopologyRefreshInterval}, nil)
 }
 
+func (r *RedisClusterReconciler) initDefaults(ctx context.Context) {
+	logger := log.FromContext(ctx)
+	if r.Planner == nil {
+		r.Planner = planner.NoopPlanner{}
+		logger.Info("default planner initialized")
+	}
+	if r.APIReader == nil {
+		r.APIReader = r.Client
+		logger.Info("default api reader initialized")
+	}
+	if r.Driver == nil {
+		r.Driver = &ActionExecutor{Client: r.Client, Scheme: r.Scheme}
+		logger.Info("default driver initialized")
+	}
+	if r.ValidatePlan == nil {
+		r.ValidatePlan = plan.NewValidator().Validate
+		logger.Info("default plan validator initialized")
+	}
+	if r.TopologyRefreshInterval <= 0 {
+		r.TopologyRefreshInterval = 60 * time.Second
+		logger.Info("default topology refresh interval initialized", "interval", r.TopologyRefreshInterval)
+	}
+	if r.TopologyStaleThreshold <= 0 {
+		r.TopologyStaleThreshold = 10 * time.Second
+		logger.Info("default topology stale threshold initialized", "threshold", r.TopologyStaleThreshold)
+	}
+}
+
 func (r *RedisClusterReconciler) handleActivePlan(ctx context.Context, cluster *v1alpha1.RedisCluster, spec plan.ClusterSpec) (ctrl.Result, error, bool) {
 	logger := log.FromContext(ctx)
 	active := cluster.Status.ActivePlan
@@ -160,12 +164,8 @@ func (r *RedisClusterReconciler) handleActivePlan(ctx context.Context, cluster *
 	state := planState(active)
 	logger.Info("active plan found", "planID", active.ID, "planState", state, "targetGeneration", active.TargetGeneration, "steps", len(active.Steps))
 	if active.TargetGeneration != cluster.Generation {
-		cluster.Status.ActivePlan = nil
-		setCondition(cluster, ConditionReady, metav1.ConditionFalse, "Replanning", "active plan targets an older generation")
-		setCondition(cluster, ConditionPlanned, metav1.ConditionFalse, "PlanSuperseded", "active plan targets an older generation")
 		logger.Info("active plan superseded by generation", "planID", active.ID, "targetGeneration", active.TargetGeneration, "generation", cluster.Generation)
-		res, err := r.finish(ctx, cluster, ctrl.Result{Requeue: true}, nil)
-		return res, err, true
+		return r.clearActivePlanAndRequeue(ctx, cluster, "active plan targets an older generation", "active plan targets an older generation")
 	}
 	switch state {
 	case plan.PlanStateCompleted:
@@ -176,12 +176,8 @@ func (r *RedisClusterReconciler) handleActivePlan(ctx context.Context, cluster *
 			res, err := r.finish(ctx, cluster, ctrl.Result{RequeueAfter: r.TopologyRefreshInterval}, nil)
 			return res, err, true
 		}
-		cluster.Status.ActivePlan = nil
-		setCondition(cluster, ConditionReady, metav1.ConditionFalse, "Replanning", "topology drifted")
-		setCondition(cluster, ConditionPlanned, metav1.ConditionFalse, "PlanSuperseded", "existing plan no longer valid")
 		logger.Info("completed plan drifted, replanning", "planID", active.ID)
-		res, err := r.finish(ctx, cluster, ctrl.Result{Requeue: true}, nil)
-		return res, err, true
+		return r.clearActivePlanAndRequeue(ctx, cluster, "topology drifted", "existing plan no longer valid")
 	case plan.PlanStateFailed:
 		if topologyMatchesSpec(cluster.Status.Topology, spec) {
 			r.event(cluster, "PlanFailedCleared", failedPlanMessage(active))
@@ -192,17 +188,21 @@ func (r *RedisClusterReconciler) handleActivePlan(ctx context.Context, cluster *
 			return res, err, true
 		}
 		r.event(cluster, "PlanFailedCleared", failedPlanMessage(active))
-		cluster.Status.ActivePlan = nil
-		setCondition(cluster, ConditionReady, metav1.ConditionFalse, "Replanning", "topology drifted")
-		setCondition(cluster, ConditionPlanned, metav1.ConditionFalse, "PlanSuperseded", "existing plan no longer valid")
 		logger.Info("failed plan cleared, replanning", "planID", active.ID)
-		res, err := r.finish(ctx, cluster, ctrl.Result{Requeue: true}, nil)
-		return res, err, true
+		return r.clearActivePlanAndRequeue(ctx, cluster, "topology drifted", "existing plan no longer valid")
 	default:
 		logger.Info("no work this reconcile")
 		res, err := r.finish(ctx, cluster, ctrl.Result{RequeueAfter: r.TopologyRefreshInterval}, nil)
 		return res, err, true
 	}
+}
+
+func (r *RedisClusterReconciler) clearActivePlanAndRequeue(ctx context.Context, cluster *v1alpha1.RedisCluster, readyMessage, plannedMessage string) (ctrl.Result, error, bool) {
+	cluster.Status.ActivePlan = nil
+	setCondition(cluster, ConditionReady, metav1.ConditionFalse, "Replanning", readyMessage)
+	setCondition(cluster, ConditionPlanned, metav1.ConditionFalse, "PlanSuperseded", plannedMessage)
+	res, err := r.finish(ctx, cluster, ctrl.Result{Requeue: true}, nil)
+	return res, err, true
 }
 
 func (r *RedisClusterReconciler) reconcilePlanIfStillNeeded(ctx context.Context, cluster *v1alpha1.RedisCluster) (ctrl.Result, error) {
@@ -310,8 +310,6 @@ func markNoPlanNeeded(cluster *v1alpha1.RedisCluster, message string) {
 	setCondition(cluster, ConditionReady, metav1.ConditionTrue, "ClusterReady", "cluster matches desired topology")
 }
 
-const maxMigrateBatchSize = 4
-
 func (r *RedisClusterReconciler) applyStepOutcome(ctx context.Context, cluster *v1alpha1.RedisCluster, active *v1alpha1.PlanStatus, planModel *plan.Plan, idx int, outcome StepOutcome, err error) bool {
 	logger := log.FromContext(ctx).WithValues("stepIndex", idx, "stepID", active.Steps[idx].ID)
 	if err != nil {
@@ -353,9 +351,6 @@ func (r *RedisClusterReconciler) executeNextStep(ctx context.Context, cluster *v
 		return r.finish(ctx, cluster, ctrl.Result{}, nil)
 	}
 	logger.Info("active plan restored", "duration", time.Since(restoreStart))
-	if step.Action == string(plan.ActionMigrateSlots) {
-		return r.executeMigrateStepBatch(ctx, cluster, active, planModel, idx)
-	}
 	execStart := time.Now()
 	outcome, err := r.Driver.ExecuteStep(ctx, cluster, planModel, idx)
 	logger.Info("step execution finished", "duration", time.Since(execStart), "status", outcome.Status, "message", outcome.Message)
@@ -376,90 +371,6 @@ func (r *RedisClusterReconciler) executeNextStep(ctx context.Context, cluster *v
 		logger.Info("step returned unknown status", "status", outcome.Status)
 		return r.finish(ctx, cluster, ctrl.Result{RequeueAfter: time.Second}, nil)
 	}
-}
-
-type stepExecutionResult struct {
-	index   int
-	outcome StepOutcome
-	err     error
-}
-
-func (r *RedisClusterReconciler) executeMigrateStepBatch(ctx context.Context, cluster *v1alpha1.RedisCluster, active *v1alpha1.PlanStatus, planModel *plan.Plan, start int) (ctrl.Result, error) {
-	logger := log.FromContext(ctx).WithValues("planID", active.ID)
-	indices := independentMigrateStepBatch(active, planModel, start)
-	if len(indices) == 0 {
-		indices = []int{start}
-	}
-
-	batchCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	results := make(chan stepExecutionResult, len(indices))
-	var wg sync.WaitGroup
-	for _, idx := range indices {
-		wg.Add(1)
-		go func(idx int) {
-			defer wg.Done()
-			execStart := time.Now()
-			outcome, err := r.Driver.ExecuteStep(batchCtx, cluster, planModel, idx)
-			log.FromContext(ctx).WithValues("stepIndex", idx, "stepID", active.Steps[idx].ID, "action", active.Steps[idx].Action).Info("step execution finished", "duration", time.Since(execStart), "status", outcome.Status, "message", outcome.Message, "error", err)
-			results <- stepExecutionResult{index: idx, outcome: outcome, err: err}
-		}(idx)
-	}
-	wg.Wait()
-	close(results)
-
-	failed := ""
-	running := false
-	for result := range results {
-		if r.applyStepOutcome(ctx, cluster, active, planModel, result.index, result.outcome, result.err) {
-			failed = active.Steps[result.index].Message
-			cancel()
-		} else if result.outcome.Status == plan.StepStateRunning {
-			running = true
-		}
-	}
-	active.CurrentStep = firstPendingID(active.Steps)
-	if failed != "" {
-		logger.Info("migrate step batch failed", "steps", len(indices), "message", failed)
-		setCondition(cluster, ConditionReady, metav1.ConditionFalse, "StepFailed", failed)
-		return r.finish(ctx, cluster, ctrl.Result{}, nil)
-	}
-	if running {
-		logger.Info("migrate step batch still running", "steps", len(indices))
-		return r.finish(ctx, cluster, ctrl.Result{RequeueAfter: time.Second}, nil)
-	}
-	logger.Info("migrate step batch completed", "steps", len(indices))
-	return r.finish(ctx, cluster, ctrl.Result{Requeue: true}, nil)
-}
-
-func independentMigrateStepBatch(active *v1alpha1.PlanStatus, p *plan.Plan, start int) []int {
-	indices := []int{}
-	sources := map[string]bool{}
-	targets := map[string]bool{}
-	for i := start; i < len(p.Steps); i++ {
-		if p.Steps[i].Action != plan.ActionMigrateSlots || active.Steps[i].Action != string(plan.ActionMigrateSlots) {
-			break
-		}
-		if active.Steps[i].Status == string(plan.StepStateCompleted) {
-			continue
-		}
-		source, sourceOK := paramString(p.Steps[i].Params, "sourcePod")
-		target, targetOK := paramString(p.Steps[i].Params, "targetPod")
-		if !sourceOK || !targetOK {
-			break
-		}
-		if sources[source] || targets[target] {
-			continue
-		}
-		sources[source] = true
-		targets[target] = true
-		indices = append(indices, i)
-		if len(indices) >= maxMigrateBatchSize {
-			break
-		}
-	}
-	return indices
 }
 
 func (r *RedisClusterReconciler) ensureNamespace(ctx context.Context, cluster *v1alpha1.RedisCluster) error {

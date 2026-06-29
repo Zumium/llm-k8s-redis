@@ -50,6 +50,7 @@ func (p *LLMPlanner) Plan(ctx context.Context, req Request) (*plan.Plan, error) 
 		return nil, err
 	}
 	setControllerOwnedFields(generatedPlan, req)
+	logger.Info("planner produced plan", "planner", "llm", "planID", generatedPlan.PlanID, "steps", len(generatedPlan.Steps), "targetGeneration", generatedPlan.TargetGeneration)
 	return generatedPlan, nil
 }
 

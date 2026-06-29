@@ -332,12 +332,12 @@ func (s *planSimulator) migrateSlots(step Step) error {
 }
 
 func (s *planSimulator) forgetNode(step Step) error {
-	pod, ok := paramString(step.Params, "pod")
-	if !ok || pod == "" {
-		return fmt.Errorf("ForgetNode requires a non-empty pod param")
-	}
+	pod, _ := paramString(step.Params, "pod")
 	key := pod
-	n := s.nodes[key]
+	var n *simulatedNode
+	if key != "" {
+		n = s.nodes[key]
+	}
 	if n == nil {
 		// The pod may be gone (ghost); fall back to lastKnownNodeId, which is
 		// the key under which addObservedNodes registered the node when its
@@ -348,10 +348,10 @@ func (s *planSimulator) forgetNode(step Step) error {
 		}
 	}
 	if n == nil || !n.clusterMember {
-		return fmt.Errorf("pod %q is not a known cluster member", pod)
+		return fmt.Errorf("ForgetNode target %q is not a known cluster member", key)
 	}
 	if len(n.slots) > 0 {
-		return fmt.Errorf("pod %q still owns slots", pod)
+		return fmt.Errorf("ForgetNode target %q still owns slots", key)
 	}
 	n.clusterMember = false
 	return nil
