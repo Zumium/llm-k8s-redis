@@ -15,8 +15,9 @@ type Driver interface {
 }
 
 type StepOutcome struct {
-	Status  plan.StepState
-	Message string
+	Status        plan.StepState
+	Message       string
+	SupersedePlan bool
 }
 
 var _ planner.Planner = planner.NoopPlanner{}

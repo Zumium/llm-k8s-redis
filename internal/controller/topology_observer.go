@@ -21,11 +21,17 @@ import (
 
 type clusterObservation struct {
 	entries  []rediscluster.Entry
+	views    []clusterView
 	topology *v1alpha1.ClusterTopology
 	pods     []corev1.Pod
 	podsByIP map[string]*corev1.Pod
 	healthy  bool
 	message  string
+}
+
+type clusterView struct {
+	Seed    string
+	Entries []rediscluster.Entry
 }
 
 func (e *ActionExecutor) ObserveTopology(ctx context.Context, cluster *v1alpha1.RedisCluster) error {
@@ -119,26 +125,60 @@ func (e *ActionExecutor) observeTopology(ctx context.Context, cluster *v1alpha1.
 		return obs, nil
 	}
 
-	nodesStart := time.Now()
-	nodesRaw, err := rc.ClusterNodes(ctx)
+	viewsStart := time.Now()
+	views, err := e.collectClusterViews(ctx, observationSeedPods(cluster, pods))
 	if err != nil {
-		obs.message = fmt.Sprintf("seed redis at %s CLUSTER NODES failed: %v", addr, err)
-		logger.Info("cluster nodes failed", "addr", addr, "duration", time.Since(nodesStart), "error", err)
+		obs.message = err.Error()
+		logger.Info("cluster nodes failed", "duration", time.Since(viewsStart), "error", err)
 		return obs, nil
 	}
-	entries := rediscluster.ParseNodes(nodesRaw)
-	logger.Info("cluster nodes read", "addr", addr, "duration", time.Since(nodesStart), "entries", len(entries))
-	if len(entries) == 0 {
+	if len(views) == 0 {
 		obs.message = fmt.Sprintf("seed redis at %s returned no CLUSTER NODES entries", addr)
 		logger.Info("cluster nodes returned no entries", "addr", addr)
 		return obs, nil
 	}
+	entries := bestClusterView(views).Entries
+	logger.Info("cluster nodes read", "duration", time.Since(viewsStart), "views", len(views), "entries", len(entries))
 
 	obs.entries = entries
+	obs.views = views
 	obs.topology = rebuildTopology(entries, pods, obs.podsByIP)
 	obs.healthy = true
 	logger.Info("topology rebuilt", "shards", len(obs.topology.Shards), "entries", len(entries), "pods", len(pods))
 	return obs, nil
+}
+
+func (e *ActionExecutor) collectClusterViews(ctx context.Context, seeds []corev1.Pod) ([]clusterView, error) {
+	var out []clusterView
+	var lastErr error
+	for _, seed := range seeds {
+		entries, err := e.clusterNodesFromSeed(ctx, seed)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if len(entries) == 0 {
+			continue
+		}
+		out = append(out, clusterView{Seed: seed.Name, Entries: entries})
+	}
+	if len(out) > 0 {
+		return out, nil
+	}
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	return nil, nil
+}
+
+func bestClusterView(views []clusterView) clusterView {
+	best := views[0]
+	for _, v := range views[1:] {
+		if len(v.Entries) > len(best.Entries) || (!ownsAllSlots(best.Entries) && ownsAllSlots(v.Entries)) {
+			best = v
+		}
+	}
+	return best
 }
 
 func (e *ActionExecutor) CollectObservedNodes(ctx context.Context, cluster *v1alpha1.RedisCluster) ([]plan.ObservedNode, error) {

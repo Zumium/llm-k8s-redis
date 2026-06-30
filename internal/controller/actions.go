@@ -75,6 +75,10 @@ func completed(format string, args ...any) StepOutcome {
 	return StepOutcome{Status: plan.StepStateCompleted, Message: fmt.Sprintf(format, args...)}
 }
 
+func needsRepair(format string, args ...any) StepOutcome {
+	return StepOutcome{Status: plan.StepStateFailed, Message: fmt.Sprintf(format, args...), SupersedePlan: true}
+}
+
 func paramString(params map[string]any, key string) (string, bool) {
 	if params == nil {
 		return "", false

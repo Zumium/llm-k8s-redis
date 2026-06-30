@@ -641,6 +641,35 @@ func TestExecuteNextStep_PersistsUpdatedParams(t *testing.T) {
 	}
 }
 
+func TestExecuteNextStep_NeedsRepairSupersedesPlan(t *testing.T) {
+	ctx := context.Background()
+	scheme := newScheme(t)
+	cluster := testCluster()
+	active := runningPlan()
+	cluster.Status.ActivePlan = active
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster).WithStatusSubresource(&api.RedisCluster{}).Build()
+	exec := &recordingExecutor{outcome: StepOutcome{
+		Status:        plan.StepStateFailed,
+		Message:       "repair needed",
+		SupersedePlan: true,
+	}}
+	r := &RedisClusterReconciler{Client: cl, Scheme: scheme, Driver: exec}
+
+	res, err := r.executeNextStep(ctx, cluster, active)
+	if err != nil {
+		t.Fatalf("executeNextStep: %v", err)
+	}
+	if !res.Requeue {
+		t.Fatal("expected requeue for replanning")
+	}
+	if active.Status != string(plan.PlanStateSuperseded) {
+		t.Fatalf("expected superseded plan, got %#v", active)
+	}
+	if active.Steps[0].Status != string(plan.StepStateRunning) {
+		t.Fatalf("expected running step while replanning, got %#v", active.Steps[0])
+	}
+}
+
 func TestExecuteNextStep_RunsOnlyCurrentMigrateStep(t *testing.T) {
 	ctx := context.Background()
 	scheme := newScheme(t)

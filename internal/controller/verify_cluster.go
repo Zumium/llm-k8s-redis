@@ -83,64 +83,91 @@ func (e *ActionExecutor) verifyCluster(ctx context.Context, cluster *v1alpha1.Re
 	}
 	logger.Info("verify cluster topology observed", "duration", time.Since(start), "entries", len(obs.entries), "shards", len(obs.topology.Shards))
 
+	state, message := classifyClusterView(obs, expectedShards, expectedReplicas)
+	if state == clusterViewConverging {
+		logger.Info("verify cluster waiting for convergence", "message", message)
+		return running("waiting for gossip to converge: %s", message), nil
+	}
+
 	outcome, stable, err := waitForStableCluster(step.Params, start, clusterObservationFingerprint(obs), "")
 	if err != nil || !stable {
 		return outcome, err
 	}
-
-	if bad := firstUnhealthyManagedNode(obs.entries); bad != "" {
-		logger.Info("verify cluster found unhealthy node", "node", bad)
-		return paramErr("cluster node not healthy: %s", bad)
-	}
-	if migrating := rediscluster.MigratingSlots(obs.entries); len(migrating) > 0 {
-		logger.Info("verify cluster found migrating slots", "slots", len(migrating))
-		return paramErr("cluster has %d slots in migrating/importing state", len(migrating))
-	}
-
-	owner, err := rediscluster.SlotOwnership(obs.entries)
-	if err != nil {
-		logger.Error(err, "verify cluster slot ownership failed")
-		return StepOutcome{Status: plan.StepStateFailed, Message: fmt.Sprintf("slot ownership inconsistent: %v", err)}, err
-	}
-	if viol := verifyFullSlotCoverage(owner, obs.entries); viol != "" {
-		logger.Info("verify cluster slot coverage violation", "violation", viol)
-		return paramErr("slot coverage violation: %s", viol)
-	}
-	logger.Info("verify cluster slot coverage passed", "slots", len(owner))
-
-	masters := rediscluster.HealthyMasters(obs.entries)
-	slotMasters := slotOwningMasters(masters)
-	if len(slotMasters) != expectedShards {
-		logger.Info("verify cluster slot-owning master count mismatch", "expected", expectedShards, "got", len(slotMasters), "healthyMasters", len(masters))
-		return paramErr("expected %d slot-owning masters, found %d", expectedShards, len(slotMasters))
-	}
-	if len(masters) != len(slotMasters) {
-		started := verifyStartedAt(step.Params, start)
-		if start.Sub(started) >= verifyStableTimeout {
-			logger.Info("verify cluster no-slot master convergence timeout", "expected", expectedShards, "healthyMasters", len(masters), "slotOwningMasters", len(slotMasters))
-			return paramErr("cluster did not converge within %s: expected %d masters, found %d healthy masters including %d no-slot masters", verifyStableTimeout, expectedShards, len(masters), len(masters)-len(slotMasters))
-		}
-		logger.Info("verify cluster waiting for no-slot masters to leave master view", "expected", expectedShards, "healthyMasters", len(masters), "slotOwningMasters", len(slotMasters))
-		return running("waiting for gossip to converge: expected %d masters, found %d healthy masters including %d no-slot masters", expectedShards, len(masters), len(masters)-len(slotMasters)), nil
-	}
-	for _, m := range slotMasters {
-		replicas := rediscluster.HealthyReplicasOf(obs.entries, m.ID)
-		if len(replicas) != expectedReplicas {
-			logger.Info("verify cluster replica count mismatch", "masterID", m.ID, "expected", expectedReplicas, "got", len(replicas))
-			return paramErr("master %s has %d healthy replicas, expected %d", m.ID, len(replicas), expectedReplicas)
-		}
-	}
-	logger.Info("verify cluster shard layout passed", "masters", len(slotMasters), "replicasPerMaster", expectedReplicas)
-
-	if unmapped := firstUnmappedNode(obs.entries, obs.podsByIP); unmapped != "" {
-		logger.Info("verify cluster found unmapped node", "node", unmapped)
-		return paramErr("redis node not mapped to any managed pod: %s", unmapped)
+	if state == clusterViewNeedsRepair {
+		logger.Info("verify cluster needs repair", "message", message)
+		return needsRepair("%s", message), nil
 	}
 
 	cluster.Status.Topology = obs.topology
 	setCondition(cluster, ConditionHealthy, metav1.ConditionTrue, "ClusterVerified", "cluster matches desired topology")
 	logger.Info("verify cluster finished", "duration", time.Since(start), "masters", expectedShards, "replicasPerMaster", expectedReplicas)
 	return completed("cluster verified: %d masters, %d replicas/master, full slot coverage", expectedShards, expectedReplicas), nil
+}
+
+type clusterViewState string
+
+const (
+	clusterViewConverging  clusterViewState = "Converging"
+	clusterViewNeedsRepair clusterViewState = "NeedsRepair"
+	clusterViewConverged   clusterViewState = "Converged"
+)
+
+func classifyClusterView(obs clusterObservation, expectedShards, expectedReplicas int) (clusterViewState, string) {
+	if clusterViewsDiffer(obs.views) {
+		return clusterViewConverging, "managed pods report different cluster views"
+	}
+	for _, e := range obs.entries {
+		if e.HasFlag("handshake") || e.HasFlag("noaddr") {
+			return clusterViewConverging, fmt.Sprintf("node still handshaking: id=%s addr=%s flags=%v", e.ID, e.Addr, e.Flags)
+		}
+		if e.HasFlag("fail") || e.HasFlag("fail?") {
+			return clusterViewNeedsRepair, fmt.Sprintf("cluster node failed: id=%s addr=%s flags=%v link=%s", e.ID, e.Addr, e.Flags, e.LinkState)
+		}
+		if !e.IsConnected() {
+			return clusterViewConverging, fmt.Sprintf("node link not connected: id=%s addr=%s flags=%v link=%s", e.ID, e.Addr, e.Flags, e.LinkState)
+		}
+	}
+	if migrating := rediscluster.MigratingSlots(obs.entries); len(migrating) > 0 {
+		return clusterViewNeedsRepair, fmt.Sprintf("cluster has %d slots in migrating/importing state", len(migrating))
+	}
+	owner, err := rediscluster.SlotOwnership(obs.entries)
+	if err != nil {
+		return clusterViewNeedsRepair, fmt.Sprintf("slot ownership inconsistent: %v", err)
+	}
+	if viol := verifyFullSlotCoverage(owner, obs.entries); viol != "" {
+		return clusterViewNeedsRepair, fmt.Sprintf("slot coverage violation: %s", viol)
+	}
+	masters := rediscluster.HealthyMasters(obs.entries)
+	slotMasters := slotOwningMasters(masters)
+	if len(masters) != len(slotMasters) {
+		return clusterViewConverging, fmt.Sprintf("expected %d masters, found %d healthy masters including %d no-slot masters", expectedShards, len(masters), len(masters)-len(slotMasters))
+	}
+	if len(slotMasters) != expectedShards {
+		return clusterViewNeedsRepair, fmt.Sprintf("expected %d slot-owning masters, found %d", expectedShards, len(slotMasters))
+	}
+	for _, m := range slotMasters {
+		replicas := rediscluster.HealthyReplicasOf(obs.entries, m.ID)
+		if len(replicas) != expectedReplicas {
+			return clusterViewNeedsRepair, fmt.Sprintf("master %s has %d healthy replicas, expected %d", m.ID, len(replicas), expectedReplicas)
+		}
+	}
+	if unmapped := firstUnmappedNode(obs.entries, obs.podsByIP); unmapped != "" {
+		return clusterViewNeedsRepair, fmt.Sprintf("redis node not mapped to any managed pod: %s", unmapped)
+	}
+	return clusterViewConverged, ""
+}
+
+func clusterViewsDiffer(views []clusterView) bool {
+	if len(views) < 2 {
+		return false
+	}
+	first := entriesFingerprint(views[0].Entries)
+	for _, v := range views[1:] {
+		if entriesFingerprint(v.Entries) != first {
+			return true
+		}
+	}
+	return false
 }
 
 func waitForStableCluster(params map[string]any, now time.Time, fingerprint, unhealthyMessage string) (StepOutcome, bool, error) {
@@ -185,9 +212,22 @@ func verifyStartedAt(params map[string]any, now time.Time) time.Time {
 }
 
 func clusterObservationFingerprint(obs clusterObservation) string {
-	parts := make([]string, 0, len(obs.entries)+len(obs.pods))
-	for _, e := range obs.entries {
-		flags := append([]string{}, e.Flags...)
+	parts := make([]string, 0, len(obs.views)+len(obs.pods)+1)
+	parts = append(parts, "best|"+entriesFingerprint(obs.entries))
+	for _, v := range obs.views {
+		parts = append(parts, "view|"+v.Seed+"|"+entriesFingerprint(v.Entries))
+	}
+	for _, p := range obs.pods {
+		parts = append(parts, fmt.Sprintf("pod|%s|%s|%t", p.Name, p.Status.PodIP, podReady(&p)))
+	}
+	sort.Strings(parts)
+	return strings.Join(parts, "\n")
+}
+
+func entriesFingerprint(entries []rediscluster.Entry) string {
+	parts := make([]string, 0, len(entries))
+	for _, e := range entries {
+		flags := stableFlags(e.Flags)
 		sort.Strings(flags)
 		slots := append([]string{}, e.Slots...)
 		sort.Strings(slots)
@@ -200,11 +240,19 @@ func clusterObservationFingerprint(obs clusterObservation) string {
 			strings.Join(slots, ","),
 		}, "|"))
 	}
-	for _, p := range obs.pods {
-		parts = append(parts, fmt.Sprintf("pod|%s|%s|%t", p.Name, p.Status.PodIP, podReady(&p)))
-	}
 	sort.Strings(parts)
 	return strings.Join(parts, "\n")
+}
+
+func stableFlags(flags []string) []string {
+	out := make([]string, 0, len(flags))
+	for _, f := range flags {
+		if strings.EqualFold(f, "myself") {
+			continue
+		}
+		out = append(out, f)
+	}
+	return out
 }
 
 func paramStringValue(params map[string]any, key string) string {
@@ -221,18 +269,6 @@ func paramIntValue(params map[string]any, key string) int {
 		return 0
 	}
 	return v
-}
-
-func firstUnhealthyManagedNode(entries []rediscluster.Entry) string {
-	for _, e := range entries {
-		if e.HasFlag("handshake") || e.HasFlag("noaddr") {
-			continue
-		}
-		if !e.Healthy() {
-			return fmt.Sprintf("id=%s addr=%s flags=%v link=%s", e.ID, e.Addr, e.Flags, e.LinkState)
-		}
-	}
-	return ""
 }
 
 func verifyFullSlotCoverage(owner map[int]string, entries []rediscluster.Entry) string {

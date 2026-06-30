@@ -338,17 +338,24 @@ func (r *RedisClusterReconciler) applyStepOutcome(ctx context.Context, cluster *
 		setStep(active, idx, string(plan.StepStateFailed), err.Error())
 		return true
 	}
-	if planModel.Steps[idx].Params != nil {
-		raw, merr := json.Marshal(planModel.Steps[idx].Params)
-		if merr != nil {
-			logger.Error(merr, "step params marshal failed")
-			setStep(active, idx, string(plan.StepStateFailed), merr.Error())
-			return true
-		}
-		active.Steps[idx].Params = apiextensionsv1.JSON{Raw: raw}
+	if err := persistStepParams(active, planModel, idx); err != nil {
+		logger.Error(err, "step params marshal failed")
+		setStep(active, idx, string(plan.StepStateFailed), err.Error())
+		return true
 	}
 	setStep(active, idx, string(outcome.Status), outcome.Message)
 	return outcome.Status == plan.StepStateFailed
+}
+
+func persistStepParams(active *v1alpha1.PlanStatus, planModel *plan.Plan, idx int) error {
+	if planModel.Steps[idx].Params != nil {
+		raw, merr := json.Marshal(planModel.Steps[idx].Params)
+		if merr != nil {
+			return merr
+		}
+		active.Steps[idx].Params = apiextensionsv1.JSON{Raw: raw}
+	}
+	return nil
 }
 
 func (r *RedisClusterReconciler) executeNextStep(ctx context.Context, cluster *v1alpha1.RedisCluster, active *v1alpha1.PlanStatus) (ctrl.Result, error) {
@@ -375,6 +382,20 @@ func (r *RedisClusterReconciler) executeNextStep(ctx context.Context, cluster *v
 	execStart := time.Now()
 	outcome, err := r.Driver.ExecuteStep(ctx, cluster, planModel, idx)
 	logger.Info("step execution finished", "duration", time.Since(execStart), "status", outcome.Status, "message", outcome.Message)
+	if err == nil && outcome.SupersedePlan {
+		if err := persistStepParams(active, planModel, idx); err != nil {
+			setStep(active, idx, string(plan.StepStateFailed), err.Error())
+			active.Status = string(plan.PlanStateFailed)
+			setCondition(cluster, ConditionReady, metav1.ConditionFalse, "StepFailed", err.Error())
+			return r.finish(ctx, cluster, ctrl.Result{}, nil)
+		}
+		setStep(active, idx, string(plan.StepStateRunning), outcome.Message)
+		active.CurrentStep = step.ID
+		active.Status = string(plan.PlanStateSuperseded)
+		setCondition(cluster, ConditionReady, metav1.ConditionFalse, "Replanning", outcome.Message)
+		setCondition(cluster, ConditionPlanned, metav1.ConditionFalse, "PlanSuperseded", outcome.Message)
+		return r.finish(ctx, cluster, ctrl.Result{Requeue: true}, nil)
+	}
 	failed := r.applyStepOutcome(ctx, cluster, active, planModel, idx, outcome, err)
 	active.CurrentStep = step.ID
 	if failed {

@@ -99,6 +99,16 @@ func executeStableVerify(t *testing.T, ctx context.Context, exec *ActionExecutor
 	return executeVerify(t, ctx, exec, cluster, p)
 }
 
+func expectNeedsRepair(t *testing.T, outcome StepOutcome, err error) {
+	t.Helper()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if outcome.Status != plan.StepStateFailed || !outcome.SupersedePlan {
+		t.Fatalf("expected NeedsRepair, got %q supersede=%t: %s", outcome.Status, outcome.SupersedePlan, outcome.Message)
+	}
+}
+
 func TestVerifyCluster_HappyPathReturnsCompletedAndRebuildsTopology(t *testing.T) {
 	ctx := context.Background()
 	cluster := testCluster()
@@ -372,6 +382,108 @@ func TestVerifyCluster_ClusterNodesFailsReturnsRunning(t *testing.T) {
 	}
 }
 
+func TestVerifyCluster_LinkDisconnectedReturnsRunning(t *testing.T) {
+	ctx := context.Background()
+	cluster := testCluster()
+	pods := vcFourReadyPods()
+	nodes := vcMaster0ID + " 10.0.0.1:6379@16379 master - 0 0 1 connected 0-8191\n" +
+		vcMaster1ID + " 10.0.0.2:6379@16379 master - 0 0 2 connected 8192-16383\n" +
+		vcReplica0ID + " 10.0.0.3:6379@16379 slave " + vcMaster0ID + " 0 0 3 disconnected\n" +
+		vcReplica1ID + " 10.0.0.4:6379@16379 slave " + vcMaster1ID + " 0 0 4 connected\n"
+	fc := &fakeRedisClient{
+		clusterInfo:  func() (string, error) { return "cluster_state:ok\r\n", nil },
+		clusterNodes: func() (string, error) { return nodes, nil },
+	}
+	exec := vcExec(t, cluster, pods, fc)
+
+	outcome, err := exec.ExecuteStep(ctx, cluster, &plan.Plan{Steps: []plan.Step{verifyStep()}}, 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if outcome.Status != plan.StepStateRunning {
+		t.Fatalf("expected Running for disconnected link, got %q: %s", outcome.Status, outcome.Message)
+	}
+}
+
+func TestVerifyCluster_FailedDisconnectedNodeNeedsRepair(t *testing.T) {
+	ctx := context.Background()
+	cluster := testCluster()
+	pods := vcFourReadyPods()
+	nodes := vcMaster0ID + " 10.0.0.1:6379@16379 master,fail - 0 0 1 disconnected 0-8191\n" +
+		vcMaster1ID + " 10.0.0.2:6379@16379 master - 0 0 2 connected 8192-16383\n" +
+		vcReplica0ID + " 10.0.0.3:6379@16379 slave " + vcMaster0ID + " 0 0 3 connected\n" +
+		vcReplica1ID + " 10.0.0.4:6379@16379 slave " + vcMaster1ID + " 0 0 4 connected\n"
+	fc := &fakeRedisClient{
+		clusterInfo:  func() (string, error) { return "cluster_state:ok\r\n", nil },
+		clusterNodes: func() (string, error) { return nodes, nil },
+	}
+	exec := vcExec(t, cluster, pods, fc)
+
+	outcome, err := executeStableVerify(t, ctx, exec, cluster, verifyStep())
+	expectNeedsRepair(t, outcome, err)
+}
+
+func TestVerifyCluster_InconsistentManagedPodViewsReturnRunning(t *testing.T) {
+	ctx := context.Background()
+	cluster := testCluster()
+	pods := vcFourReadyPods()
+	fc := &fakeRedisClient{
+		clusterInfo: func() (string, error) { return "cluster_state:ok\r\n", nil },
+		clusterNodesAddr: func(addr string) (string, error) {
+			if addr == "10.0.0.1:6379" {
+				return clusterOK(), nil
+			}
+			return clusterOKAlt(), nil
+		},
+	}
+	exec := vcExec(t, cluster, pods, fc)
+
+	outcome, err := exec.ExecuteStep(ctx, cluster, &plan.Plan{Steps: []plan.Step{verifyStep()}}, 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if outcome.Status != plan.StepStateRunning {
+		t.Fatalf("expected Running for inconsistent views, got %q: %s", outcome.Status, outcome.Message)
+	}
+}
+
+func TestVerifyCluster_MyselfFlagDoesNotMakeViewsInconsistent(t *testing.T) {
+	ctx := context.Background()
+	cluster := testCluster()
+	pods := vcFourReadyPods()
+	fc := &fakeRedisClient{
+		clusterInfo: func() (string, error) { return "cluster_state:ok\r\n", nil },
+		clusterNodesAddr: func(addr string) (string, error) {
+			flags := map[string]string{
+				"10.0.0.1:6379": "master,myself",
+				"10.0.0.2:6379": "master,myself",
+				"10.0.0.3:6379": "slave,myself",
+				"10.0.0.4:6379": "slave,myself",
+			}
+			return vcMaster0ID + " 10.0.0.1:6379@16379 " + flagFor(addr, "10.0.0.1:6379", flags, "master") + " - 0 0 1 connected 0-8191\n" +
+				vcMaster1ID + " 10.0.0.2:6379@16379 " + flagFor(addr, "10.0.0.2:6379", flags, "master") + " - 0 0 2 connected 8192-16383\n" +
+				vcReplica0ID + " 10.0.0.3:6379@16379 " + flagFor(addr, "10.0.0.3:6379", flags, "slave") + " " + vcMaster0ID + " 0 0 3 connected\n" +
+				vcReplica1ID + " 10.0.0.4:6379@16379 " + flagFor(addr, "10.0.0.4:6379", flags, "slave") + " " + vcMaster1ID + " 0 0 4 connected\n", nil
+		},
+	}
+	exec := vcExec(t, cluster, pods, fc)
+
+	outcome, err := executeStableVerify(t, ctx, exec, cluster, verifyStep())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if outcome.Status != plan.StepStateCompleted {
+		t.Fatalf("expected Completed, got %q: %s", outcome.Status, outcome.Message)
+	}
+}
+
+func flagFor(seed, addr string, flags map[string]string, fallback string) string {
+	if seed == addr {
+		return flags[addr]
+	}
+	return fallback
+}
+
 func TestVerifyCluster_MasterCountMismatchFails(t *testing.T) {
 	ctx := context.Background()
 	cluster := testCluster()
@@ -385,12 +497,7 @@ func TestVerifyCluster_MasterCountMismatchFails(t *testing.T) {
 	exec := vcExec(t, cluster, pods, fc)
 
 	outcome, err := executeStableVerify(t, ctx, exec, cluster, verifyStep())
-	if err == nil {
-		t.Fatal("expected error on master count mismatch")
-	}
-	if outcome.Status != plan.StepStateFailed {
-		t.Fatalf("expected Failed, got %q: %s", outcome.Status, outcome.Message)
-	}
+	expectNeedsRepair(t, outcome, err)
 }
 
 func TestVerifyCluster_ExtraNoSlotMasterReturnsRunning(t *testing.T) {
@@ -429,12 +536,7 @@ func TestVerifyCluster_ExtraSlotOwningMasterFails(t *testing.T) {
 	exec := vcExec(t, cluster, pods, fc)
 
 	outcome, err := executeStableVerify(t, ctx, exec, cluster, verifyStep())
-	if err == nil {
-		t.Fatal("expected error on extra slot-owning master")
-	}
-	if outcome.Status != plan.StepStateFailed {
-		t.Fatalf("expected Failed, got %q: %s", outcome.Status, outcome.Message)
-	}
+	expectNeedsRepair(t, outcome, err)
 }
 
 func TestVerifyCluster_ReplicaCountMismatchFails(t *testing.T) {
@@ -451,12 +553,7 @@ func TestVerifyCluster_ReplicaCountMismatchFails(t *testing.T) {
 	exec := vcExec(t, cluster, pods, fc)
 
 	outcome, err := executeStableVerify(t, ctx, exec, cluster, verifyStep())
-	if err == nil {
-		t.Fatal("expected error on replica count mismatch")
-	}
-	if outcome.Status != plan.StepStateFailed {
-		t.Fatalf("expected Failed, got %q: %s", outcome.Status, outcome.Message)
-	}
+	expectNeedsRepair(t, outcome, err)
 }
 
 func TestVerifyCluster_SlotCoverageGapFails(t *testing.T) {
@@ -474,12 +571,7 @@ func TestVerifyCluster_SlotCoverageGapFails(t *testing.T) {
 	exec := vcExec(t, cluster, pods, fc)
 
 	outcome, err := executeStableVerify(t, ctx, exec, cluster, verifyStep())
-	if err == nil {
-		t.Fatal("expected error on slot coverage gap")
-	}
-	if outcome.Status != plan.StepStateFailed {
-		t.Fatalf("expected Failed, got %q: %s", outcome.Status, outcome.Message)
-	}
+	expectNeedsRepair(t, outcome, err)
 }
 
 func TestVerifyCluster_MigratingSlotFails(t *testing.T) {
@@ -497,12 +589,7 @@ func TestVerifyCluster_MigratingSlotFails(t *testing.T) {
 	exec := vcExec(t, cluster, pods, fc)
 
 	outcome, err := executeStableVerify(t, ctx, exec, cluster, verifyStep())
-	if err == nil {
-		t.Fatal("expected error on migrating slot")
-	}
-	if outcome.Status != plan.StepStateFailed {
-		t.Fatalf("expected Failed, got %q: %s", outcome.Status, outcome.Message)
-	}
+	expectNeedsRepair(t, outcome, err)
 }
 
 func TestVerifyCluster_SlotOwnerNotMasterFails(t *testing.T) {
@@ -520,12 +607,7 @@ func TestVerifyCluster_SlotOwnerNotMasterFails(t *testing.T) {
 	exec := vcExec(t, cluster, pods, fc)
 
 	outcome, err := executeStableVerify(t, ctx, exec, cluster, verifyStep())
-	if err == nil {
-		t.Fatal("expected error when a replica owns a slot")
-	}
-	if outcome.Status != plan.StepStateFailed {
-		t.Fatalf("expected Failed, got %q: %s", outcome.Status, outcome.Message)
-	}
+	expectNeedsRepair(t, outcome, err)
 }
 
 func TestVerifyCluster_FailedNodeFails(t *testing.T) {
@@ -543,12 +625,7 @@ func TestVerifyCluster_FailedNodeFails(t *testing.T) {
 	exec := vcExec(t, cluster, pods, fc)
 
 	outcome, err := executeStableVerify(t, ctx, exec, cluster, verifyStep())
-	if err == nil {
-		t.Fatal("expected error when a node is failed")
-	}
-	if outcome.Status != plan.StepStateFailed {
-		t.Fatalf("expected Failed, got %q: %s", outcome.Status, outcome.Message)
-	}
+	expectNeedsRepair(t, outcome, err)
 }
 
 func TestVerifyCluster_ReplicaFailedFails(t *testing.T) {
@@ -566,12 +643,7 @@ func TestVerifyCluster_ReplicaFailedFails(t *testing.T) {
 	exec := vcExec(t, cluster, pods, fc)
 
 	outcome, err := executeStableVerify(t, ctx, exec, cluster, verifyStep())
-	if err == nil {
-		t.Fatal("expected error when a replica is failed (replica count drops)")
-	}
-	if outcome.Status != plan.StepStateFailed {
-		t.Fatalf("expected Failed, got %q: %s", outcome.Status, outcome.Message)
-	}
+	expectNeedsRepair(t, outcome, err)
 }
 
 func TestVerifyCluster_UnmappedRedisNodeFails(t *testing.T) {
@@ -593,15 +665,10 @@ func TestVerifyCluster_UnmappedRedisNodeFails(t *testing.T) {
 	exec := vcExec(t, cluster, pods, fc)
 
 	outcome, err := executeStableVerify(t, ctx, exec, cluster, verifyStep())
-	if err == nil {
-		t.Fatal("expected error when a redis node is not a managed pod")
-	}
-	if outcome.Status != plan.StepStateFailed {
-		t.Fatalf("expected Failed, got %q: %s", outcome.Status, outcome.Message)
-	}
+	expectNeedsRepair(t, outcome, err)
 }
 
-func TestVerifyCluster_HandshakeNodeIgnored(t *testing.T) {
+func TestVerifyCluster_HandshakeNodeReturnsRunning(t *testing.T) {
 	ctx := context.Background()
 	cluster := testCluster()
 	pods := vcFourReadyPods()
@@ -616,8 +683,8 @@ func TestVerifyCluster_HandshakeNodeIgnored(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if outcome.Status != plan.StepStateCompleted {
-		t.Fatalf("expected Completed with handshake node ignored, got %q: %s", outcome.Status, outcome.Message)
+	if outcome.Status != plan.StepStateRunning {
+		t.Fatalf("expected Running with handshake node, got %q: %s", outcome.Status, outcome.Message)
 	}
 }
 
