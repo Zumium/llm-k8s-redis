@@ -7,8 +7,10 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/Zumium/llm-k8s-redis/internal/observor"
 	"github.com/Zumium/llm-k8s-redis/internal/plan"
 	"github.com/Zumium/llm-k8s-redis/internal/rediscluster"
+	"github.com/Zumium/llm-k8s-redis/internal/validator"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
@@ -24,11 +26,7 @@ func NewGoPlanner(fallback Planner) *GoPlanner {
 
 func (p *GoPlanner) Plan(ctx context.Context, req Request) (*plan.Plan, error) {
 	if generated := buildGoPlan(req); generated != nil {
-		if err := plan.NewValidator().Validate(generated, plan.ValidationContext{
-			Spec:           req.Spec,
-			NextPodOrdinal: req.ObservedState.NextPodOrdinal,
-			ObservedNodes:  req.ObservedState.Nodes,
-		}); err == nil {
+		if err := validator.Validate(validator.ObservationFromObservedNodes(req.ObservedState.Nodes), generated); err == nil {
 			log.FromContext(ctx).Info("planner produced plan", "planner", "go", "planID", generated.PlanID, "steps", len(generated.Steps), "targetGeneration", generated.TargetGeneration)
 			return generated, nil
 		} else {
@@ -101,7 +99,7 @@ func topologyFromObserved(nodes []ObservedNode) observedTopology {
 		if !n.PodExists || !n.RedisSeen || n.Role != "master" || n.Slots == "" {
 			continue
 		}
-		if !plan.ObservedNodeHealthy(n) {
+		if !observor.ObservedNodeHealthy(n) {
 			continue
 		}
 		masterIndex[n.Pod] = len(t.masters)
@@ -116,7 +114,7 @@ func topologyFromObserved(nodes []ObservedNode) observedTopology {
 			masterPod = nodeIDToPod[n.MasterID]
 		}
 		if i, ok := masterIndex[masterPod]; ok {
-			if plan.ObservedNodeHealthy(n) {
+			if observor.ObservedNodeHealthy(n) {
 				t.masters[i].replicas = append(t.masters[i].replicas, observedReplica{pod: n.Pod, nodeID: n.NodeID, ready: true})
 			}
 		}
@@ -620,7 +618,7 @@ func livePodExists(nodes []ObservedNode, pod string) bool {
 func ghostNodes(nodes []ObservedNode) []ObservedNode {
 	var out []ObservedNode
 	for _, n := range nodes {
-		if plan.ObservedNodeForgettableGhost(n) {
+		if observor.ObservedNodeForgettableGhost(n) {
 			out = append(out, n)
 		}
 	}
@@ -629,7 +627,7 @@ func ghostNodes(nodes []ObservedNode) []ObservedNode {
 
 func hasAmbiguousNoSlotNode(nodes []ObservedNode) bool {
 	for _, n := range nodes {
-		if n.RedisSeen && n.Slots == "" && !plan.ObservedNodeHealthy(n) && !plan.ObservedNodeForgettableGhost(n) {
+		if n.RedisSeen && n.Slots == "" && !observor.ObservedNodeHealthy(n) && !observor.ObservedNodeForgettableGhost(n) {
 			return true
 		}
 	}

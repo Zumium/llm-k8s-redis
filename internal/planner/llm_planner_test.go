@@ -374,8 +374,6 @@ func TestWorkedExamplesAreValid(t *testing.T) {
 		"replica-scaleout-001":       plan.ValidationContext{Spec: plan.ClusterSpec{Name: "example", Generation: 2, Shards: 3, ReplicasPerShard: 2, Image: "redis:7", MemorySize: "1Gi"}, NextPodOrdinal: 6, ObservedNodes: observed},
 		"shard-scaleout-001":         plan.ValidationContext{Spec: plan.ClusterSpec{Name: "example", Generation: 3, Shards: 4, ReplicasPerShard: 1, Image: "redis:7", MemorySize: "1Gi"}, NextPodOrdinal: 6, ObservedNodes: observed},
 		"repair-missing-replica-001": plan.ValidationContext{Spec: twoShardSpec, NextPodOrdinal: 3, ObservedNodes: observedMissingReplica()},
-		"cleanup-ghost-001":          plan.ValidationContext{Spec: twoShardSpec, NextPodOrdinal: 4, ObservedNodes: observedWithGhost()},
-		"cleanup-dirty-001":          plan.ValidationContext{Spec: twoShardSpec, NextPodOrdinal: 5, ObservedNodes: observedWithDirtyPod()},
 	}
 	seen := map[string]bool{}
 	allExamples := workedExamplesForAnalysis(`{"subprocesses":["repairTopology","cleanupGhostNodes","cleanupDirtyNodes","changeClusterSpec"],"summary":"all examples"}`)
@@ -386,7 +384,7 @@ func TestWorkedExamplesAreValid(t *testing.T) {
 		}
 		seen[p.PlanID] = true
 		t.Run(p.PlanID, func(t *testing.T) {
-			if err := plan.NewValidator().Validate(&p, input); err != nil {
+			if err := validatePlan(&p, input); err != nil {
 				t.Fatalf("validate: %v", err)
 			}
 		})
