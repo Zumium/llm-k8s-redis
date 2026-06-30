@@ -1,4 +1,4 @@
-package controller
+package action
 
 import (
 	"context"
@@ -14,13 +14,17 @@ import (
 	"github.com/Zumium/llm-k8s-redis/internal/redis"
 )
 
+type StepOutcome struct {
+	Status        plan.StepState
+	Message       string
+	SupersedePlan bool
+}
+
 type ActionExecutor struct {
 	client.Client
 	Scheme       *runtime.Scheme
 	RedisFactory redis.Factory
 }
-
-var _ Driver = &ActionExecutor{}
 
 func (e *ActionExecutor) ExecuteStep(ctx context.Context, cluster *v1alpha1.RedisCluster, p *plan.Plan, stepIndex int) (outcome StepOutcome, err error) {
 	start := time.Now()

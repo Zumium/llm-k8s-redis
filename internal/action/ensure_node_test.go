@@ -1,4 +1,4 @@
-package controller
+package action
 
 import (
 	"context"
@@ -21,6 +21,7 @@ import (
 )
 
 const twoGiBytes = int64(2147483648)
+const finalizer = "redis.example.com/redis-cluster-finalizer"
 
 func newExecutorScheme(t *testing.T) *runtime.Scheme {
 	t.Helper()
@@ -39,6 +40,16 @@ func testCluster() *api.RedisCluster {
 		TypeMeta:   metav1.TypeMeta{Kind: "RedisCluster", APIVersion: api.GroupVersion.String()},
 		ObjectMeta: metav1.ObjectMeta{Name: "example", UID: "cluster-uid-123", Generation: 1},
 		Spec:       api.RedisClusterSpec{Shards: 2, ReplicasPerShard: 1, Image: "redis:7.2", MemorySize: "2Gi"},
+	}
+}
+
+func clusterWithTopology() *api.RedisCluster {
+	return &api.RedisCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "example", Generation: 1},
+		Spec:       api.RedisClusterSpec{Shards: 2, ReplicasPerShard: 1, Image: "redis:7.2", MemorySize: "2Gi"},
+		Status: api.RedisClusterStatus{
+			Topology: &api.ClusterTopology{Shards: []api.ShardTopology{{ID: "shard-0"}}},
+		},
 	}
 }
 
