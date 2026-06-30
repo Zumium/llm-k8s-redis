@@ -126,9 +126,12 @@ func topologyFromObservedNodes(nodes []ObservedNode) *ClusterTopology {
 		if !n.PodExists || !n.RedisSeen || n.Role != "master" || n.Slots == "" {
 			continue
 		}
+		if !ObservedNodeHealthy(n) {
+			continue
+		}
 		masters = append(masters, ShardTopology{
 			ID:     fmt.Sprintf("shard-%d", len(masters)),
-			Master: NodeTopology{Pod: n.Pod, NodeID: n.NodeID, Slots: n.Slots, Ready: n.Ready && !n.Deleting},
+			Master: NodeTopology{Pod: n.Pod, NodeID: n.NodeID, Slots: n.Slots, Ready: true},
 		})
 		masterIndex[n.Pod] = len(masters) - 1
 	}
@@ -144,7 +147,9 @@ func topologyFromObservedNodes(nodes []ObservedNode) *ClusterTopology {
 		if !ok {
 			continue
 		}
-		masters[i].Replicas = append(masters[i].Replicas, NodeTopology{Pod: n.Pod, NodeID: n.NodeID, Ready: n.Ready && !n.Deleting})
+		if ObservedNodeHealthy(n) {
+			masters[i].Replicas = append(masters[i].Replicas, NodeTopology{Pod: n.Pod, NodeID: n.NodeID, Ready: true})
+		}
 	}
 	return &ClusterTopology{Shards: masters}
 }
@@ -315,6 +320,9 @@ func validateCreatePodNames(ensurePods map[string]bool) error {
 }
 
 func validateExistingTopologyPlan(p *Plan, spec ClusterSpec, ctx *ValidationContext, topology *ClusterTopology, ensurePods map[string]bool) error {
+	if hasAmbiguousNoSlotNode(ctx.ObservedNodes) {
+		return fmt.Errorf("observed Redis node is unhealthy but not a forgettable ghost")
+	}
 	currentShards := len(topology.Shards)
 	if h := healableTopology(topology, spec, ctx.ObservedNodes); h != nil {
 		return validateHealRepair(p, spec, ctx, topology, h)
@@ -473,24 +481,16 @@ func healableTopology(topology *ClusterTopology, spec ClusterSpec, observed []Ob
 func ghostNodes(observed []ObservedNode) []ObservedNode {
 	var out []ObservedNode
 	for _, n := range observed {
-		if !n.RedisSeen {
-			continue
+		if ObservedNodeForgettableGhost(n) {
+			out = append(out, n)
 		}
-		if n.Slots != "" {
-			continue
-		}
-		failed := !n.PodExists || hasFailFlag(n.Flags)
-		if !failed {
-			continue
-		}
-		out = append(out, n)
 	}
 	return out
 }
 
-func hasFailFlag(flags []string) bool {
-	for _, f := range flags {
-		if f == "fail" || f == "fail?" {
+func hasAmbiguousNoSlotNode(observed []ObservedNode) bool {
+	for _, n := range observed {
+		if n.RedisSeen && n.Slots == "" && !ObservedNodeHealthy(n) && !ObservedNodeForgettableGhost(n) {
 			return true
 		}
 	}
@@ -539,19 +539,8 @@ func validateHealRepair(p *Plan, spec ClusterSpec, ctx *ValidationContext, topol
 		}
 		if id == "" {
 			pod, _ := paramString(s.Params, "pod")
-			var matchedID string
-			for _, g := range h.ghosts {
-				if g.Pod == pod && g.PodExists {
-					matchedID = g.NodeID
-					break
-				}
-			}
-			if matchedID == "" {
-				return verr(fmt.Sprintf("Add 'lastKnownNodeId' param with the NodeID of pod %q from the observed state", pod),
-					"step %q: ForgetNode requires lastKnownNodeId when pod %q no longer exists", s.ID, pod)
-			}
-			ghostSeen[matchedID] = true
-			continue
+			return verr(fmt.Sprintf("Add 'lastKnownNodeId' param with the NodeID of pod %q from the observed state", pod),
+				"step %q: ForgetNode requires lastKnownNodeId for ghost pod %q", s.ID, pod)
 		}
 		if _, ok := ghostSeen[id]; !ok {
 			return fmt.Errorf("step %q: lastKnownNodeId %q is not a known ghost node", s.ID, id)

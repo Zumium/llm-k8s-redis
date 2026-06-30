@@ -252,7 +252,9 @@ func (r *RedisClusterReconciler) reconcilePlan(ctx context.Context, cluster *v1a
 			return r.finish(ctx, cluster, ctrl.Result{RequeueAfter: 10 * time.Second}, nil)
 		}
 		logger.Info("observed nodes collected", "attempt", attempt, "nodes", len(nodes), "duration", time.Since(collectStart))
-		cluster.Status.ObservedNodes = apiObservedNodes(nodes)
+		observed := apiObservedNodes(nodes)
+		previousObserved := cluster.Status.ObservedNodes
+		cluster.Status.ObservedNodes = observed
 		bumpNextPodOrdinalFromObserved(cluster, nodes)
 		req.ObservedState.Nodes = nodes
 		req.ObservedState.NextPodOrdinal = int(cluster.Status.NextPodOrdinal)
@@ -262,7 +264,19 @@ func (r *RedisClusterReconciler) reconcilePlan(ctx context.Context, cluster *v1a
 			logger.Info("live topology already matches spec, skipping planner", "attempt", attempt)
 			return r.finish(ctx, cluster, ctrl.Result{RequeueAfter: r.TopologyRefreshInterval}, nil)
 		}
-		if reason := planningInstabilityReason(nodes, spec); reason != "" {
+		reason := planningInstabilityReason(nodes, spec)
+		observedStable := observedStatusNodesEqual(previousObserved, observed) || (len(previousObserved) == 0 && len(observed) == 0 && clusterStableWaitStarted(cluster))
+		if !observedStable && !clusterStableWaitTimedOut(cluster) {
+			if reason == "" {
+				reason = "waiting for stable observed nodes before planning"
+			}
+			setCondition(cluster, ConditionReady, metav1.ConditionFalse, "WaitingForClusterStable", reason)
+			setCondition(cluster, ConditionPlanned, metav1.ConditionFalse, "WaitingForClusterStable", reason)
+			cluster.Status.ObservedGeneration = cluster.Generation
+			logger.Info("waiting for stable observed nodes before planning", "attempt", attempt, "reason", reason)
+			return r.finish(ctx, cluster, ctrl.Result{RequeueAfter: 10 * time.Second}, nil)
+		}
+		if reason != "" {
 			if !clusterStableWaitTimedOut(cluster) {
 				setCondition(cluster, ConditionReady, metav1.ConditionFalse, "WaitingForClusterStable", reason)
 				setCondition(cluster, ConditionPlanned, metav1.ConditionFalse, "WaitingForClusterStable", reason)

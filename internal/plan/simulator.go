@@ -15,6 +15,7 @@ type simulatedNode struct {
 type planSimulator struct {
 	spec       ClusterSpec
 	nodes      map[string]*simulatedNode
+	nodeIDs    map[string]string
 	slotOwners map[int]string
 	healMode   bool
 }
@@ -38,6 +39,7 @@ func newPlanSimulator(ctx ValidationContext) *planSimulator {
 	s := &planSimulator{
 		spec:       ctx.Spec,
 		nodes:      map[string]*simulatedNode{},
+		nodeIDs:    map[string]string{},
 		slotOwners: map[int]string{},
 		healMode:   ctx.healMode,
 	}
@@ -83,15 +85,20 @@ func (s *planSimulator) addObservedNodes(nodes []ObservedNode) {
 	}
 	for _, observed := range nodes {
 		pod := observed.Pod
-		if pod == "" {
+		if !observed.PodExists && observed.NodeID != "" {
+			pod = observed.NodeID
+		} else if pod == "" {
 			pod = observed.NodeID
 		}
 		if pod == "" {
 			continue
 		}
+		if observed.NodeID != "" {
+			s.nodeIDs[observed.NodeID] = pod
+		}
 		n := s.ensureSimulatedNode(pod)
 		n.exists = observed.PodExists
-		n.ready = observed.Ready && !observed.Deleting
+		n.ready = ObservedNodeHealthy(observed)
 		n.clusterMember = observed.RedisSeen
 		n.role = observed.Role
 		if n.role == "" {
@@ -336,7 +343,15 @@ func (s *planSimulator) forgetNode(step Step) error {
 	pod, _ := paramString(step.Params, "pod")
 	key := pod
 	var n *simulatedNode
-	if key != "" {
+	if id, ok := paramString(step.Params, "lastKnownNodeId"); ok && id != "" {
+		key = s.nodeIDs[id]
+		if key == "" {
+			key = id
+		}
+		n = s.nodes[key]
+	}
+	if n == nil && pod != "" {
+		key = pod
 		n = s.nodes[key]
 	}
 	if n == nil {
@@ -401,10 +416,10 @@ func (s *planSimulator) verifyCluster(step Step) error {
 		if n.exists && !n.clusterMember && !n.forgotten {
 			return fmt.Errorf("managed pod %q is not a Redis cluster member", pod)
 		}
-		if n.exists && n.clusterMember && n.role == "master" && len(n.slots) == 0 {
+		if n.exists && n.clusterMember && n.ready && n.role == "master" && len(n.slots) == 0 {
 			return fmt.Errorf("managed master %q owns no slots; reuse it or delete it before VerifyCluster", pod)
 		}
-		if !n.exists || !n.clusterMember || n.role != "master" || len(n.slots) == 0 {
+		if !n.exists || !n.clusterMember || !n.ready || n.role != "master" || len(n.slots) == 0 {
 			continue
 		}
 		masters++
@@ -459,7 +474,7 @@ func (s *planSimulator) checkInvariants() error {
 func (s *planSimulator) replicaCount(masterPod string) int {
 	count := 0
 	for _, n := range s.nodes {
-		if n.exists && n.clusterMember && n.role == "replica" && n.replicaOf == masterPod {
+		if n.exists && n.clusterMember && n.ready && n.role == "replica" && n.replicaOf == masterPod {
 			count++
 		}
 	}

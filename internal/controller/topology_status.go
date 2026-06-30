@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"maps"
+	"reflect"
 	"slices"
 	"strings"
 	"time"
@@ -115,7 +116,7 @@ func observedNodesMatchSpec(nodes []plan.ObservedNode, spec plan.ClusterSpec) bo
 		if !n.PodExists || !n.RedisSeen || n.Role != "master" || n.Slots == "" {
 			continue
 		}
-		if n.Pod == "" || !n.Ready || n.Deleting {
+		if n.Pod == "" || !plan.ObservedNodeHealthy(n) {
 			return false
 		}
 		if _, ok := shards[n.Pod]; ok {
@@ -147,7 +148,7 @@ func observedNodesMatchSpec(nodes []plan.ObservedNode, spec plan.ClusterSpec) bo
 		if _, ok := shards[masterPod]; !ok {
 			continue
 		}
-		if n.Pod == "" || !n.Ready || n.Deleting {
+		if n.Pod == "" || !plan.ObservedNodeHealthy(n) {
 			return false
 		}
 		shards[masterPod]++
@@ -195,6 +196,37 @@ func observedStatusNodesMatchSpec(nodes []v1alpha1.ObservedNode, spec plan.Clust
 	return observedNodesMatchSpec(out, spec)
 }
 
+func observedStatusNodesEqual(a, b []v1alpha1.ObservedNode) bool {
+	a = normalizedObservedStatusNodes(a)
+	b = normalizedObservedStatusNodes(b)
+	return reflect.DeepEqual(a, b)
+}
+
+func normalizedObservedStatusNodes(nodes []v1alpha1.ObservedNode) []v1alpha1.ObservedNode {
+	out := slices.Clone(nodes)
+	for i := range out {
+		if len(out[i].Flags) == 0 {
+			out[i].Flags = nil
+		} else {
+			out[i].Flags = slices.Clone(out[i].Flags)
+			slices.Sort(out[i].Flags)
+		}
+	}
+	slices.SortFunc(out, func(a, b v1alpha1.ObservedNode) int {
+		switch {
+		case a.Pod != b.Pod:
+			return strings.Compare(a.Pod, b.Pod)
+		case a.NodeID != b.NodeID:
+			return strings.Compare(a.NodeID, b.NodeID)
+		case a.Role != b.Role:
+			return strings.Compare(a.Role, b.Role)
+		default:
+			return strings.Compare(a.MasterID, b.MasterID)
+		}
+	})
+	return out
+}
+
 func planningInstabilityReason(nodes []plan.ObservedNode, spec plan.ClusterSpec) string {
 	if waitingForRedisFailover(nodes, spec) {
 		return "waiting for Redis native failover to promote a replica"
@@ -216,6 +248,15 @@ func clusterStableWaitTimedOut(c *v1alpha1.RedisCluster) bool {
 	return false
 }
 
+func clusterStableWaitStarted(c *v1alpha1.RedisCluster) bool {
+	for _, cond := range c.Status.Conditions {
+		if cond.Type == ConditionPlanned && cond.Reason == "WaitingForClusterStable" {
+			return true
+		}
+	}
+	return false
+}
+
 func waitingForRedisFailover(nodes []plan.ObservedNode, spec plan.ClusterSpec) bool {
 	healthyMasters := 0
 	failedSlotMaster := false
@@ -223,14 +264,22 @@ func waitingForRedisFailover(nodes []plan.ObservedNode, spec plan.ClusterSpec) b
 		if !n.RedisSeen || n.Role != "master" || n.Slots == "" {
 			continue
 		}
-		failed := !n.PodExists || n.Deleting || slices.Contains(n.Flags, "fail") || slices.Contains(n.Flags, "fail?")
-		if failed {
+		if !n.PodExists || n.Deleting || hasRedisFailoverFlag(n.Flags) {
 			failedSlotMaster = true
 			continue
 		}
-		if n.Ready {
+		if n.PodExists {
 			healthyMasters++
 		}
 	}
 	return failedSlotMaster && healthyMasters < int(spec.Shards)
+}
+
+func hasRedisFailoverFlag(flags []string) bool {
+	for _, f := range flags {
+		if strings.EqualFold(f, "fail") || strings.EqualFold(f, "fail?") {
+			return true
+		}
+	}
+	return false
 }

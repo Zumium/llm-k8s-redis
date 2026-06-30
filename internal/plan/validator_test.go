@@ -563,6 +563,44 @@ func TestValidate_ForgetNodeAcceptsNonSlotMember(t *testing.T) {
 	}
 }
 
+func TestValidate_RepairRejectsNotReadyOnlyReplicaAsGhost(t *testing.T) {
+	ctx := func() ValidationContext {
+		ctx := ctxWithObservedNodes(spec(), topology())
+		ctx.ObservedNodes[1].Ready = false
+		ctx.NextPodOrdinal = 4
+		return ctx
+	}()
+	if err := validatePlan(validReplicaReplacementPlan(), ctx); err == nil {
+		t.Fatal("expected not-ready-only replica replacement to fail")
+	}
+}
+
+func TestValidate_ForgetNodePrefersLastKnownNodeID(t *testing.T) {
+	s := spec()
+	s.Shards = 1
+	p := &Plan{
+		DSLVersion:       DSLVersion,
+		PlanID:           "forget-old-node",
+		TargetGeneration: 1,
+		Steps: []Step{
+			{ID: "forget", Action: ActionForgetNode, Params: map[string]any{"namespace": "example", "pod": "redis-1", "lastKnownNodeId": "old-node-1"}},
+			{ID: "verify", Action: ActionVerifyCluster, Params: map[string]any{"expectedShards": 1, "expectedReplicasPerShard": 1, "requireClusterStateOk": true, "requireFullSlotCoverage": true, "requireAllSlotOwnersHaveReplicas": true}},
+		},
+	}
+	ctx := ValidationContext{
+		Spec: s,
+		ObservedNodes: []ObservedNode{
+			{Pod: "redis-0", PodExists: true, RedisSeen: true, NodeID: "node-0", Role: "master", Slots: "0-16383", Ready: true},
+			{Pod: "redis-1", PodExists: true, RedisSeen: true, NodeID: "new-node-1", Role: "replica", MasterPod: "redis-0", Ready: true},
+			{Pod: "redis-1", PodExists: false, RedisSeen: true, NodeID: "old-node-1", Role: "replica", MasterPod: "redis-0", Flags: []string{"fail"}},
+		},
+		NextPodOrdinal: 2,
+	}
+	if err := validatePlan(p, ctx); err != nil {
+		t.Fatalf("expected lastKnownNodeId to target old node, got %v", err)
+	}
+}
+
 func TestValidate_RepairRejectsSkippedNextPodOrdinal(t *testing.T) {
 	ctx := func() ValidationContext {
 		ctx := ctxWithObservedNodes(spec(), topology())
@@ -1117,13 +1155,13 @@ func TestValidate_HealRepairAcceptsUniformUnderReplicatedWithGhost(t *testing.T)
 	}
 }
 
-func TestValidate_HealRepairAcceptsPodExistingGhostWithoutLastKnownNodeID(t *testing.T) {
+func TestValidate_HealRepairRejectsPodExistingGhostWithoutLastKnownNodeID(t *testing.T) {
 	ctx := healCtx()
 	ctx.ObservedNodes[3].PodExists = true
 	p := validHealPlan()
 	delete(p.Steps[stepIndex(t, p, "forget-redis-0")].Params, "lastKnownNodeId")
-	if err := validatePlan(p, ctx); err != nil {
-		t.Fatalf("expected pod-existing ghost forget to pass without lastKnownNodeId, got %v", err)
+	if err := validatePlan(p, ctx); err == nil {
+		t.Fatal("expected pod-existing ghost forget without lastKnownNodeId to fail")
 	}
 }
 

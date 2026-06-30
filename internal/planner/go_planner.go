@@ -101,8 +101,11 @@ func topologyFromObserved(nodes []ObservedNode) observedTopology {
 		if !n.PodExists || !n.RedisSeen || n.Role != "master" || n.Slots == "" {
 			continue
 		}
+		if !plan.ObservedNodeHealthy(n) {
+			continue
+		}
 		masterIndex[n.Pod] = len(t.masters)
-		t.masters = append(t.masters, observedMaster{pod: n.Pod, nodeID: n.NodeID, slots: n.Slots, ready: n.Ready && !n.Deleting})
+		t.masters = append(t.masters, observedMaster{pod: n.Pod, nodeID: n.NodeID, slots: n.Slots, ready: true})
 	}
 	for _, n := range nodes {
 		if !n.PodExists || !n.RedisSeen || n.Role != "replica" {
@@ -113,7 +116,9 @@ func topologyFromObserved(nodes []ObservedNode) observedTopology {
 			masterPod = nodeIDToPod[n.MasterID]
 		}
 		if i, ok := masterIndex[masterPod]; ok {
-			t.masters[i].replicas = append(t.masters[i].replicas, observedReplica{pod: n.Pod, nodeID: n.NodeID, ready: n.Ready && !n.Deleting})
+			if plan.ObservedNodeHealthy(n) {
+				t.masters[i].replicas = append(t.masters[i].replicas, observedReplica{pod: n.Pod, nodeID: n.NodeID, ready: true})
+			}
 		}
 	}
 	return t
@@ -150,6 +155,9 @@ func buildRepairPlan(req Request, t observedTopology) *plan.Plan {
 		return nil
 	}
 	ghosts := ghostNodes(req.ObservedState.Nodes)
+	if hasAmbiguousNoSlotNode(req.ObservedState.Nodes) {
+		return nil
+	}
 	if len(ghosts) == 0 && uniformReplicaCount(t) {
 		return nil
 	}
@@ -165,11 +173,11 @@ func buildRepairPlan(req Request, t observedTopology) *plan.Plan {
 		if n.Pod != "" {
 			params["pod"] = n.Pod
 		}
-		if (!n.PodExists || n.Pod == "") && n.NodeID != "" {
+		if n.NodeID != "" {
 			params["lastKnownNodeId"] = n.NodeID
 		}
 		steps = append(steps, step("forget-"+label, plan.ActionForgetNode, params))
-		if n.Pod != "" {
+		if n.Pod != "" && !n.PodExists && !livePodExists(req.ObservedState.Nodes, n.Pod) {
 			steps = append(steps, deleteStep(spec, n.Pod))
 		}
 	}
@@ -600,9 +608,9 @@ func redisPodOrdinalValue(pod string) int {
 	return n
 }
 
-func hasFailFlag(flags []string) bool {
-	for _, f := range flags {
-		if f == "fail" || f == "fail?" {
+func livePodExists(nodes []ObservedNode, pod string) bool {
+	for _, n := range nodes {
+		if n.Pod == pod && n.PodExists {
 			return true
 		}
 	}
@@ -612,11 +620,20 @@ func hasFailFlag(flags []string) bool {
 func ghostNodes(nodes []ObservedNode) []ObservedNode {
 	var out []ObservedNode
 	for _, n := range nodes {
-		if n.RedisSeen && n.Slots == "" && (!n.PodExists || hasFailFlag(n.Flags)) {
+		if plan.ObservedNodeForgettableGhost(n) {
 			out = append(out, n)
 		}
 	}
 	return out
+}
+
+func hasAmbiguousNoSlotNode(nodes []ObservedNode) bool {
+	for _, n := range nodes {
+		if n.RedisSeen && n.Slots == "" && !plan.ObservedNodeHealthy(n) && !plan.ObservedNodeForgettableGhost(n) {
+			return true
+		}
+	}
+	return false
 }
 
 func uniformReplicaCount(t observedTopology) bool {

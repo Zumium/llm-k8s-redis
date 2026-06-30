@@ -326,7 +326,7 @@ func TestGoPlannerGhostForgetParams(t *testing.T) {
 		wantPod       bool
 	}{
 		{name: "missing pod", ghost: ObservedNode{Pod: "redis-4", PodExists: false, RedisSeen: true, NodeID: "node-4", Role: "replica", MasterPod: "redis-0", Flags: []string{"fail"}}, wantLastKnown: true, wantPod: true},
-		{name: "existing failed pod", ghost: ObservedNode{Pod: "redis-4", PodExists: true, RedisSeen: true, NodeID: "node-4", Role: "replica", MasterPod: "redis-0", Flags: []string{"fail?"}}, wantLastKnown: false, wantPod: true},
+		{name: "existing failed pod", ghost: ObservedNode{Pod: "redis-4", PodExists: true, RedisSeen: true, NodeID: "node-4", Role: "replica", MasterPod: "redis-0", Flags: []string{"fail?"}}, wantLastKnown: true, wantPod: true},
 		{name: "unmapped missing pod", ghost: ObservedNode{PodExists: false, RedisSeen: true, NodeID: "node-4", Role: "replica", MasterPod: "redis-0", Flags: []string{"fail"}}, wantLastKnown: true},
 	}
 	for _, tc := range cases {
@@ -352,6 +352,88 @@ func TestGoPlannerGhostForgetParams(t *testing.T) {
 				t.Fatalf("generated plan did not validate: %v", err)
 			}
 		})
+	}
+}
+
+func TestGoPlannerGhostForgetAlwaysUsesLastKnownNodeID(t *testing.T) {
+	nodes := append(healthyObservedNodes(), ObservedNode{Pod: "redis-4", PodExists: true, RedisSeen: true, NodeID: "node-4", Role: "replica", MasterPod: "redis-0", Flags: []string{"fail?"}})
+
+	got, err := NewGoPlanner(nil).Plan(context.Background(), Request{
+		Spec:          sampleSpec(),
+		ObservedState: ObservedState{NextPodOrdinal: 5, Nodes: nodes},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	forget := firstAction(got, plan.ActionForgetNode)
+	if forget.Params["lastKnownNodeId"] != "node-4" {
+		t.Fatalf("forget params = %#v", forget.Params)
+	}
+	if firstAction(got, plan.ActionDeleteNode).Action != "" {
+		t.Fatalf("delete step generated: %#v", got.Steps)
+	}
+	if err := plan.NewValidator().Validate(got, plan.ValidationContext{Spec: sampleSpec(), NextPodOrdinal: 5, ObservedNodes: nodes}); err != nil {
+		t.Fatalf("generated plan did not validate: %v", err)
+	}
+}
+
+func TestGoPlannerDoesNotDeleteReusedGhostPodName(t *testing.T) {
+	nodes := append(healthyObservedNodes(),
+		ObservedNode{Pod: "redis-4", PodExists: false, RedisSeen: true, NodeID: "old-node-4", Role: "replica", MasterPod: "redis-0", Flags: []string{"fail"}},
+		ObservedNode{Pod: "redis-4", PodExists: true},
+	)
+
+	req := Request{
+		Spec:          sampleSpec(),
+		ObservedState: ObservedState{NextPodOrdinal: 5, Nodes: nodes},
+	}
+	got := buildRepairPlan(req, topologyFromObserved(nodes))
+	if got == nil {
+		t.Fatal("repair plan is nil")
+	}
+	forget := firstAction(got, plan.ActionForgetNode)
+	if forget.Params["lastKnownNodeId"] != "old-node-4" {
+		t.Fatalf("forget params = %#v", forget.Params)
+	}
+	if firstAction(got, plan.ActionDeleteNode).Action != "" {
+		t.Fatalf("delete step generated: %#v", got.Steps)
+	}
+}
+
+func TestGoPlannerReplacesDisconnectedReplica(t *testing.T) {
+	nodes := withReplicaLinkState(healthyObservedNodes(), "redis-1", "disconnected")
+	got, err := NewGoPlanner(nil).Plan(context.Background(), Request{
+		Spec:          sampleSpec(),
+		ObservedState: ObservedState{NextPodOrdinal: 4, Nodes: nodes},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got.PlanID != "go-repair-3" {
+		t.Fatalf("planID = %q", got.PlanID)
+	}
+	if forget := firstAction(got, plan.ActionForgetNode); forget.Params["lastKnownNodeId"] != "node-1" {
+		t.Fatalf("forget = %#v", forget)
+	}
+	if ensure := firstAction(got, plan.ActionEnsureNode); ensure.Params["pod"] != "redis-4" {
+		t.Fatalf("ensure = %#v", ensure)
+	}
+	if err := plan.NewValidator().Validate(got, plan.ValidationContext{Spec: sampleSpec(), NextPodOrdinal: 4, ObservedNodes: nodes}); err != nil {
+		t.Fatalf("generated plan did not validate: %v", err)
+	}
+}
+
+func TestGoPlannerFallsBackForNotReadyOnlyReplica(t *testing.T) {
+	nodes := healthyObservedNodes()
+	nodes[1].Ready = false
+	fallbackErr := errors.New("fallback called")
+	fallback := &stubPlanner{err: fallbackErr}
+	_, err := NewGoPlanner(fallback).Plan(context.Background(), Request{
+		Spec:          sampleSpec(),
+		ObservedState: ObservedState{NextPodOrdinal: 4, Nodes: nodes},
+	})
+	if !errors.Is(err, fallbackErr) || !fallback.called {
+		t.Fatalf("fallback err=%v called=%v", err, fallback.called)
 	}
 }
 
@@ -392,6 +474,28 @@ func TestGoPlannerMapsReplicaByMasterID(t *testing.T) {
 	}
 	if got.PlanID != "go-replica-scaleout-3" {
 		t.Fatalf("planID = %q", got.PlanID)
+	}
+}
+
+func TestGoPlannerFallsBackForFailedExistingMaster(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		patch func([]ObservedNode) []ObservedNode
+	}{
+		{name: "fail flag", patch: withMasterFlags("redis-0", []string{"master", "fail"})},
+		{name: "disconnected", patch: withMasterLinkState("redis-0", "disconnected")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fallbackErr := errors.New("fallback called")
+			fallback := &stubPlanner{err: fallbackErr}
+			_, err := NewGoPlanner(fallback).Plan(context.Background(), Request{
+				Spec:          withReplicas(sampleSpec(), 2),
+				ObservedState: ObservedState{NextPodOrdinal: 4, Nodes: tc.patch(healthyObservedNodes())},
+			})
+			if !errors.Is(err, fallbackErr) || !fallback.called {
+				t.Fatalf("fallback err=%v called=%v", err, fallback.called)
+			}
+		})
 	}
 }
 
@@ -548,6 +652,40 @@ func withMasterReady(nodes []ObservedNode, pod string, ready bool) []ObservedNod
 	for i := range out {
 		if out[i].Pod == pod {
 			out[i].Ready = ready
+		}
+	}
+	return out
+}
+
+func withMasterFlags(pod string, flags []string) func([]ObservedNode) []ObservedNode {
+	return func(nodes []ObservedNode) []ObservedNode {
+		out := append([]ObservedNode(nil), nodes...)
+		for i := range out {
+			if out[i].Pod == pod {
+				out[i].Flags = flags
+			}
+		}
+		return out
+	}
+}
+
+func withMasterLinkState(pod, state string) func([]ObservedNode) []ObservedNode {
+	return func(nodes []ObservedNode) []ObservedNode {
+		out := append([]ObservedNode(nil), nodes...)
+		for i := range out {
+			if out[i].Pod == pod {
+				out[i].LinkState = state
+			}
+		}
+		return out
+	}
+}
+
+func withReplicaLinkState(nodes []ObservedNode, pod, state string) []ObservedNode {
+	out := append([]ObservedNode(nil), nodes...)
+	for i := range out {
+		if out[i].Pod == pod {
+			out[i].LinkState = state
 		}
 	}
 	return out
