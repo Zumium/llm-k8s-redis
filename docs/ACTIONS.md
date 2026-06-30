@@ -52,7 +52,7 @@ DSL 中所有需要定位 Pod 的地方必须显式携带 `namespace`。单 Pod 
 
 Action 的实现应该遵循“观察优先”的原则：执行前先检查实际状态，执行后再重新观察，不假设前一个 Action 一定成功。即使 Plan 中 step 顺序合法，executor 也必须在执行当前 Action 时重新验证安全不变量。
 
-当 Action 发现实际状态已经偏离 Plan，且无法通过当前 Action 幂等修复时，应返回 `Failed`，由 Controller 停止继续执行当前 Plan，等待重新规划或人工介入。
+当 Action 发现实际状态已经偏离 Plan，且无法通过当前 Action 幂等修复时，应返回 `Failed`，由 Controller 停止继续执行当前 Plan，等待人工介入或新的 CR generation 将该 Plan 标记为 `Superseded`。
 
 ## EnsureNode
 
@@ -227,6 +227,7 @@ Params：
 - 对每个需要迁移的 slot，将目标 Master 标记为 `IMPORTING`，源 Master 标记为 `MIGRATING`
 - 从源 Master 扫描属于该 slot 的 keys，并使用受控 Redis 迁移流程迁移到目标 Master
 - 每次 reconcile 中，单个 `MigrateSlots` 最多并发处理 8 个 slots；每个 slot 每批最多迁移 100 个 keys，未完成时返回 `Running`，下一轮 reconcile 从 live Redis 状态继续
+- 迁移前必须等待所有 ready managed peer 都看到 target 是 healthy master，且 target 已有 healthy replica；`SETSLOT` 因 gossip 未收敛返回 unknown node 或 “use SETSLOT only with masters” 时返回 `Running`
 - 连续的多个 `MigrateSlots` step 如果 source Pod 和 target Pod 都互不重复，可以在同一次 reconcile 中并发执行
 - key 迁移完成后，将该 slot 的 owner 切换为目标 Master
 - 每迁移一批 slots 后重新观察 cluster 状态，确保可以从中断处继续执行

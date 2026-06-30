@@ -16,6 +16,11 @@ func bumpNextPodOrdinal(c *v1alpha1.RedisCluster) bool {
 			max = n
 		}
 	}
+	for _, n := range c.Status.ObservedNodes {
+		if ord, ok := controllerRedisPodOrdinal(n.Pod); ok && ord > max {
+			max = ord
+		}
+	}
 	if c.Status.ActivePlan != nil {
 		p, err := statusToPlan(c.Status.ActivePlan)
 		if err == nil {
@@ -34,14 +39,23 @@ func bumpNextPodOrdinal(c *v1alpha1.RedisCluster) bool {
 		}
 	}
 	next := int32(max + 1)
-	if next < 0 {
-		next = 0
-	}
 	if next > c.Status.NextPodOrdinal {
 		c.Status.NextPodOrdinal = next
 		return true
 	}
 	return false
+}
+
+func bumpNextPodOrdinalFromObserved(c *v1alpha1.RedisCluster, nodes []plan.ObservedNode) {
+	max := int(c.Status.NextPodOrdinal) - 1
+	for _, n := range nodes {
+		if ord, ok := controllerRedisPodOrdinal(n.Pod); ok && ord > max {
+			max = ord
+		}
+	}
+	if next := int32(max + 1); next > c.Status.NextPodOrdinal {
+		c.Status.NextPodOrdinal = next
+	}
 }
 
 func advanceNextPodOrdinalFromPlan(c *v1alpha1.RedisCluster, p *plan.Plan) {

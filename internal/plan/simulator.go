@@ -6,6 +6,7 @@ type simulatedNode struct {
 	exists        bool
 	ready         bool
 	clusterMember bool
+	forgotten     bool
 	role          string
 	replicaOf     string
 	slots         map[int]struct{}
@@ -354,6 +355,7 @@ func (s *planSimulator) forgetNode(step Step) error {
 		return fmt.Errorf("ForgetNode target %q still owns slots", key)
 	}
 	n.clusterMember = false
+	n.forgotten = true
 	return nil
 }
 
@@ -396,6 +398,12 @@ func (s *planSimulator) verifyCluster(step Step) error {
 	}
 	masters := 0
 	for pod, n := range s.nodes {
+		if n.exists && !n.clusterMember && !n.forgotten {
+			return fmt.Errorf("managed pod %q is not a Redis cluster member", pod)
+		}
+		if n.exists && n.clusterMember && n.role == "master" && len(n.slots) == 0 {
+			return fmt.Errorf("managed master %q owns no slots; reuse it or delete it before VerifyCluster", pod)
+		}
 		if !n.exists || !n.clusterMember || n.role != "master" || len(n.slots) == 0 {
 			continue
 		}

@@ -41,10 +41,11 @@ const (
 type PlanState string
 
 const (
-	PlanStatePending   PlanState = "Pending"
-	PlanStateRunning   PlanState = "Running"
-	PlanStateCompleted PlanState = "Completed"
-	PlanStateFailed    PlanState = "Failed"
+	PlanStatePending    PlanState = "Pending"
+	PlanStateRunning    PlanState = "Running"
+	PlanStateCompleted  PlanState = "Completed"
+	PlanStateFailed     PlanState = "Failed"
+	PlanStateSuperseded PlanState = "Superseded"
 )
 
 // Plan is the LLM-generated, JSON-encoded reconciliation plan.

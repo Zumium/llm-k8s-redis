@@ -62,3 +62,15 @@ func toPlannerRequest(c *v1alpha1.RedisCluster, spec plan.ClusterSpec) planner.R
 		},
 	}
 }
+
+func apiObservedNodes(nodes []plan.ObservedNode) []v1alpha1.ObservedNode {
+	out := make([]v1alpha1.ObservedNode, len(nodes))
+	for i, n := range nodes {
+		out[i] = v1alpha1.ObservedNode{
+			Pod: n.Pod, PodExists: n.PodExists, RedisSeen: n.RedisSeen, NodeID: n.NodeID, Role: n.Role,
+			Slots: n.Slots, MasterID: n.MasterID, MasterPod: n.MasterPod, Ready: n.Ready, Deleting: n.Deleting,
+			Flags: append([]string{}, n.Flags...), LinkState: n.LinkState,
+		}
+	}
+	return out
+}

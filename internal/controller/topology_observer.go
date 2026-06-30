@@ -48,6 +48,9 @@ func (e *ActionExecutor) ObserveTopology(ctx context.Context, cluster *v1alpha1.
 	}
 
 	cluster.Status.Topology = obs.topology
+	nodes := observedNodes(cluster, obs.pods, obs.entries)
+	cluster.Status.ObservedNodes = apiObservedNodes(nodes)
+	bumpNextPodOrdinalFromObserved(cluster, nodes)
 	setCondition(cluster, ConditionHealthy, metav1.ConditionTrue, "TopologyObserved", "topology refreshed from live cluster")
 	logger.Info("observe topology finished", "duration", time.Since(start), "pods", len(obs.pods), "entries", len(obs.entries), "shards", len(obs.topology.Shards))
 	return nil

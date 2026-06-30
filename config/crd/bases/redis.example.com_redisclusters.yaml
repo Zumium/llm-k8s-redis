@@ -98,6 +98,7 @@ spec:
                     - Running
                     - Completed
                     - Failed
+                    - Superseded
                     type: string
                   steps:
                     description: Steps is the ordered list of step states.
@@ -219,6 +220,41 @@ spec:
                   handled.
                 format: int64
                 type: integer
+              observedNodes:
+                description: ObservedNodes is the last full managed node inventory
+                  used for planning.
+                items:
+                  description: ObservedNode records the current Kubernetes and Redis
+                    view of one managed node.
+                  properties:
+                    deleting:
+                      type: boolean
+                    flags:
+                      items:
+                        type: string
+                      type: array
+                    linkState:
+                      type: string
+                    masterId:
+                      type: string
+                    masterPod:
+                      type: string
+                    nodeId:
+                      type: string
+                    pod:
+                      type: string
+                    podExists:
+                      type: boolean
+                    ready:
+                      type: boolean
+                    redisSeen:
+                      type: boolean
+                    role:
+                      type: string
+                    slots:
+                      type: string
+                  type: object
+                type: array
               topology:
                 description: Topology is the last observed Redis Cluster topology.
                 properties:

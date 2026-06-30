@@ -156,17 +156,22 @@ func (r *RedisClusterReconciler) handleActivePlan(ctx context.Context, cluster *
 	if active == nil {
 		return ctrl.Result{}, nil, false
 	}
-	if planState(active) == plan.PlanStateRunning {
+	state := planState(active)
+	if active.TargetGeneration != cluster.Generation && state != plan.PlanStateSuperseded {
+		logger.Info("active plan superseded by generation", "planID", active.ID, "targetGeneration", active.TargetGeneration, "generation", cluster.Generation)
+		active.Status = string(plan.PlanStateSuperseded)
+		setCondition(cluster, ConditionReady, metav1.ConditionFalse, "PlanSuperseded", "active plan targets an older generation")
+		setCondition(cluster, ConditionPlanned, metav1.ConditionFalse, "PlanSuperseded", "active plan targets an older generation")
+		r.event(cluster, "PlanSuperseded", "active plan targets an older generation")
+		res, err := r.finish(ctx, cluster, ctrl.Result{Requeue: true}, nil)
+		return res, err, true
+	}
+	if state == plan.PlanStateRunning {
 		logger.Info("running active plan found", "planID", active.ID, "steps", len(active.Steps), "currentStep", active.CurrentStep)
 		res, err := r.executeNextStep(ctx, cluster, active)
 		return res, err, true
 	}
-	state := planState(active)
 	logger.Info("active plan found", "planID", active.ID, "planState", state, "targetGeneration", active.TargetGeneration, "steps", len(active.Steps))
-	if active.TargetGeneration != cluster.Generation {
-		logger.Info("active plan superseded by generation", "planID", active.ID, "targetGeneration", active.TargetGeneration, "generation", cluster.Generation)
-		return r.clearActivePlanAndRequeue(ctx, cluster, "active plan targets an older generation", "active plan targets an older generation")
-	}
 	switch state {
 	case plan.PlanStateCompleted:
 		if topologyMatchesSpec(cluster.Status.Topology, spec) {
@@ -179,17 +184,20 @@ func (r *RedisClusterReconciler) handleActivePlan(ctx context.Context, cluster *
 		logger.Info("completed plan drifted, replanning", "planID", active.ID)
 		return r.clearActivePlanAndRequeue(ctx, cluster, "topology drifted", "existing plan no longer valid")
 	case plan.PlanStateFailed:
-		if topologyMatchesSpec(cluster.Status.Topology, spec) {
-			r.event(cluster, "PlanFailedCleared", failedPlanMessage(active))
+		if observedStatusNodesMatchSpec(cluster.Status.ObservedNodes, spec) || (len(cluster.Status.ObservedNodes) == 0 && topologyMatchesSpec(cluster.Status.Topology, spec)) {
 			cluster.Status.ActivePlan = nil
 			markNoPlanNeeded(cluster, "topology already matches spec")
 			logger.Info("failed plan cleared because topology matches spec", "planID", active.ID)
 			res, err := r.finish(ctx, cluster, ctrl.Result{RequeueAfter: r.TopologyRefreshInterval}, nil)
 			return res, err, true
 		}
-		r.event(cluster, "PlanFailedCleared", failedPlanMessage(active))
-		logger.Info("failed plan cleared, replanning", "planID", active.ID)
-		return r.clearActivePlanAndRequeue(ctx, cluster, "topology drifted", "existing plan no longer valid")
+		active.Status = string(plan.PlanStateFailed)
+		setCondition(cluster, ConditionReady, metav1.ConditionFalse, "PlanFailed", failedPlanMessage(active))
+		logger.Info("failed plan retained", "planID", active.ID)
+		res, err := r.finish(ctx, cluster, ctrl.Result{RequeueAfter: r.TopologyRefreshInterval}, nil)
+		return res, err, true
+	case plan.PlanStateSuperseded:
+		return r.clearActivePlanAndRequeue(ctx, cluster, "active plan targets an older generation", "active plan targets an older generation")
 	default:
 		logger.Info("no work this reconcile")
 		res, err := r.finish(ctx, cluster, ctrl.Result{RequeueAfter: r.TopologyRefreshInterval}, nil)
@@ -244,12 +252,25 @@ func (r *RedisClusterReconciler) reconcilePlan(ctx context.Context, cluster *v1a
 			return r.finish(ctx, cluster, ctrl.Result{RequeueAfter: 10 * time.Second}, nil)
 		}
 		logger.Info("observed nodes collected", "attempt", attempt, "nodes", len(nodes), "duration", time.Since(collectStart))
+		cluster.Status.ObservedNodes = apiObservedNodes(nodes)
+		bumpNextPodOrdinalFromObserved(cluster, nodes)
 		req.ObservedState.Nodes = nodes
+		req.ObservedState.NextPodOrdinal = int(cluster.Status.NextPodOrdinal)
 		if observedNodesMatchSpec(nodes, spec) {
 			cluster.Status.ActivePlan = nil
 			markNoPlanNeeded(cluster, "live topology already matches spec")
 			logger.Info("live topology already matches spec, skipping planner", "attempt", attempt)
 			return r.finish(ctx, cluster, ctrl.Result{RequeueAfter: r.TopologyRefreshInterval}, nil)
+		}
+		if reason := planningInstabilityReason(nodes, spec); reason != "" {
+			if !clusterStableWaitTimedOut(cluster) {
+				setCondition(cluster, ConditionReady, metav1.ConditionFalse, "WaitingForClusterStable", reason)
+				setCondition(cluster, ConditionPlanned, metav1.ConditionFalse, "WaitingForClusterStable", reason)
+				cluster.Status.ObservedGeneration = cluster.Generation
+				logger.Info("waiting for redis cluster to stabilize before planning", "attempt", attempt, "reason", reason)
+				return r.finish(ctx, cluster, ctrl.Result{RequeueAfter: 10 * time.Second}, nil)
+			}
+			logger.Info("redis cluster stability wait timed out, planning repair", "attempt", attempt, "reason", reason)
 		}
 
 		attemptStart := time.Now()
@@ -357,11 +378,15 @@ func (r *RedisClusterReconciler) executeNextStep(ctx context.Context, cluster *v
 	failed := r.applyStepOutcome(ctx, cluster, active, planModel, idx, outcome, err)
 	active.CurrentStep = step.ID
 	if failed {
+		active.Status = string(plan.PlanStateFailed)
 		setCondition(cluster, ConditionReady, metav1.ConditionFalse, "StepFailed", active.Steps[idx].Message)
 		return r.finish(ctx, cluster, ctrl.Result{}, nil)
 	}
 	switch outcome.Status {
 	case plan.StepStateCompleted:
+		if nextPendingStep(active) < 0 {
+			active.Status = string(plan.PlanStateCompleted)
+		}
 		logger.Info("step completed")
 		return r.finish(ctx, cluster, ctrl.Result{Requeue: true}, nil)
 	case plan.StepStateRunning:

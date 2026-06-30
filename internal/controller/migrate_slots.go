@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -145,15 +146,15 @@ func (e *ActionExecutor) migrateSlots(ctx context.Context, cluster *v1alpha1.Red
 		logger.Info("target master has no healthy replica before migrate slots", "targetPod", targetPodName, "targetID", target.ID)
 		return running("target master %s/%s has no healthy replica yet; waiting before MigrateSlots", ns, targetPodName), nil
 	}
+	pods, outcome, ok := e.listManagedPods(ctx, cluster)
+	if !ok {
+		return outcome, fmt.Errorf("%s", outcome.Message)
+	}
 
 	owner, err := rediscluster.SlotOwnership(entries)
 	if err != nil {
 		logger.Error(err, "parse slot ownership before migrate slots failed")
 		return StepOutcome{Status: plan.StepStateFailed, Message: fmt.Sprintf("parse slot ownership: %v", err)}, err
-	}
-	pods, outcome, ok := e.listManagedPods(ctx, cluster)
-	if !ok {
-		return outcome, fmt.Errorf("%s", outcome.Message)
 	}
 	podsByIP := mapPodsByIP(pods)
 	entriesByID := map[string]rediscluster.Entry{}
@@ -234,6 +235,11 @@ func (e *ActionExecutor) migrateSlots(ctx context.Context, cluster *v1alpha1.Red
 		}
 		todo = append(todo, slot)
 	}
+	if len(todo) > 0 {
+		if outcome, ok := e.waitForMigratePeerViews(ctx, pods, entries, targetPod.Status.PodIP, target.ID); !ok {
+			return outcome, nil
+		}
+	}
 
 	sourceClients := map[string]redis.Client{}
 	defer func() {
@@ -286,6 +292,7 @@ func (e *ActionExecutor) migrateSlots(ctx context.Context, cluster *v1alpha1.Red
 
 	var mu sync.Mutex
 	var firstErr migrateSlotResult
+	var firstWait migrateSlotResult
 	migratedKeys := 0
 	completedSlots := 0
 	var wg sync.WaitGroup
@@ -301,6 +308,9 @@ func (e *ActionExecutor) migrateSlots(ctx context.Context, cluster *v1alpha1.Red
 				firstErr = result
 				cancel()
 			}
+			if firstErr.err == nil && !firstWait.wait && result.wait {
+				firstWait = result
+			}
 			if result.keys > 0 {
 				migratedKeys += result.keys
 			} else if result.err == nil {
@@ -313,6 +323,9 @@ func (e *ActionExecutor) migrateSlots(ctx context.Context, cluster *v1alpha1.Red
 
 	if firstErr.err != nil {
 		return firstErr.outcome, firstErr.err
+	}
+	if firstWait.wait {
+		return firstWait.outcome, nil
 	}
 	if migratedKeys > 0 {
 		return running("migrated %d keys across %d slots; waiting to finish slot ownership", migratedKeys, len(todo)-completedSlots), nil
@@ -331,6 +344,7 @@ type migrateSlotResult struct {
 	outcome StepOutcome
 	err     error
 	keys    int
+	wait    bool
 }
 
 func (e *ActionExecutor) verifyMigratedSlots(ctx context.Context, cluster *v1alpha1.RedisCluster, entries []rediscluster.Entry, sourcePodName, targetPodName, targetID string, desired []int) (StepOutcome, error, bool) {
@@ -407,16 +421,58 @@ func migrateVerifyPods(cluster *v1alpha1.RedisCluster, pods []corev1.Pod, entrie
 	return out
 }
 
+func (e *ActionExecutor) waitForMigratePeerViews(ctx context.Context, pods []corev1.Pod, entries []rediscluster.Entry, targetIP, targetID string) (StepOutcome, bool) {
+	podsByIP := mapPodsByIP(pods)
+	for _, entry := range entries {
+		addr := rediscluster.RedisAddrFromClusterAddr(entry.Addr)
+		ip := rediscluster.IPFromAddr(addr)
+		pod := podsByIP[ip]
+		if pod == nil {
+			continue
+		}
+		if !podReady(pod) || pod.Status.PodIP == "" {
+			continue
+		}
+		rc, err := e.RedisFactory(addr)
+		if err != nil {
+			return running("peer %s not ready for migration preflight: %v", addr, err), false
+		}
+		raw, err := rc.ClusterNodes(ctx)
+		closeErr := rc.Close()
+		if err != nil {
+			return running("peer %s CLUSTER NODES not ready for migration preflight: %v", addr, err), false
+		}
+		if closeErr != nil {
+			log.FromContext(ctx).Info("close redis client after migrate preflight failed", "addr", addr, "error", closeErr)
+		}
+		entries := rediscluster.ParseNodes(raw)
+		target := rediscluster.FindByIP(entries, targetIP)
+		if target == nil || target.ID != targetID || !target.IsMaster() || !target.Healthy() {
+			return running("peer %s does not yet see target %s as healthy master", addr, targetID), false
+		}
+		if !rediscluster.MasterHasHealthyReplica(entries, targetID) {
+			return running("peer %s does not yet see target %s with healthy replica", addr, targetID), false
+		}
+	}
+	return StepOutcome{}, true
+}
+
 func (e *ActionExecutor) migrateSlot(ctx context.Context, sourceRC, targetRC redis.Client, extraNodeClients map[string]redis.Client, sourceID, targetID, targetAddr string, slot int) migrateSlotResult {
 	logger := log.FromContext(ctx)
 	slotStart := time.Now()
 	logger.Info("migrating slot started", "slot", slot, "sourceID", sourceID, "targetID", targetID)
 	if err := targetRC.ClusterSetSlotImporting(ctx, slot, sourceID); err != nil {
 		logger.Error(err, "target setslot importing failed", "slot", slot, "duration", time.Since(slotStart))
+		if transientRedisPropagationError(err) {
+			return migrateSlotResult{outcome: running("target SETSLOT IMPORTING slot %d waiting for Redis gossip: %v", slot, err), wait: true}
+		}
 		return migrateSlotResult{outcome: StepOutcome{Status: plan.StepStateFailed, Message: fmt.Sprintf("target SETSLOT IMPORTING slot %d: %v", slot, err)}, err: err}
 	}
 	if err := sourceRC.ClusterSetSlotMigrating(ctx, slot, targetID); err != nil {
 		logger.Error(err, "source setslot migrating failed", "slot", slot, "duration", time.Since(slotStart))
+		if transientRedisPropagationError(err) {
+			return migrateSlotResult{outcome: running("source SETSLOT MIGRATING slot %d waiting for Redis gossip: %v", slot, err), wait: true}
+		}
 		return migrateSlotResult{outcome: StepOutcome{Status: plan.StepStateFailed, Message: fmt.Sprintf("source SETSLOT MIGRATING slot %d: %v", slot, err)}, err: err}
 	}
 	keys, err := sourceRC.ClusterGetKeysInSlot(ctx, slot, migrateKeysPerSlot)
@@ -438,10 +494,16 @@ func (e *ActionExecutor) migrateSlot(ctx context.Context, sourceRC, targetRC red
 	}
 	if err := sourceRC.ClusterSetSlotNode(ctx, slot, targetID); err != nil {
 		logger.Error(err, "source setslot node failed", "slot", slot, "duration", time.Since(slotStart))
+		if transientRedisPropagationError(err) {
+			return migrateSlotResult{outcome: running("source SETSLOT NODE slot %d waiting for Redis gossip: %v", slot, err), wait: true}
+		}
 		return migrateSlotResult{outcome: StepOutcome{Status: plan.StepStateFailed, Message: fmt.Sprintf("source SETSLOT NODE slot %d: %v", slot, err)}, err: err}
 	}
 	if err := targetRC.ClusterSetSlotNode(ctx, slot, targetID); err != nil {
 		logger.Error(err, "target setslot node failed", "slot", slot, "duration", time.Since(slotStart))
+		if transientRedisPropagationError(err) {
+			return migrateSlotResult{outcome: running("target SETSLOT NODE slot %d waiting for Redis gossip: %v", slot, err), wait: true}
+		}
 		return migrateSlotResult{outcome: StepOutcome{Status: plan.StepStateFailed, Message: fmt.Sprintf("target SETSLOT NODE slot %d: %v", slot, err)}, err: err}
 	}
 	addrs := make([]string, 0, len(extraNodeClients))
@@ -453,11 +515,25 @@ func (e *ActionExecutor) migrateSlot(ctx context.Context, sourceRC, targetRC red
 		rc := extraNodeClients[addr]
 		if err := rc.ClusterSetSlotNode(ctx, slot, targetID); err != nil {
 			logger.Error(err, "peer setslot node failed", "addr", addr, "slot", slot, "duration", time.Since(slotStart))
+			if transientRedisPropagationError(err) {
+				return migrateSlotResult{outcome: running("peer %s SETSLOT NODE slot %d waiting for Redis gossip: %v", addr, slot, err), wait: true}
+			}
 			return migrateSlotResult{outcome: StepOutcome{Status: plan.StepStateFailed, Message: fmt.Sprintf("peer %s SETSLOT NODE slot %d: %v", addr, slot, err)}, err: err}
 		}
 	}
 	logger.Info("migrating slot finished", "slot", slot, "duration", time.Since(slotStart))
 	return migrateSlotResult{}
+}
+
+func transientRedisPropagationError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "please use setslot only with masters") ||
+		strings.Contains(msg, "unknown node") ||
+		strings.Contains(msg, "not known") ||
+		strings.Contains(msg, "no such node")
 }
 
 func (e *ActionExecutor) getPod(ctx context.Context, ns, podName string) (*corev1.Pod, StepOutcome, error, bool) {

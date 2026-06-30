@@ -47,6 +47,9 @@ func nextPendingStep(ps *v1alpha1.PlanStatus) int {
 }
 
 func planState(ps *v1alpha1.PlanStatus) plan.PlanState {
+	if ps.Status == string(plan.PlanStateSuperseded) {
+		return plan.PlanStateSuperseded
+	}
 	hasFailed, allDone := false, true
 	for _, s := range ps.Steps {
 		switch s.Status {

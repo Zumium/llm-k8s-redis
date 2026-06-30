@@ -78,9 +78,9 @@ nextPodOrdinal: <n>
 
 第二次用 `buildUserPrompt()` 加上第一次的 analysis JSON，要求返回现有 Plan DSL。analysis JSON 只作为模型上下文，不持久化、不参与 controller 分支，也不替代 Validator。第二阶段 prompt 会按 analysis 文本里的标签追加对应 worked examples：`repairTopology`、`cleanupGhostNodes`、`cleanupDirtyNodes`、`changeClusterSpec` 各自只追加自己的示例；多个标签会按这个顺序拼接多组示例。
 
-`ObservedState.Nodes` **不**从 `status.topology` 直接拷贝。Controller 在 reconcile 起点重新读取 K8S Pods 与 Redis `CLUSTER NODES`，再结合 `status.topology` 中的最后已知 pod ↔ nodeId 关系，构造一张面向 planner 的节点事实表。LLM 看到的 observed state 永远是这一次的实时事实，不是上一次的健康拓扑摘要。
+`ObservedState.Nodes` **不**从 `status.topology` 直接拷贝。Controller 在 reconcile 起点重新读取 K8S Pods 与 Redis `CLUSTER NODES`，再结合 `status.topology` 中的最后已知 pod ↔ nodeId 关系，构造一张面向 planner 的节点事实表，并写入 `status.observedNodes` 作为最近一次完整 inventory。LLM 看到的 observed state 永远是这一次的实时事实，不是上一次的健康拓扑摘要。
 
-`ActivePlan` 只用于决定是否需要重新规划。若当前 `activePlan` 仍处于 `Pending` 或 `Running`，Controller 不调用 LLM，不干扰当前计划，只继续执行下一步。只有当当前 plan 已经进入最终状态（`Completed` 或 `Failed`），或者没有 active plan 时，Controller 才基于最新 observed state 请求 LLM 重新规划。
+`ActivePlan` 只用于决定是否需要重新规划。若当前 `activePlan` 仍处于 `Pending` 或 `Running` 且 `targetGeneration` 等于当前 CR generation，Controller 不调用 LLM，只继续执行下一步；若 generation 已变化，先把 plan 标记为 `Superseded`，本轮不执行 step。`Failed` plan 不会被自动清空重试，只有 live observed nodes 已经匹配 spec 或新 generation supersede 时才离开失败态。
 
 `Request`（`internal/planner/types.go`）把这些状态一起送给 planner：
 

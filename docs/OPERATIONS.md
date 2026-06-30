@@ -246,7 +246,7 @@ ScaleOut 的目标状态：
 
 ### Pod命名规则
 
-所有由 Controller 管理的 Redis Pod 必须命名为 `redis-<N>`，其中 `<N>` 为非负整数。Pod 名全局只能使用一次：Create 时 Pod 必须从 `redis-0` 开始连续创建初始节点；Create 后的任何新增 Pod，包括 ScaleOut 和 Repair，都必须使用历史最大 ordinal + 1 开始的连续新序列。不允许 LLM 自行发明其他名称、复用已删除 Pod 名，或填补历史 ordinal 空洞。
+所有由 Controller 管理的 Redis Pod 必须命名为 `redis-<N>`，其中 `<N>` 为非负整数。已进入 `status.topology`、`status.observedNodes` 或当前 `activePlan` 的 Pod 名全局只能使用一次：Create 时 Pod 必须从 `redis-0` 开始连续创建初始节点；Create 后的任何新增 Pod，包括 ScaleOut 和 Repair，都必须使用全量 managed inventory 历史最大 ordinal + 1 开始的连续新序列。不允许 LLM 自行发明其他名称、复用已删除 Pod 名，或填补已进入 inventory 的历史 ordinal 空洞。Failed plan 不会因为 topology 不匹配被自动清空，所以未进入 slot topology 的 ordinal 预留也不会被释放给立即重试复用。
 
 例如 Create 2 个 shard、每个 shard 1 个 replica，需要 4 个节点，必须命名为 `redis-0`、`redis-1`、`redis-2`、`redis-3`。
 
@@ -301,7 +301,7 @@ Controller 在执行 ScaleOut Plan 前必须做 schema 校验和安全校验：
 - 所有新增 Pod 必须先 `EnsureNode`、再 `WaitNodeReady`、再 `MeetNode`
 - 每个最终 Master 必须在迁移 slots 前拥有至少一个 Replica
 - 每个新增或补齐的 Replica 必须通过 `ReplicateNode` 指向合法 Master
-- 所有 `MigrateSlots` 的 source/target 必须是 Master，且 target Master 必须已有健康 Replica
+- 所有 `MigrateSlots` 的 source/target 必须是 Master，且每个 ready managed peer 都必须已经看到 target Master 及其 Replica 健康；Redis gossip 未收敛时保持 `Running`
 - `MigrateSlots` 的 slots 必须精确匹配 Controller 按均衡规则计算出的迁移矩阵
 - 如果只增加 `replicasPerShard`，Plan 不允许包含 `MigrateSlots` 或 `AddSlots`
 - Plan 最后必须包含 `VerifyCluster`
@@ -399,7 +399,7 @@ Repair 场景的目标状态：
 
 当被删除的 Pod 是 Master 且存在健康 Replica 时，Plan 应接受 Redis Cluster 的当前事实。如果 Redis 已完成 failover，被提升的 Replica 就是该 Shard 的当前 Master；Controller 不要求恢复旧 Pod 的 Master 身份。Plan 应围绕当前 slot owner 使用新的单调递增 Pod 名补齐 Replica，并通过带 `lastKnownNodeId` 的 `ForgetNode` 清理旧 Master nodeId，最后执行 `VerifyCluster`。
 
-如果 Redis 尚未完成 failover，Plan 可以先通过不改变拓扑的动作等待或验证实际状态，但不能把 slots 主动分配给一个没有数据来源的新节点。只有在 live Redis 状态显示 slots 已由健康 Master 持有后，才允许继续补副本和清理旧节点。
+如果 Redis 尚未完成 failover，Controller 在规划前设置 `WaitingForClusterStable` 并 requeue 等待；slot migrating/importing 中间态也同样等待。等待超过 2 分钟后才允许进入 Planner/Validator 修复流程，但 Plan 仍不能把 slots 主动分配给一个没有数据来源的新节点。只有在 live Redis 状态显示 slots 已由健康 Master 持有后，才允许继续补副本和清理旧节点。
 
 ### activePlan中的异常
 

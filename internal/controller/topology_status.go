@@ -3,6 +3,8 @@ package controller
 import (
 	"context"
 	"maps"
+	"slices"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -150,10 +152,85 @@ func observedNodesMatchSpec(nodes []plan.ObservedNode, spec plan.ClusterSpec) bo
 		}
 		shards[masterPod]++
 	}
+	for _, n := range nodes {
+		if !n.PodExists && !n.RedisSeen {
+			continue
+		}
+		if n.Role == "master" && n.Slots != "" {
+			if _, ok := shards[n.Pod]; ok {
+				continue
+			}
+		}
+		if n.Role == "replica" {
+			masterPod := n.MasterPod
+			if masterPod == "" && n.MasterID != "" {
+				masterPod = nodeIDToPod[n.MasterID]
+			}
+			if _, ok := shards[masterPod]; ok {
+				continue
+			}
+		}
+		return false
+	}
 	for _, replicas := range shards {
 		if replicas != int(spec.ReplicasPerShard) {
 			return false
 		}
 	}
 	return true
+}
+
+func observedStatusNodesMatchSpec(nodes []v1alpha1.ObservedNode, spec plan.ClusterSpec) bool {
+	if len(nodes) == 0 {
+		return false
+	}
+	out := make([]plan.ObservedNode, len(nodes))
+	for i, n := range nodes {
+		out[i] = plan.ObservedNode{
+			Pod: n.Pod, PodExists: n.PodExists, RedisSeen: n.RedisSeen, NodeID: n.NodeID, Role: n.Role,
+			Slots: n.Slots, MasterID: n.MasterID, MasterPod: n.MasterPod, Ready: n.Ready, Deleting: n.Deleting,
+			Flags: append([]string{}, n.Flags...), LinkState: n.LinkState,
+		}
+	}
+	return observedNodesMatchSpec(out, spec)
+}
+
+func planningInstabilityReason(nodes []plan.ObservedNode, spec plan.ClusterSpec) string {
+	if waitingForRedisFailover(nodes, spec) {
+		return "waiting for Redis native failover to promote a replica"
+	}
+	for _, n := range nodes {
+		if n.RedisSeen && n.Role == "master" && strings.ContainsAny(n.Slots, "[]") {
+			return "waiting for Redis slot migration/importing state to settle"
+		}
+	}
+	return ""
+}
+
+func clusterStableWaitTimedOut(c *v1alpha1.RedisCluster) bool {
+	for _, cond := range c.Status.Conditions {
+		if cond.Type == ConditionPlanned && cond.Reason == "WaitingForClusterStable" {
+			return time.Since(cond.LastTransitionTime.Time) >= verifyStableTimeout
+		}
+	}
+	return false
+}
+
+func waitingForRedisFailover(nodes []plan.ObservedNode, spec plan.ClusterSpec) bool {
+	healthyMasters := 0
+	failedSlotMaster := false
+	for _, n := range nodes {
+		if !n.RedisSeen || n.Role != "master" || n.Slots == "" {
+			continue
+		}
+		failed := !n.PodExists || n.Deleting || slices.Contains(n.Flags, "fail") || slices.Contains(n.Flags, "fail?")
+		if failed {
+			failedSlotMaster = true
+			continue
+		}
+		if n.Ready {
+			healthyMasters++
+		}
+	}
+	return failedSlotMaster && healthyMasters < int(spec.Shards)
 }

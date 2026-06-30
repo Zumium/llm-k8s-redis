@@ -51,6 +51,22 @@ type ClusterTopology struct {
 	Shards []ShardTopology `json:"shards,omitempty"`
 }
 
+// ObservedNode records the current Kubernetes and Redis view of one managed node.
+type ObservedNode struct {
+	Pod       string   `json:"pod,omitempty"`
+	PodExists bool     `json:"podExists,omitempty"`
+	RedisSeen bool     `json:"redisSeen,omitempty"`
+	NodeID    string   `json:"nodeId,omitempty"`
+	Role      string   `json:"role,omitempty"`
+	Slots     string   `json:"slots,omitempty"`
+	MasterID  string   `json:"masterId,omitempty"`
+	MasterPod string   `json:"masterPod,omitempty"`
+	Ready     bool     `json:"ready,omitempty"`
+	Deleting  bool     `json:"deleting,omitempty"`
+	Flags     []string `json:"flags,omitempty"`
+	LinkState string   `json:"linkState,omitempty"`
+}
+
 // StepStatus is the persisted state of a single plan step.
 type StepStatus struct {
 	// ID is the step identifier.
@@ -75,7 +91,7 @@ type StepStatus struct {
 type PlanStatus struct {
 	// ID is the plan identifier.
 	ID string `json:"id,omitempty"`
-	// +kubebuilder:validation:Enum=Pending;Running;Completed;Failed
+	// +kubebuilder:validation:Enum=Pending;Running;Completed;Failed;Superseded
 	Status string `json:"status,omitempty"`
 	// TargetGeneration is the RedisCluster generation this plan targets.
 	TargetGeneration int64 `json:"targetGeneration,omitempty"`
@@ -103,6 +119,8 @@ type RedisClusterStatus struct {
 	TopologyObservedAt metav1.Time `json:"topologyObservedAt,omitempty"`
 	// NextPodOrdinal is the next redis-N ordinal that may be allocated.
 	NextPodOrdinal int32 `json:"nextPodOrdinal,omitempty"`
+	// ObservedNodes is the last full managed node inventory used for planning.
+	ObservedNodes []ObservedNode `json:"observedNodes,omitempty"`
 	// ActivePlan is the plan currently being executed, if any.
 	ActivePlan *PlanStatus `json:"activePlan,omitempty"`
 }
