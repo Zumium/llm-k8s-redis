@@ -368,12 +368,11 @@ func TestSystemPromptDoesNotIncludeWorkedExamples(t *testing.T) {
 
 func TestWorkedExamplesAreValid(t *testing.T) {
 	observed := observedThreeShardOneReplica()
-	twoShardSpec := plan.ClusterSpec{Name: "example", Generation: 1, Shards: 2, ReplicasPerShard: 1, Image: "redis:7.2", MemorySize: "2Gi"}
-	inputs := map[string]any{
-		"create-001":                 plan.ClusterSpec{Name: "example", Generation: 1, Shards: 3, ReplicasPerShard: 1, Image: "redis:7", MemorySize: "1Gi"},
-		"replica-scaleout-001":       plan.ValidationContext{Spec: plan.ClusterSpec{Name: "example", Generation: 2, Shards: 3, ReplicasPerShard: 2, Image: "redis:7", MemorySize: "1Gi"}, NextPodOrdinal: 6, ObservedNodes: observed},
-		"shard-scaleout-001":         plan.ValidationContext{Spec: plan.ClusterSpec{Name: "example", Generation: 3, Shards: 4, ReplicasPerShard: 1, Image: "redis:7", MemorySize: "1Gi"}, NextPodOrdinal: 6, ObservedNodes: observed},
-		"repair-missing-replica-001": plan.ValidationContext{Spec: twoShardSpec, NextPodOrdinal: 3, ObservedNodes: observedMissingReplica()},
+	inputs := map[string][]ObservedNode{
+		"create-001":                 nil,
+		"replica-scaleout-001":       observed,
+		"shard-scaleout-001":         observed,
+		"repair-missing-replica-001": observedMissingReplica(),
 	}
 	seen := map[string]bool{}
 	allExamples := workedExamplesForAnalysis(`{"subprocesses":["repairTopology","cleanupGhostNodes","cleanupDirtyNodes","changeClusterSpec"],"summary":"all examples"}`)

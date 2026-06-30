@@ -4,6 +4,7 @@ import (
 	"context"
 
 	v1alpha1 "github.com/Zumium/llm-k8s-redis/api/v1alpha1"
+	"github.com/Zumium/llm-k8s-redis/internal/action"
 	"github.com/Zumium/llm-k8s-redis/internal/plan"
 	"github.com/Zumium/llm-k8s-redis/internal/planner"
 )
@@ -14,10 +15,6 @@ type Driver interface {
 	CollectObservedNodes(ctx context.Context, cluster *v1alpha1.RedisCluster) ([]plan.ObservedNode, error)
 }
 
-type StepOutcome struct {
-	Status        plan.StepState
-	Message       string
-	SupersedePlan bool
-}
+type StepOutcome = action.StepOutcome
 
 var _ planner.Planner = planner.NoopPlanner{}

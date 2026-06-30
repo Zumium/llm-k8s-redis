@@ -75,14 +75,6 @@ type ClusterSpec struct {
 	MemorySize       string
 }
 
-type ValidationContext struct {
-	Spec           ClusterSpec
-	Topology       *ClusterTopology
-	NextPodOrdinal int
-	ObservedNodes  []ObservedNode
-	healMode       bool
-}
-
 type ObservedNode struct {
 	Pod       string
 	PodExists bool

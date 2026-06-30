@@ -15,11 +15,7 @@ type stubPlanner struct {
 	err    error
 }
 
-func validatePlan(p *plan.Plan, input any) error {
-	var nodes []plan.ObservedNode
-	if ctx, ok := input.(plan.ValidationContext); ok {
-		nodes = ctx.ObservedNodes
-	}
+func validatePlan(p *plan.Plan, nodes []ObservedNode) error {
 	return validator.Validate(validator.ObservationFromObservedNodes(nodes), p)
 }
 
@@ -36,7 +32,7 @@ func TestGoPlannerCreatesInitialCluster(t *testing.T) {
 	if got.PlanID != "go-create-3" || len(got.Steps) != 16 {
 		t.Fatalf("plan = %#v", got)
 	}
-	if err := validatePlan(got, sampleSpec()); err != nil {
+	if err := validatePlan(got, nil); err != nil {
 		t.Fatalf("generated plan did not validate: %v", err)
 	}
 }
@@ -76,7 +72,7 @@ func TestGoPlannerCreateVariants(t *testing.T) {
 			if !sameStrings(gotRanges, tc.wantRanges) {
 				t.Fatalf("slot ranges = %#v, want %#v", gotRanges, tc.wantRanges)
 			}
-			if err := validatePlan(got, spec); err != nil {
+			if err := validatePlan(got, nil); err != nil {
 				t.Fatalf("generated plan did not validate: %v", err)
 			}
 		})
@@ -108,7 +104,7 @@ func TestGoPlannerScalesReplicas(t *testing.T) {
 	if fallback := firstAction(got, plan.ActionMeetNode); fallback.Params["sourcePod"] != "redis-0" || fallback.Params["targetPod"] != "redis-4" {
 		t.Fatalf("first meet = %#v", fallback)
 	}
-	if err := validatePlan(got, plan.ValidationContext{Spec: spec, NextPodOrdinal: 4, ObservedNodes: healthyObservedNodes()}); err != nil {
+	if err := validatePlan(got, healthyObservedNodes()); err != nil {
 		t.Fatalf("generated plan did not validate: %v", err)
 	}
 }
@@ -139,7 +135,7 @@ func TestGoPlannerScalesReplicasIn(t *testing.T) {
 	if got.Steps[0].Params["lastKnownNodeId"] != "node-4" {
 		t.Fatalf("forget params = %#v", got.Steps[0].Params)
 	}
-	if err := validatePlan(got, plan.ValidationContext{Spec: sampleSpec(), NextPodOrdinal: 6, ObservedNodes: nodes}); err != nil {
+	if err := validatePlan(got, nodes); err != nil {
 		t.Fatalf("generated plan did not validate: %v", err)
 	}
 }
@@ -168,7 +164,7 @@ func TestGoPlannerScalesShardsOut(t *testing.T) {
 	if !hasMigration(got, "redis-0", "redis-2", "5462-8191") || !hasMigration(got, "redis-2", "redis-4", "10923-16383") {
 		t.Fatalf("migrations = %#v", migrationStepsOf(got))
 	}
-	if err := validatePlan(got, plan.ValidationContext{Spec: spec, NextPodOrdinal: 4, ObservedNodes: nodes}); err != nil {
+	if err := validatePlan(got, nodes); err != nil {
 		t.Fatalf("generated plan did not validate: %v", err)
 	}
 }
@@ -209,7 +205,7 @@ func TestGoPlannerScalesShardsIn(t *testing.T) {
 			t.Fatalf("forget step missing lastKnownNodeId: %#v", s)
 		}
 	}
-	if err := validatePlan(got, plan.ValidationContext{Spec: spec, NextPodOrdinal: 6, ObservedNodes: nodes}); err != nil {
+	if err := validatePlan(got, nodes); err != nil {
 		t.Fatalf("generated plan did not validate: %v", err)
 	}
 }
@@ -255,7 +251,7 @@ func TestGoPlannerRepairsNonUniformReplicas(t *testing.T) {
 	if replicate.Params["masterPod"] != "redis-2" || replicate.Params["replicaPod"] != "redis-4" {
 		t.Fatalf("replicate = %#v", replicate)
 	}
-	if err := validatePlan(got, plan.ValidationContext{Spec: sampleSpec(), NextPodOrdinal: 4, ObservedNodes: nodes}); err != nil {
+	if err := validatePlan(got, nodes); err != nil {
 		t.Fatalf("generated plan did not validate: %v", err)
 	}
 }
@@ -278,7 +274,7 @@ func TestGoPlannerRepairsThreeShardMixedReplicaCounts(t *testing.T) {
 	if got.PlanID != "go-repair-3" || got.Steps[0].ID != "ensure-redis-10" {
 		t.Fatalf("plan = %#v", got)
 	}
-	if err := validatePlan(got, plan.ValidationContext{Spec: spec, NextPodOrdinal: 10, ObservedNodes: nodes}); err != nil {
+	if err := validatePlan(got, nodes); err != nil {
 		t.Fatalf("generated plan did not validate: %v", err)
 	}
 }
@@ -452,7 +448,7 @@ func TestGoPlannerUsesStatusNextPodOrdinal(t *testing.T) {
 	if got.Steps[0].ID != "ensure-redis-4" {
 		t.Fatalf("first step = %#v", got.Steps[0])
 	}
-	if err := validatePlan(got, plan.ValidationContext{Spec: spec, NextPodOrdinal: 4, ObservedNodes: nodes}); err != nil {
+	if err := validatePlan(got, nodes); err != nil {
 		t.Fatalf("generated plan did not validate: %v", err)
 	}
 }
