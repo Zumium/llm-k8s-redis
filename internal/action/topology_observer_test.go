@@ -237,6 +237,9 @@ func TestCollectObservedNodes_JoinsPodsRedisAndLastKnownTopology(t *testing.T) {
 	if nodes[0].Pod != "redis-0" || !nodes[0].PodExists || !nodes[0].RedisSeen || nodes[0].NodeID != vcMaster0ID || nodes[0].Slots != "0-8191" {
 		t.Fatalf("unexpected redis-0 fact: %#v", nodes[0])
 	}
+	if nodes[0].Image != "redis:7.2" {
+		t.Fatalf("expected redis-0 image, got %#v", nodes[0])
+	}
 	if nodes[1].Pod != "redis-1" || nodes[1].NodeID != vcMaster1ID || nodes[1].Role != "master" {
 		t.Fatalf("unexpected redis-1 fact: %#v", nodes[1])
 	}

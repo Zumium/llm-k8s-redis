@@ -8,7 +8,15 @@ import (
 )
 
 func validatePlan(p *plan.Plan, t *plan.ClusterTopology) error {
-	return Validate(ObservationFromObservedNodes(observedFromTopology(t)), p)
+	return Validate(testSpec(), observedFromTopology(t), p)
+}
+
+func validatePlanWithNodes(p *plan.Plan, nodes []plan.ObservedNode) error {
+	return Validate(testSpec(), nodes, p)
+}
+
+func testSpec() plan.ClusterSpec {
+	return plan.ClusterSpec{Name: "example", Generation: 1, Shards: 2, ReplicasPerShard: 1, Image: "redis:7.2", MemorySize: "2Gi"}
 }
 
 func planWith(steps ...plan.Step) *plan.Plan {
@@ -91,9 +99,9 @@ func observedFromTopology(t *plan.ClusterTopology) []plan.ObservedNode {
 	}
 	var out []plan.ObservedNode
 	for _, sh := range t.Shards {
-		out = append(out, plan.ObservedNode{Pod: sh.Master.Pod, PodExists: true, RedisSeen: true, NodeID: sh.Master.NodeID, Role: "master", Slots: sh.Master.Slots, Ready: sh.Master.Ready})
+		out = append(out, plan.ObservedNode{Pod: sh.Master.Pod, PodExists: true, Image: "redis:7.2", RedisSeen: true, NodeID: sh.Master.NodeID, Role: "master", Slots: sh.Master.Slots, Ready: sh.Master.Ready})
 		for _, r := range sh.Replicas {
-			out = append(out, plan.ObservedNode{Pod: r.Pod, PodExists: true, RedisSeen: true, NodeID: r.NodeID, Role: "replica", MasterPod: sh.Master.Pod, Ready: r.Ready})
+			out = append(out, plan.ObservedNode{Pod: r.Pod, PodExists: true, Image: "redis:7.2", RedisSeen: true, NodeID: r.NodeID, Role: "replica", MasterPod: sh.Master.Pod, Ready: r.Ready})
 		}
 	}
 	return out
@@ -238,6 +246,78 @@ func TestValidate_DeleteForgottenNode(t *testing.T) {
 	p.Steps[len(p.Steps)-1] = verify(1, 0)
 	if err := validatePlan(p, topo); err != nil {
 		t.Fatalf("expected forgotten replica delete to pass, got %v", err)
+	}
+}
+
+func TestValidate_RejectsOldImageNoop(t *testing.T) {
+	nodes := observedFromTopology(topology())
+	for i := range nodes {
+		nodes[i].Image = "redis:7.0"
+	}
+	if err := validatePlanWithNodes(planWith(verify(2, 1)), nodes); err == nil {
+		t.Fatal("expected old image verify to fail")
+	}
+}
+
+func TestValidate_AcceptsImageReplacementPlan(t *testing.T) {
+	nodes := observedFromTopology(topology())
+	for i := range nodes {
+		nodes[i].Image = "redis:7.0"
+	}
+	p := planWith(
+		ensure("ensure-4", "redis-4"),
+		ensure("ensure-5", "redis-5"),
+		ensure("ensure-6", "redis-6"),
+		ensure("ensure-7", "redis-7"),
+		wait("wait-4", "redis-4"),
+		wait("wait-5", "redis-5"),
+		wait("wait-6", "redis-6"),
+		wait("wait-7", "redis-7"),
+		meet("meet-4", "redis-0", "redis-4"),
+		meet("meet-5", "redis-0", "redis-5"),
+		meet("meet-6", "redis-0", "redis-6"),
+		meet("meet-7", "redis-0", "redis-7"),
+		replicate("replicate-5", "redis-4", "redis-5"),
+		replicate("replicate-7", "redis-6", "redis-7"),
+		migrate("migrate-0", "redis-0", "redis-4", "0-8191"),
+		migrate("migrate-2", "redis-2", "redis-6", "8192-16383"),
+		forget("forget-1", "redis-1"),
+		del("delete-1", "redis-1"),
+		forget("forget-3", "redis-3"),
+		del("delete-3", "redis-3"),
+		forget("forget-0", "redis-0"),
+		del("delete-0", "redis-0"),
+		forget("forget-2", "redis-2"),
+		del("delete-2", "redis-2"),
+		verify(2, 1),
+	)
+	if err := validatePlanWithNodes(p, nodes); err != nil {
+		t.Fatalf("expected replacement plan to pass, got %v", err)
+	}
+}
+
+func TestValidate_RejectsEnsureImageMismatch(t *testing.T) {
+	p := planWith(plan.Step{ID: "ensure", Action: plan.ActionEnsureNode, Params: map[string]any{"namespace": "example", "pod": "redis-0", "image": "redis:7.0", "memorySize": "2Gi"}}, verify(2, 1))
+	if err := validatePlanWithNodes(p, nil); err == nil {
+		t.Fatal("expected image mismatch to fail")
+	}
+}
+
+func TestValidate_RejectsEmptyLivePodImage(t *testing.T) {
+	nodes := observedFromTopology(topology())
+	nodes[0].Image = ""
+	if err := validatePlanWithNodes(planWith(verify(2, 1)), nodes); err == nil {
+		t.Fatal("expected empty image to fail")
+	}
+}
+
+func TestValidate_GhostWithoutPodImageStillRequiresForget(t *testing.T) {
+	nodes := append(observedFromTopology(topology()), plan.ObservedNode{Pod: "redis-4", PodExists: false, RedisSeen: true, NodeID: "node-4", Role: "replica", MasterPod: "redis-0", Flags: []string{"fail"}})
+	if err := validatePlanWithNodes(planWith(verify(2, 1)), nodes); err == nil {
+		t.Fatal("expected unforgiven ghost to fail")
+	}
+	if err := validatePlanWithNodes(planWith(plan.Step{ID: "forget", Action: plan.ActionForgetNode, Params: map[string]any{"namespace": "example", "lastKnownNodeId": "node-4"}}, verify(2, 1)), nodes); err != nil {
+		t.Fatalf("expected forgotten ghost to pass, got %v", err)
 	}
 }
 

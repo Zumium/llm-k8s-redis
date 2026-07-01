@@ -10,17 +10,19 @@ import (
 type simulatedNode struct {
 	exists, ready, clusterMember, forgotten bool
 	role, replicaOf                         string
+	image                                   string
 	slots                                   map[int]struct{}
 }
 
 type planSimulator struct {
+	spec       plan.ClusterSpec
 	nodes      map[string]*simulatedNode
 	nodeIDs    map[string]string
 	slotOwners map[int]string
 }
 
-func simulatePlan(p *plan.Plan, ctx observor.ClusterObservation) error {
-	s := newPlanSimulator(ctx)
+func simulatePlan(spec plan.ClusterSpec, nodes []plan.ObservedNode, p *plan.Plan) error {
+	s := newPlanSimulator(spec, nodes)
 	for i, step := range p.Steps {
 		if err := s.apply(step, p, i); err != nil {
 			return fmt.Errorf("step %q: %w", step.ID, err)
@@ -32,39 +34,65 @@ func simulatePlan(p *plan.Plan, ctx observor.ClusterObservation) error {
 	return nil
 }
 
-func newPlanSimulator(ctx observor.ClusterObservation) *planSimulator {
-	s := &planSimulator{nodes: map[string]*simulatedNode{}, nodeIDs: map[string]string{}, slotOwners: map[int]string{}}
-	s.addTopology(topologyFromObservation(ctx))
+func newPlanSimulator(spec plan.ClusterSpec, nodes []plan.ObservedNode) *planSimulator {
+	s := &planSimulator{spec: spec, nodes: map[string]*simulatedNode{}, nodeIDs: map[string]string{}, slotOwners: map[int]string{}}
+	s.addObservedNodes(nodes)
 	return s
 }
 
-func (s *planSimulator) addTopology(t *plan.ClusterTopology) {
-	if t == nil {
-		return
+func observedKey(n plan.ObservedNode) string {
+	if n.Pod != "" {
+		return n.Pod
 	}
-	for _, sh := range t.Shards {
-		m := s.ensureExistingNode(sh.Master.Pod)
-		m.ready, m.clusterMember, m.role = sh.Master.Ready, true, "master"
-		if slots, err := parseSlots(sh.Master.Slots); err == nil {
-			for slot := range slots {
-				m.slots[slot] = struct{}{}
-				s.slotOwners[slot] = sh.Master.Pod
+	return n.NodeID
+}
+
+func (s *planSimulator) addObservedNodes(nodes []plan.ObservedNode) {
+	for _, n := range nodes {
+		key := observedKey(n)
+		if key == "" {
+			continue
+		}
+		if n.NodeID != "" {
+			s.nodeIDs[n.NodeID] = key
+		}
+		s.ensureNodeKey(key)
+	}
+	for _, n := range nodes {
+		key := observedKey(n)
+		if key == "" {
+			continue
+		}
+		sn := s.ensureNodeKey(key)
+		if n.PodExists {
+			sn.exists = true
+			sn.image = n.Image
+		}
+		if n.RedisSeen {
+			sn.clusterMember, sn.role, sn.ready = true, n.Role, observor.ObservedNodeHealthy(n)
+			sn.replicaOf = n.MasterPod
+			if sn.replicaOf == "" {
+				sn.replicaOf = s.nodeIDs[n.MasterID]
+			}
+			if sn.replicaOf == "" {
+				sn.replicaOf = n.MasterID
 			}
 		}
-		for _, r := range sh.Replicas {
-			rn := s.ensureExistingNode(r.Pod)
-			rn.ready, rn.clusterMember, rn.role, rn.replicaOf = r.Ready, true, "replica", sh.Master.Pod
+		if slots, err := parseSlots(n.Slots); err == nil {
+			for slot := range slots {
+				sn.slots[slot] = struct{}{}
+				s.slotOwners[slot] = key
+			}
 		}
 	}
 }
 
-func (s *planSimulator) ensureExistingNode(pod string) *simulatedNode {
-	if n := s.nodes[pod]; n != nil {
-		n.exists = true
+func (s *planSimulator) ensureNodeKey(key string) *simulatedNode {
+	if n := s.nodes[key]; n != nil {
 		return n
 	}
-	n := &simulatedNode{exists: true, slots: map[int]struct{}{}}
-	s.nodes[pod] = n
+	n := &simulatedNode{slots: map[int]struct{}{}}
+	s.nodes[key] = n
 	return n
 }
 
@@ -121,10 +149,22 @@ func (s *planSimulator) readyMaster(pod, hint string) (*simulatedNode, error) {
 
 func (s *planSimulator) ensureNode(step plan.Step) error {
 	pod, err := reqP(step.Params, "pod", "EnsureNode")
-	if err == nil {
-		s.ensureExistingNode(pod)
+	if err != nil {
+		return err
 	}
-	return err
+	image, err := reqP(step.Params, "image", "EnsureNode")
+	if err != nil {
+		return err
+	}
+	if image != s.spec.Image {
+		return fmt.Errorf("EnsureNode image %q must equal spec image %q", image, s.spec.Image)
+	}
+	n := s.ensureNodeKey(pod)
+	if !n.exists {
+		n.image = image
+	}
+	n.exists = true
+	return nil
 }
 
 func (s *planSimulator) waitNodeReady(step plan.Step) error {
@@ -343,6 +383,17 @@ func (s *planSimulator) verifyCluster(step plan.Step) error {
 	}
 	if len(s.slotOwners) != 16384 {
 		return verr(fmt.Sprintf("Slot coverage is %d/16384; add AddSlots or MigrateSlots steps to cover all slots 0-16383", len(s.slotOwners)), "slot coverage is %d, expected 16384", len(s.slotOwners))
+	}
+	for pod, n := range s.nodes {
+		if n.exists && n.image == "" {
+			return fmt.Errorf("managed pod %q has empty image", pod)
+		}
+		if n.exists && n.image != s.spec.Image {
+			return fmt.Errorf("managed pod %q image %q does not match spec image %q", pod, n.image, s.spec.Image)
+		}
+		if n.clusterMember && !n.forgotten && (!n.exists || !n.ready) {
+			return fmt.Errorf("redis member %q must be forgotten before VerifyCluster", pod)
+		}
 	}
 	return s.checkInvariants()
 }

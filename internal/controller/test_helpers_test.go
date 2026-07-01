@@ -12,7 +12,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	api "github.com/Zumium/llm-k8s-redis/api/v1alpha1"
-	"github.com/Zumium/llm-k8s-redis/internal/observor"
 	"github.com/Zumium/llm-k8s-redis/internal/plan"
 	"github.com/Zumium/llm-k8s-redis/internal/planner"
 )
@@ -142,9 +141,9 @@ func observedFromAPITopology(t *api.ClusterTopology) []plan.ObservedNode {
 		return out
 	}
 	for _, sh := range t.Shards {
-		out = append(out, plan.ObservedNode{Pod: sh.Master.Pod, PodExists: true, RedisSeen: true, NodeID: sh.Master.NodeID, Role: "master", Slots: sh.Master.Slots, Ready: sh.Master.Ready})
+		out = append(out, plan.ObservedNode{Pod: sh.Master.Pod, PodExists: true, Image: "redis:7.2", RedisSeen: true, NodeID: sh.Master.NodeID, Role: "master", Slots: sh.Master.Slots, Ready: sh.Master.Ready})
 		for _, r := range sh.Replicas {
-			out = append(out, plan.ObservedNode{Pod: r.Pod, PodExists: true, RedisSeen: true, NodeID: r.NodeID, Role: "replica", MasterPod: sh.Master.Pod, Ready: r.Ready})
+			out = append(out, plan.ObservedNode{Pod: r.Pod, PodExists: true, Image: "redis:7.2", RedisSeen: true, NodeID: r.NodeID, Role: "replica", MasterPod: sh.Master.Pod, Ready: r.Ready})
 		}
 	}
 	return out
@@ -216,7 +215,7 @@ type recordingValidator struct {
 	errors []error
 }
 
-func (v *recordingValidator) Validate(_ observor.ClusterObservation, _ *plan.Plan) error {
+func (v *recordingValidator) Validate(_ plan.ClusterSpec, _ []plan.ObservedNode, _ *plan.Plan) error {
 	v.called++
 	if len(v.errors) > 0 {
 		err := v.errors[0]

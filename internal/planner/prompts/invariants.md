@@ -3,6 +3,7 @@
 - A replica must not hold slots.
 - Slots 0-16383 must be fully covered exactly once across all AddSlots steps.
 - For shard ScaleOut, MigrateSlots must exactly rebalance slots to the controller rule: existing masters in observed topology order, then new masters in EnsureNode order, with slots 0-16383 split as evenly as possible.
+- Image drift is handled by the GoPlanner with whole master+replica group replacement using nextPodOrdinal; do not invent an image-only update action or reuse old pod names.
 - For replica ScaleIn, only remove extra replicas with ForgetNode, then DeleteNode, then VerifyCluster. Never remove a master, migrate slots, or reduce replicasPerShard below 1.
 - For shard ScaleIn, replace all old nodes: create spec.shards new master+replica groups using nextPodOrdinal, migrate every slot from old masters to the new masters balanced across only the new masters, then ForgetNode and DeleteNode every old pod before VerifyCluster. Do not change replicasPerShard in the same plan.
 - Every namespace param must equal the RedisCluster name.

@@ -34,6 +34,7 @@ reconcile with live-state safety checks.
 - **Create** a Redis Cluster from scratch
 - **ScaleOut** shards or replicas (balanced slot redistribution)
 - **ScaleIn** replicas or shards (full-replacement strategy for shard shrink)
+- **Upgrade** Redis images by editing `spec.image` (full node replacement)
 - **Repair** single-Pod drift (replica/master deletion, with activePlan awareness)
 - 9 whitelisted actions: `EnsureNode`, `WaitNodeReady`, `MeetNode`, `ReplicateNode`,
   `AddSlots`, `MigrateSlots`, `ForgetNode`, `DeleteNode`, `VerifyCluster`

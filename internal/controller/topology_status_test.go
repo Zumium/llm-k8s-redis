@@ -8,14 +8,24 @@ import (
 
 func TestObservedNodesMatchSpecRejectsUnhealthyNodes(t *testing.T) {
 	base := []plan.ObservedNode{
-		{Pod: "redis-0", PodExists: true, RedisSeen: true, NodeID: "master-0", Role: "master", Slots: "0-8191", Ready: true},
-		{Pod: "redis-1", PodExists: true, RedisSeen: true, NodeID: "replica-1", Role: "replica", MasterPod: "redis-0", Ready: true},
-		{Pod: "redis-2", PodExists: true, RedisSeen: true, NodeID: "master-2", Role: "master", Slots: "8192-16383", Ready: true},
-		{Pod: "redis-3", PodExists: true, RedisSeen: true, NodeID: "replica-3", Role: "replica", MasterPod: "redis-2", Ready: true},
+		{Pod: "redis-0", PodExists: true, Image: "redis:7.2", RedisSeen: true, NodeID: "master-0", Role: "master", Slots: "0-8191", Ready: true},
+		{Pod: "redis-1", PodExists: true, Image: "redis:7.2", RedisSeen: true, NodeID: "replica-1", Role: "replica", MasterPod: "redis-0", Ready: true},
+		{Pod: "redis-2", PodExists: true, Image: "redis:7.2", RedisSeen: true, NodeID: "master-2", Role: "master", Slots: "8192-16383", Ready: true},
+		{Pod: "redis-3", PodExists: true, Image: "redis:7.2", RedisSeen: true, NodeID: "replica-3", Role: "replica", MasterPod: "redis-2", Ready: true},
 	}
 	spec := toClusterSpec(testCluster())
 	if !observedNodesMatchSpec(base, spec) {
 		t.Fatal("healthy observed nodes should match spec")
+	}
+	withOldImage := append([]plan.ObservedNode(nil), base...)
+	withOldImage[0].Image = "redis:7.0"
+	if observedNodesMatchSpec(withOldImage, spec) {
+		t.Fatal("old image observed nodes should not match spec")
+	}
+	withEmptyImage := append([]plan.ObservedNode(nil), base...)
+	withEmptyImage[0].Image = ""
+	if observedNodesMatchSpec(withEmptyImage, spec) {
+		t.Fatal("empty image observed nodes should not match spec")
 	}
 	cases := []struct {
 		name string

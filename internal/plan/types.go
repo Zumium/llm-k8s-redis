@@ -78,6 +78,7 @@ type ClusterSpec struct {
 type ObservedNode struct {
 	Pod       string
 	PodExists bool
+	Image     string
 	RedisSeen bool
 	NodeID    string
 	Role      string

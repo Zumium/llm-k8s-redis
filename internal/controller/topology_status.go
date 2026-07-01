@@ -54,6 +54,9 @@ func observedNodesMatchSpec(nodes []plan.ObservedNode, spec plan.ClusterSpec) bo
 	shards := map[string]int{}
 	covered := map[int]string{}
 	for _, n := range nodes {
+		if n.PodExists && n.Image != spec.Image {
+			return false
+		}
 		if !n.PodExists || !n.RedisSeen || n.Role != "master" || n.Slots == "" {
 			continue
 		}
@@ -130,7 +133,7 @@ func observedStatusNodesMatchSpec(nodes []v1alpha1.ObservedNode, spec plan.Clust
 	out := make([]plan.ObservedNode, len(nodes))
 	for i, n := range nodes {
 		out[i] = plan.ObservedNode{
-			Pod: n.Pod, PodExists: n.PodExists, RedisSeen: n.RedisSeen, NodeID: n.NodeID, Role: n.Role,
+			Pod: n.Pod, PodExists: n.PodExists, Image: n.Image, RedisSeen: n.RedisSeen, NodeID: n.NodeID, Role: n.Role,
 			Slots: n.Slots, MasterID: n.MasterID, MasterPod: n.MasterPod, Ready: n.Ready, Deleting: n.Deleting,
 			Flags: append([]string{}, n.Flags...), LinkState: n.LinkState,
 		}

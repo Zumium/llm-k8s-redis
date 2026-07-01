@@ -16,7 +16,7 @@ type stubPlanner struct {
 }
 
 func validatePlan(p *plan.Plan, nodes []ObservedNode) error {
-	return validator.Validate(validator.ObservationFromObservedNodes(nodes), p)
+	return validator.Validate(sampleSpec(), nodes, p)
 }
 
 func (p *stubPlanner) Plan(_ context.Context, _ Request) (*plan.Plan, error) {
@@ -134,6 +134,37 @@ func TestGoPlannerScalesReplicasIn(t *testing.T) {
 	}
 	if got.Steps[0].Params["lastKnownNodeId"] != "node-4" {
 		t.Fatalf("forget params = %#v", got.Steps[0].Params)
+	}
+	if err := validatePlan(got, nodes); err != nil {
+		t.Fatalf("generated plan did not validate: %v", err)
+	}
+}
+
+func TestGoPlannerReplacesImageDrift(t *testing.T) {
+	spec := sampleSpec()
+	nodes := withImage(healthyObservedNodes(), "redis:7.0")
+
+	got, err := NewGoPlanner(nil).Plan(context.Background(), Request{
+		Spec:          spec,
+		ObservedState: ObservedState{NextPodOrdinal: 4, Nodes: nodes},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got.PlanID != "go-image-drift-3" {
+		t.Fatalf("planID = %q", got.PlanID)
+	}
+	if got.Steps[0].ID != "ensure-redis-4" || got.Steps[3].ID != "ensure-redis-7" {
+		t.Fatalf("new pods = %#v", got.Steps[:4])
+	}
+	if got.Steps[0].Params["image"] != spec.Image {
+		t.Fatalf("ensure image = %#v", got.Steps[0].Params)
+	}
+	if !hasMigration(got, "redis-0", "redis-4", "0-8191") || !hasMigration(got, "redis-2", "redis-6", "8192-16383") {
+		t.Fatalf("migrations = %#v", migrationStepsOf(got))
+	}
+	if got.Steps[len(got.Steps)-6].ID != "delete-redis-3" || got.Steps[len(got.Steps)-4].ID != "delete-redis-0" {
+		t.Fatalf("old nodes not removed replicas first: %#v", got.Steps[len(got.Steps)-9:])
 	}
 	if err := validatePlan(got, nodes); err != nil {
 		t.Fatalf("generated plan did not validate: %v", err)
@@ -542,43 +573,43 @@ func TestGoPlannerUnsupportedWithoutFallback(t *testing.T) {
 
 func healthyObservedNodes() []ObservedNode {
 	return []ObservedNode{
-		{Pod: "redis-0", PodExists: true, RedisSeen: true, NodeID: "node-0", Role: "master", Slots: "0-8191", Ready: true},
-		{Pod: "redis-1", PodExists: true, RedisSeen: true, NodeID: "node-1", Role: "replica", MasterID: "node-0", MasterPod: "redis-0", Ready: true},
-		{Pod: "redis-2", PodExists: true, RedisSeen: true, NodeID: "node-2", Role: "master", Slots: "8192-16383", Ready: true},
-		{Pod: "redis-3", PodExists: true, RedisSeen: true, NodeID: "node-3", Role: "replica", MasterID: "node-2", MasterPod: "redis-2", Ready: true},
+		{Pod: "redis-0", PodExists: true, Image: "redis:7.2", RedisSeen: true, NodeID: "node-0", Role: "master", Slots: "0-8191", Ready: true},
+		{Pod: "redis-1", PodExists: true, Image: "redis:7.2", RedisSeen: true, NodeID: "node-1", Role: "replica", MasterID: "node-0", MasterPod: "redis-0", Ready: true},
+		{Pod: "redis-2", PodExists: true, Image: "redis:7.2", RedisSeen: true, NodeID: "node-2", Role: "master", Slots: "8192-16383", Ready: true},
+		{Pod: "redis-3", PodExists: true, Image: "redis:7.2", RedisSeen: true, NodeID: "node-3", Role: "replica", MasterID: "node-2", MasterPod: "redis-2", Ready: true},
 	}
 }
 
 func overProvisionedObservedNodes() []ObservedNode {
 	return append(healthyObservedNodes(),
-		ObservedNode{Pod: "redis-4", PodExists: true, RedisSeen: true, NodeID: "node-4", Role: "replica", MasterID: "node-0", MasterPod: "redis-0", Ready: true},
-		ObservedNode{Pod: "redis-5", PodExists: true, RedisSeen: true, NodeID: "node-5", Role: "replica", MasterID: "node-2", MasterPod: "redis-2", Ready: true},
+		ObservedNode{Pod: "redis-4", PodExists: true, Image: "redis:7.2", RedisSeen: true, NodeID: "node-4", Role: "replica", MasterID: "node-0", MasterPod: "redis-0", Ready: true},
+		ObservedNode{Pod: "redis-5", PodExists: true, Image: "redis:7.2", RedisSeen: true, NodeID: "node-5", Role: "replica", MasterID: "node-2", MasterPod: "redis-2", Ready: true},
 	)
 }
 
 func threeShardObservedNodes() []ObservedNode {
 	return []ObservedNode{
-		{Pod: "redis-0", PodExists: true, RedisSeen: true, NodeID: "node-0", Role: "master", Slots: "0-5461", Ready: true},
-		{Pod: "redis-1", PodExists: true, RedisSeen: true, NodeID: "node-1", Role: "replica", MasterID: "node-0", MasterPod: "redis-0", Ready: true},
-		{Pod: "redis-2", PodExists: true, RedisSeen: true, NodeID: "node-2", Role: "master", Slots: "5462-10922", Ready: true},
-		{Pod: "redis-3", PodExists: true, RedisSeen: true, NodeID: "node-3", Role: "replica", MasterID: "node-2", MasterPod: "redis-2", Ready: true},
-		{Pod: "redis-4", PodExists: true, RedisSeen: true, NodeID: "node-4", Role: "master", Slots: "10923-16383", Ready: true},
-		{Pod: "redis-5", PodExists: true, RedisSeen: true, NodeID: "node-5", Role: "replica", MasterID: "node-4", MasterPod: "redis-4", Ready: true},
+		{Pod: "redis-0", PodExists: true, Image: "redis:7.2", RedisSeen: true, NodeID: "node-0", Role: "master", Slots: "0-5461", Ready: true},
+		{Pod: "redis-1", PodExists: true, Image: "redis:7.2", RedisSeen: true, NodeID: "node-1", Role: "replica", MasterID: "node-0", MasterPod: "redis-0", Ready: true},
+		{Pod: "redis-2", PodExists: true, Image: "redis:7.2", RedisSeen: true, NodeID: "node-2", Role: "master", Slots: "5462-10922", Ready: true},
+		{Pod: "redis-3", PodExists: true, Image: "redis:7.2", RedisSeen: true, NodeID: "node-3", Role: "replica", MasterID: "node-2", MasterPod: "redis-2", Ready: true},
+		{Pod: "redis-4", PodExists: true, Image: "redis:7.2", RedisSeen: true, NodeID: "node-4", Role: "master", Slots: "10923-16383", Ready: true},
+		{Pod: "redis-5", PodExists: true, Image: "redis:7.2", RedisSeen: true, NodeID: "node-5", Role: "replica", MasterID: "node-4", MasterPod: "redis-4", Ready: true},
 	}
 }
 
 func threeShardMixedReplicaObservedNodes() []ObservedNode {
 	return []ObservedNode{
-		{Pod: "redis-0", PodExists: true, RedisSeen: true, NodeID: "node-0", Role: "master", Slots: "0-5461", Ready: true},
-		{Pod: "redis-1", PodExists: true, RedisSeen: true, NodeID: "node-1", Role: "master", Slots: "5462-10922", Ready: true},
-		{Pod: "redis-2", PodExists: true, RedisSeen: true, NodeID: "node-2", Role: "master", Slots: "10923-16383", Ready: true},
-		{Pod: "redis-3", PodExists: true, RedisSeen: true, NodeID: "node-3", Role: "replica", MasterID: "node-0", MasterPod: "redis-0", Ready: true},
-		{Pod: "redis-4", PodExists: true, RedisSeen: true, NodeID: "node-4", Role: "replica", MasterID: "node-0", MasterPod: "redis-0", Ready: true},
-		{Pod: "redis-5", PodExists: true, RedisSeen: true, NodeID: "node-5", Role: "replica", MasterID: "node-1", MasterPod: "redis-1", Ready: true},
-		{Pod: "redis-6", PodExists: true, RedisSeen: true, NodeID: "node-6", Role: "replica", MasterID: "node-1", MasterPod: "redis-1", Ready: true},
-		{Pod: "redis-7", PodExists: true, RedisSeen: true, NodeID: "node-7", Role: "replica", MasterID: "node-1", MasterPod: "redis-1", Ready: true},
-		{Pod: "redis-8", PodExists: true, RedisSeen: true, NodeID: "node-8", Role: "replica", MasterID: "node-2", MasterPod: "redis-2", Ready: true},
-		{Pod: "redis-9", PodExists: true, RedisSeen: true, NodeID: "node-9", Role: "replica", MasterID: "node-2", MasterPod: "redis-2", Ready: true},
+		{Pod: "redis-0", PodExists: true, Image: "redis:7.2", RedisSeen: true, NodeID: "node-0", Role: "master", Slots: "0-5461", Ready: true},
+		{Pod: "redis-1", PodExists: true, Image: "redis:7.2", RedisSeen: true, NodeID: "node-1", Role: "master", Slots: "5462-10922", Ready: true},
+		{Pod: "redis-2", PodExists: true, Image: "redis:7.2", RedisSeen: true, NodeID: "node-2", Role: "master", Slots: "10923-16383", Ready: true},
+		{Pod: "redis-3", PodExists: true, Image: "redis:7.2", RedisSeen: true, NodeID: "node-3", Role: "replica", MasterID: "node-0", MasterPod: "redis-0", Ready: true},
+		{Pod: "redis-4", PodExists: true, Image: "redis:7.2", RedisSeen: true, NodeID: "node-4", Role: "replica", MasterID: "node-0", MasterPod: "redis-0", Ready: true},
+		{Pod: "redis-5", PodExists: true, Image: "redis:7.2", RedisSeen: true, NodeID: "node-5", Role: "replica", MasterID: "node-1", MasterPod: "redis-1", Ready: true},
+		{Pod: "redis-6", PodExists: true, Image: "redis:7.2", RedisSeen: true, NodeID: "node-6", Role: "replica", MasterID: "node-1", MasterPod: "redis-1", Ready: true},
+		{Pod: "redis-7", PodExists: true, Image: "redis:7.2", RedisSeen: true, NodeID: "node-7", Role: "replica", MasterID: "node-1", MasterPod: "redis-1", Ready: true},
+		{Pod: "redis-8", PodExists: true, Image: "redis:7.2", RedisSeen: true, NodeID: "node-8", Role: "replica", MasterID: "node-2", MasterPod: "redis-2", Ready: true},
+		{Pod: "redis-9", PodExists: true, Image: "redis:7.2", RedisSeen: true, NodeID: "node-9", Role: "replica", MasterID: "node-2", MasterPod: "redis-2", Ready: true},
 	}
 }
 
@@ -682,6 +713,14 @@ func withReplicaLinkState(nodes []ObservedNode, pod, state string) []ObservedNod
 		if out[i].Pod == pod {
 			out[i].LinkState = state
 		}
+	}
+	return out
+}
+
+func withImage(nodes []ObservedNode, image string) []ObservedNode {
+	out := append([]ObservedNode(nil), nodes...)
+	for i := range out {
+		out[i].Image = image
 	}
 	return out
 }

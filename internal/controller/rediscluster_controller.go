@@ -16,7 +16,6 @@ import (
 
 	v1alpha1 "github.com/Zumium/llm-k8s-redis/api/v1alpha1"
 	"github.com/Zumium/llm-k8s-redis/internal/action"
-	"github.com/Zumium/llm-k8s-redis/internal/observor"
 	"github.com/Zumium/llm-k8s-redis/internal/plan"
 	"github.com/Zumium/llm-k8s-redis/internal/planner"
 	"github.com/Zumium/llm-k8s-redis/internal/validator"
@@ -37,7 +36,7 @@ type RedisClusterReconciler struct {
 	Scheme       *runtime.Scheme
 	Planner      planner.Planner
 	Driver       Driver
-	ValidatePlan func(observor.ClusterObservation, *plan.Plan) error
+	ValidatePlan func(plan.ClusterSpec, []plan.ObservedNode, *plan.Plan) error
 	Recorder     events.EventRecorder
 }
 

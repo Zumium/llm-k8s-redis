@@ -6,7 +6,6 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/Zumium/llm-k8s-redis/internal/observor"
 	"github.com/Zumium/llm-k8s-redis/internal/plan"
 )
 
@@ -31,13 +30,12 @@ func ValidationHint(err error) string {
 
 // ----------
 
-func Validate(current observor.ClusterObservation, p *plan.Plan) error {
-	// to codex: no touch on this
+func Validate(spec plan.ClusterSpec, nodes []plan.ObservedNode, p *plan.Plan) error {
 	if err := isPlanValid(p); err != nil {
 		return err
 	}
 
-	if err := simulatePlan(p, current); err != nil {
+	if err := simulatePlan(spec, nodes, p); err != nil {
 		return err
 	}
 	return nil
@@ -75,116 +73,6 @@ func isPlanValid(p *plan.Plan) error {
 	}
 
 	return nil
-}
-
-func topologyFromObservation(current observor.ClusterObservation) *plan.ClusterTopology {
-	topology := &plan.ClusterTopology{}
-	for i, shard := range current.Shards {
-		st := plan.ShardTopology{ID: fmt.Sprintf("shard-%d", i)}
-		for _, n := range shard.Nodes {
-			nt := plan.NodeTopology{Pod: n.PodName, NodeID: n.NodeID, Ready: true}
-			if n.NodeID == shard.MasterNodeID || n.Role == observor.NodeRoleMaster {
-				nt.Slots = slotRangesString(shard.Slots)
-				st.Master = nt
-			} else {
-				st.Replicas = append(st.Replicas, nt)
-			}
-		}
-		topology.Shards = append(topology.Shards, st)
-	}
-	return topology
-}
-
-func slotRangesString(ranges [][2]int) string {
-	parts := make([]string, 0, len(ranges))
-	for _, r := range ranges {
-		if r[0] == r[1] {
-			parts = append(parts, strconv.Itoa(r[0]))
-		} else {
-			parts = append(parts, fmt.Sprintf("%d-%d", r[0], r[1]))
-		}
-	}
-	return strings.Join(parts, ",")
-}
-
-func ObservationFromObservedNodes(nodes []plan.ObservedNode) observor.ClusterObservation {
-	topology := topologyFromObservedNodes(nodes)
-	out := observor.ClusterObservation{UncategorizedNodes: map[string]observor.Node{}}
-	if topology == nil {
-		return out
-	}
-	for _, sh := range topology.Shards {
-		slots, _ := parseSlotRanges(sh.Master.Slots)
-		nodes := map[string]observor.Node{}
-		master := observor.Node{NodeID: sh.Master.NodeID, PodName: sh.Master.Pod, Role: observor.NodeRoleMaster}
-		nodes[nodeKey(master)] = master
-		for _, r := range sh.Replicas {
-			replica := observor.Node{NodeID: r.NodeID, PodName: r.Pod, Role: observor.NodeRoleReplica}
-			nodes[nodeKey(replica)] = replica
-		}
-		out.Shards = append(out.Shards, observor.Shard{Slots: slots, MasterNodeID: nodeKey(master), Nodes: nodes})
-	}
-	return out
-}
-
-func nodeKey(n observor.Node) string {
-	if n.NodeID != "" {
-		return n.NodeID
-	}
-	return n.PodName
-}
-
-func parseSlotRanges(spec string) ([][2]int, error) {
-	slots, err := parseSlots(spec)
-	if err != nil {
-		return nil, err
-	}
-	ranges := make([][2]int, 0, len(slots))
-	for slot := range slots {
-		ranges = append(ranges, [2]int{slot, slot})
-	}
-	return ranges, nil
-}
-
-func topologyFromObservedNodes(nodes []plan.ObservedNode) *plan.ClusterTopology {
-	nodeIDToPod := map[string]string{}
-	for _, n := range nodes {
-		if n.NodeID != "" && n.Pod != "" {
-			nodeIDToPod[n.NodeID] = n.Pod
-		}
-	}
-	masters := []plan.ShardTopology{}
-	masterIndex := map[string]int{}
-	for _, n := range nodes {
-		if !n.PodExists || !n.RedisSeen || n.Role != "master" || n.Slots == "" {
-			continue
-		}
-		if !observor.ObservedNodeHealthy(n) {
-			continue
-		}
-		masters = append(masters, plan.ShardTopology{
-			ID:     fmt.Sprintf("shard-%d", len(masters)),
-			Master: plan.NodeTopology{Pod: n.Pod, NodeID: n.NodeID, Slots: n.Slots, Ready: true},
-		})
-		masterIndex[n.Pod] = len(masters) - 1
-	}
-	for _, n := range nodes {
-		if !n.PodExists || !n.RedisSeen || n.Role != "replica" {
-			continue
-		}
-		masterPod := n.MasterPod
-		if masterPod == "" && n.MasterID != "" {
-			masterPod = nodeIDToPod[n.MasterID]
-		}
-		i, ok := masterIndex[masterPod]
-		if !ok {
-			continue
-		}
-		if observor.ObservedNodeHealthy(n) {
-			masters[i].Replicas = append(masters[i].Replicas, plan.NodeTopology{Pod: n.Pod, NodeID: n.NodeID, Ready: true})
-		}
-	}
-	return &plan.ClusterTopology{Shards: masters}
 }
 
 func validateStepSchema(s plan.Step) error {

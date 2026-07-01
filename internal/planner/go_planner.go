@@ -26,7 +26,7 @@ func NewGoPlanner(fallback Planner) *GoPlanner {
 
 func (p *GoPlanner) Plan(ctx context.Context, req Request) (*plan.Plan, error) {
 	if generated := buildGoPlan(req); generated != nil {
-		if err := validator.Validate(validator.ObservationFromObservedNodes(req.ObservedState.Nodes), generated); err == nil {
+		if err := validator.Validate(req.Spec, req.ObservedState.Nodes, generated); err == nil {
 			log.FromContext(ctx).Info("planner produced plan", "planner", "go", "planID", generated.PlanID, "steps", len(generated.Steps), "targetGeneration", generated.TargetGeneration)
 			return generated, nil
 		} else {
@@ -56,6 +56,9 @@ func buildGoPlan(req Request) *plan.Plan {
 	if p := buildRepairPlan(req, t); p != nil {
 		return p
 	}
+	if p := buildImageDriftPlan(req, t); p != nil {
+		return p
+	}
 	if p := buildReplicaScaleInPlan(req, t); p != nil {
 		return p
 	}
@@ -75,6 +78,7 @@ type observedTopology struct {
 type observedMaster struct {
 	pod      string
 	nodeID   string
+	image    string
 	slots    string
 	ready    bool
 	replicas []observedReplica
@@ -83,6 +87,7 @@ type observedMaster struct {
 type observedReplica struct {
 	pod    string
 	nodeID string
+	image  string
 	ready  bool
 }
 
@@ -103,7 +108,7 @@ func topologyFromObserved(nodes []ObservedNode) observedTopology {
 			continue
 		}
 		masterIndex[n.Pod] = len(t.masters)
-		t.masters = append(t.masters, observedMaster{pod: n.Pod, nodeID: n.NodeID, slots: n.Slots, ready: true})
+		t.masters = append(t.masters, observedMaster{pod: n.Pod, nodeID: n.NodeID, image: n.Image, slots: n.Slots, ready: true})
 	}
 	for _, n := range nodes {
 		if !n.PodExists || !n.RedisSeen || n.Role != "replica" {
@@ -115,7 +120,7 @@ func topologyFromObserved(nodes []ObservedNode) observedTopology {
 		}
 		if i, ok := masterIndex[masterPod]; ok {
 			if observor.ObservedNodeHealthy(n) {
-				t.masters[i].replicas = append(t.masters[i].replicas, observedReplica{pod: n.Pod, nodeID: n.NodeID, ready: true})
+				t.masters[i].replicas = append(t.masters[i].replicas, observedReplica{pod: n.Pod, nodeID: n.NodeID, image: n.Image, ready: true})
 			}
 		}
 	}
@@ -226,6 +231,50 @@ func buildReplicaScaleInPlan(req Request, t observedTopology) *plan.Plan {
 		return nil
 	}
 	return newGoPlan(spec, "go-replica-scalein", "Scale Redis Cluster replicas down", append(steps, verifyStep(spec)))
+}
+
+func buildImageDriftPlan(req Request, t observedTopology) *plan.Plan {
+	spec := req.Spec
+	if len(t.masters) != int(spec.Shards) {
+		return nil
+	}
+	replicas, ok := shardScaleReady(t)
+	if !ok || replicas != int(spec.ReplicasPerShard) {
+		return nil
+	}
+	owners, ok := slotOwners(t)
+	if !ok || !topologyImageDrift(t, spec.Image) {
+		return nil
+	}
+	next := req.ObservedState.NextPodOrdinal
+	newPods := redisPods(next, int(spec.Shards)*(1+replicas))
+	newMasters := []string{}
+	newReplicas := []replicaProvision{}
+	for i, pod := range newPods {
+		if i%(1+replicas) == 0 {
+			newMasters = append(newMasters, pod)
+			continue
+		}
+		newReplicas = append(newReplicas, replicaProvision{master: newMasters[len(newMasters)-1], replica: pod})
+	}
+	steps := []plan.Step{}
+	steps = append(steps, ensureSteps(spec, newPods)...)
+	steps = append(steps, waitSteps(spec, newPods)...)
+	steps = append(steps, meetSteps(spec, t.masters[0].pod, newMasters)...)
+	for _, r := range newReplicas {
+		steps = append(steps, meetStep(spec, t.masters[0].pod, r.replica))
+	}
+	for _, r := range newReplicas {
+		steps = append(steps, replicateStep(spec, r.master, r.replica))
+	}
+	steps = append(steps, migrationSteps(spec, owners, newMasters, false)...)
+	for _, old := range topologyReplicas(t) {
+		steps = append(steps, forgetDeleteSteps(spec, old.pod, old.nodeID)...)
+	}
+	for _, old := range topologyMasters(t) {
+		steps = append(steps, forgetDeleteSteps(spec, old.pod, old.nodeID)...)
+	}
+	return newGoPlan(spec, "go-image-drift", "Replace Redis nodes for image change", append(steps, verifyStep(spec)))
 }
 
 func buildReplicaScaleOutPlan(req Request, t observedTopology) *plan.Plan {
@@ -514,6 +563,38 @@ func topologyNodes(t observedTopology) []topologyNode {
 		}
 	}
 	return out
+}
+
+func topologyMasters(t observedTopology) []topologyNode {
+	out := make([]topologyNode, 0, len(t.masters))
+	for _, m := range t.masters {
+		out = append(out, topologyNode{pod: m.pod, nodeID: m.nodeID})
+	}
+	return out
+}
+
+func topologyReplicas(t observedTopology) []topologyNode {
+	out := []topologyNode{}
+	for _, m := range t.masters {
+		for _, r := range m.replicas {
+			out = append(out, topologyNode{pod: r.pod, nodeID: r.nodeID})
+		}
+	}
+	return out
+}
+
+func topologyImageDrift(t observedTopology, image string) bool {
+	for _, m := range t.masters {
+		if m.image != "" && m.image != image {
+			return true
+		}
+		for _, r := range m.replicas {
+			if r.image != "" && r.image != image {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func migrationSteps(spec plan.ClusterSpec, owners map[int]string, masters []string, skipSame bool) []plan.Step {

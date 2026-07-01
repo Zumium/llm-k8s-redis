@@ -307,29 +307,29 @@ func TestNoopPlanner(t *testing.T) {
 
 func observedThreeShardOneReplica() []ObservedNode {
 	return []ObservedNode{
-		{Pod: "redis-0", PodExists: true, RedisSeen: true, NodeID: "n0", Role: "master", Slots: "0-5461", Ready: true, Flags: []string{"master"}, LinkState: "connected"},
-		{Pod: "redis-1", PodExists: true, RedisSeen: true, NodeID: "n1", Role: "replica", MasterPod: "redis-0", Ready: true, Flags: []string{"slave"}, LinkState: "connected"},
-		{Pod: "redis-2", PodExists: true, RedisSeen: true, NodeID: "n2", Role: "master", Slots: "5462-10922", Ready: true, Flags: []string{"master"}, LinkState: "connected"},
-		{Pod: "redis-3", PodExists: true, RedisSeen: true, NodeID: "n3", Role: "replica", MasterPod: "redis-2", Ready: true, Flags: []string{"slave"}, LinkState: "connected"},
-		{Pod: "redis-4", PodExists: true, RedisSeen: true, NodeID: "n4", Role: "master", Slots: "10923-16383", Ready: true, Flags: []string{"master"}, LinkState: "connected"},
-		{Pod: "redis-5", PodExists: true, RedisSeen: true, NodeID: "n5", Role: "replica", MasterPod: "redis-4", Ready: true, Flags: []string{"slave"}, LinkState: "connected"},
+		{Pod: "redis-0", PodExists: true, Image: "redis:7.2", RedisSeen: true, NodeID: "n0", Role: "master", Slots: "0-5461", Ready: true, Flags: []string{"master"}, LinkState: "connected"},
+		{Pod: "redis-1", PodExists: true, Image: "redis:7.2", RedisSeen: true, NodeID: "n1", Role: "replica", MasterPod: "redis-0", Ready: true, Flags: []string{"slave"}, LinkState: "connected"},
+		{Pod: "redis-2", PodExists: true, Image: "redis:7.2", RedisSeen: true, NodeID: "n2", Role: "master", Slots: "5462-10922", Ready: true, Flags: []string{"master"}, LinkState: "connected"},
+		{Pod: "redis-3", PodExists: true, Image: "redis:7.2", RedisSeen: true, NodeID: "n3", Role: "replica", MasterPod: "redis-2", Ready: true, Flags: []string{"slave"}, LinkState: "connected"},
+		{Pod: "redis-4", PodExists: true, Image: "redis:7.2", RedisSeen: true, NodeID: "n4", Role: "master", Slots: "10923-16383", Ready: true, Flags: []string{"master"}, LinkState: "connected"},
+		{Pod: "redis-5", PodExists: true, Image: "redis:7.2", RedisSeen: true, NodeID: "n5", Role: "replica", MasterPod: "redis-4", Ready: true, Flags: []string{"slave"}, LinkState: "connected"},
 	}
 }
 
 func observedTwoShardOneReplica() []ObservedNode {
 	return []ObservedNode{
-		{Pod: "redis-0", PodExists: true, RedisSeen: true, NodeID: "node-0", Role: "master", Slots: "0-8191", Ready: true},
-		{Pod: "redis-1", PodExists: true, RedisSeen: true, NodeID: "node-1", Role: "replica", MasterID: "node-0", MasterPod: "redis-0", Ready: true},
-		{Pod: "redis-2", PodExists: true, RedisSeen: true, NodeID: "node-2", Role: "master", Slots: "8192-16383", Ready: true},
-		{Pod: "redis-3", PodExists: true, RedisSeen: true, NodeID: "node-3", Role: "replica", MasterID: "node-2", MasterPod: "redis-2", Ready: true},
+		{Pod: "redis-0", PodExists: true, Image: "redis:7.2", RedisSeen: true, NodeID: "node-0", Role: "master", Slots: "0-8191", Ready: true},
+		{Pod: "redis-1", PodExists: true, Image: "redis:7.2", RedisSeen: true, NodeID: "node-1", Role: "replica", MasterID: "node-0", MasterPod: "redis-0", Ready: true},
+		{Pod: "redis-2", PodExists: true, Image: "redis:7.2", RedisSeen: true, NodeID: "node-2", Role: "master", Slots: "8192-16383", Ready: true},
+		{Pod: "redis-3", PodExists: true, Image: "redis:7.2", RedisSeen: true, NodeID: "node-3", Role: "replica", MasterID: "node-2", MasterPod: "redis-2", Ready: true},
 	}
 }
 
 func observedMissingReplica() []ObservedNode {
 	return []ObservedNode{
-		{Pod: "redis-0", PodExists: true, RedisSeen: true, NodeID: "node-0", Role: "master", Slots: "0-8191", Ready: true},
-		{Pod: "redis-1", PodExists: true, RedisSeen: true, NodeID: "node-1", Role: "replica", MasterID: "node-0", MasterPod: "redis-0", Ready: true},
-		{Pod: "redis-2", PodExists: true, RedisSeen: true, NodeID: "node-2", Role: "master", Slots: "8192-16383", Ready: true},
+		{Pod: "redis-0", PodExists: true, Image: "redis:7.2", RedisSeen: true, NodeID: "node-0", Role: "master", Slots: "0-8191", Ready: true},
+		{Pod: "redis-1", PodExists: true, Image: "redis:7.2", RedisSeen: true, NodeID: "node-1", Role: "replica", MasterID: "node-0", MasterPod: "redis-0", Ready: true},
+		{Pod: "redis-2", PodExists: true, Image: "redis:7.2", RedisSeen: true, NodeID: "node-2", Role: "master", Slots: "8192-16383", Ready: true},
 	}
 }
 

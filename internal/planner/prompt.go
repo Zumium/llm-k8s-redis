@@ -128,10 +128,10 @@ func writeObservedNodesTable(b *strings.Builder, nodes []ObservedNode) {
 		b.WriteString("No observed nodes.\n")
 		return
 	}
-	b.WriteString("pod | podExists | redisSeen | nodeId | role | slots | masterId | masterPod | ready | deleting | flags | linkState\n")
+	b.WriteString("pod | podExists | image | redisSeen | nodeId | role | slots | masterId | masterPod | ready | deleting | flags | linkState\n")
 	for _, n := range nodes {
-		fmt.Fprintf(b, "%s | %v | %v | %s | %s | %s | %s | %s | %v | %v | %s | %s\n",
-			dashIfEmpty(n.Pod), n.PodExists, n.RedisSeen, dashIfEmpty(n.NodeID), dashIfEmpty(n.Role), dashIfEmpty(n.Slots),
+		fmt.Fprintf(b, "%s | %v | %s | %v | %s | %s | %s | %s | %s | %v | %v | %s | %s\n",
+			dashIfEmpty(n.Pod), n.PodExists, dashIfEmpty(n.Image), n.RedisSeen, dashIfEmpty(n.NodeID), dashIfEmpty(n.Role), dashIfEmpty(n.Slots),
 			dashIfEmpty(n.MasterID), dashIfEmpty(n.MasterPod), n.Ready, n.Deleting, dashIfEmpty(strings.Join(n.Flags, ",")), dashIfEmpty(n.LinkState))
 	}
 }

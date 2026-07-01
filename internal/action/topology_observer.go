@@ -358,6 +358,7 @@ func observedNodes(cluster *v1alpha1.RedisCluster, pods []corev1.Pod, entries []
 		n := plan.ObservedNode{
 			Pod:       p.Name,
 			PodExists: true,
+			Image:     podRedisImage(&p),
 			NodeID:    podToNodeID[p.Name],
 			Ready:     podReady(&p),
 			Deleting:  p.DeletionTimestamp != nil,
@@ -398,6 +399,15 @@ func observedNodes(cluster *v1alpha1.RedisCluster, pods []corev1.Pod, entries []
 		return out[i].NodeID < out[j].NodeID
 	})
 	return out
+}
+
+func podRedisImage(p *corev1.Pod) string {
+	for _, c := range p.Spec.Containers {
+		if c.Name == redisContainerName {
+			return c.Image
+		}
+	}
+	return ""
 }
 
 func fillObservedNode(n *plan.ObservedNode, entry rediscluster.Entry, nodeIDToPod map[string]string) {

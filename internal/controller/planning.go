@@ -10,7 +10,6 @@ import (
 
 	v1alpha1 "github.com/Zumium/llm-k8s-redis/api/v1alpha1"
 	"github.com/Zumium/llm-k8s-redis/internal/plan"
-	"github.com/Zumium/llm-k8s-redis/internal/validator"
 )
 
 func (r *RedisClusterReconciler) reconcilePlan(ctx context.Context, cluster *v1alpha1.RedisCluster, spec plan.ClusterSpec) (ctrl.Result, error) {
@@ -67,7 +66,7 @@ func (r *RedisClusterReconciler) reconcilePlan(ctx context.Context, cluster *v1a
 	logger.Info("planner returned plan", "planID", newPlan.PlanID, "steps", len(newPlan.Steps), "duration", time.Since(attemptStart))
 
 	validateStart := time.Now()
-	if err := r.ValidatePlan(validator.ObservationFromObservedNodes(nodes), newPlan); err != nil {
+	if err := r.ValidatePlan(spec, nodes, newPlan); err != nil {
 		logger.Info("plan rejected", "planID", newPlan.PlanID, "duration", time.Since(validateStart), "error", err)
 		setCondition(cluster, ConditionPlanned, metav1.ConditionFalse, "PlanRejected", err.Error())
 		cluster.Status.ObservedGeneration = cluster.Generation

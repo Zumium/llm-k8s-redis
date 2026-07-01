@@ -55,6 +55,7 @@ type ClusterTopology struct {
 type ObservedNode struct {
 	Pod       string   `json:"pod,omitempty"`
 	PodExists bool     `json:"podExists,omitempty"`
+	Image     string   `json:"image,omitempty"`
 	RedisSeen bool     `json:"redisSeen,omitempty"`
 	NodeID    string   `json:"nodeId,omitempty"`
 	Role      string   `json:"role,omitempty"`
