@@ -122,8 +122,6 @@ CLI flags:
 | `--disable-llm-planner`     | `false`                       | Fallback to no-op planner |
 | `--llm-configmap-name`      | `llm-config`                  | ConfigMap name           |
 | `--llm-configmap-namespace` | `redis-cluster-system`        | ConfigMap namespace      |
-| `--topology-refresh-interval` | `60s`                       | Lazy refresh interval    |
-| `--topology-stale-threshold`  | `10s`                       | Redis query debounce     |
 
 Disable the LLM planner with `--disable-llm-planner` to run the controller
 without an LLM backend (no plans will be generated).

@@ -1,78 +1,18 @@
 package controller
 
 import (
-	"context"
-	"maps"
 	"reflect"
 	"slices"
 	"strings"
 	"time"
 
-	corev1 "k8s.io/api/core/v1"
-	"sigs.k8s.io/controller-runtime/pkg/client"
-
 	v1alpha1 "github.com/Zumium/llm-k8s-redis/api/v1alpha1"
+	"github.com/Zumium/llm-k8s-redis/internal/observor"
 	"github.com/Zumium/llm-k8s-redis/internal/plan"
 	"github.com/Zumium/llm-k8s-redis/internal/rediscluster"
 )
 
-func (r *RedisClusterReconciler) shouldRefreshTopology(ctx context.Context, c *v1alpha1.RedisCluster) bool {
-	if c.Status.Topology == nil {
-		return false
-	}
-	active := c.Status.ActivePlan
-	if active != nil && planState(active) == plan.PlanStateRunning {
-		return false
-	}
-	if r.podSetDrifted(ctx, c) {
-		return true
-	}
-	elapsed := time.Since(c.Status.TopologyObservedAt.Time)
-	return elapsed >= r.TopologyStaleThreshold
-}
-
-func (r *RedisClusterReconciler) podSetDrifted(ctx context.Context, c *v1alpha1.RedisCluster) bool {
-	if c.Status.Topology == nil {
-		return false
-	}
-	var podList corev1.PodList
-	if err := r.List(ctx, &podList, &client.ListOptions{
-		Namespace: c.Name,
-	}, client.MatchingLabels{labelCluster: c.Name}); err != nil {
-		return false
-	}
-	live := livePodSignature(podList.Items)
-	want := topologyPodSignature(c.Status.Topology)
-	return !maps.Equal(live, want)
-}
-
-func livePodSignature(pods []corev1.Pod) map[string]bool {
-	out := map[string]bool{}
-	for i := range pods {
-		out[pods[i].Name] = podReady(&pods[i])
-	}
-	return out
-}
-
-func topologyPodSignature(topo *v1alpha1.ClusterTopology) map[string]bool {
-	out := map[string]bool{}
-	if topo == nil {
-		return out
-	}
-	for i := range topo.Shards {
-		sh := &topo.Shards[i]
-		if sh.Master.Pod != "" {
-			out[sh.Master.Pod] = sh.Master.Ready
-		}
-		for j := range sh.Replicas {
-			r := &sh.Replicas[j]
-			if r.Pod != "" {
-				out[r.Pod] = r.Ready
-			}
-		}
-	}
-	return out
-}
+const verifyStableTimeout = 2 * time.Minute
 
 func topologyMatchesSpec(topology *v1alpha1.ClusterTopology, spec plan.ClusterSpec) bool {
 	if topology == nil || len(topology.Shards) == 0 {
@@ -100,6 +40,7 @@ func topologyMatchesSpec(topology *v1alpha1.ClusterTopology, spec plan.ClusterSp
 	return true
 }
 
+// 严格判断 live Redis 视角是否已经满足 spec；true 表示 planner 不应再生成 plan。
 func observedNodesMatchSpec(nodes []plan.ObservedNode, spec plan.ClusterSpec) bool {
 	if len(nodes) == 0 || spec.Shards <= 0 || spec.ReplicasPerShard < 0 {
 		return false
@@ -116,7 +57,7 @@ func observedNodesMatchSpec(nodes []plan.ObservedNode, spec plan.ClusterSpec) bo
 		if !n.PodExists || !n.RedisSeen || n.Role != "master" || n.Slots == "" {
 			continue
 		}
-		if n.Pod == "" || !plan.ObservedNodeHealthy(n) {
+		if n.Pod == "" || !observor.ObservedNodeHealthy(n) {
 			return false
 		}
 		if _, ok := shards[n.Pod]; ok {
@@ -148,7 +89,7 @@ func observedNodesMatchSpec(nodes []plan.ObservedNode, spec plan.ClusterSpec) bo
 		if _, ok := shards[masterPod]; !ok {
 			continue
 		}
-		if n.Pod == "" || !plan.ObservedNodeHealthy(n) {
+		if n.Pod == "" || !observor.ObservedNodeHealthy(n) {
 			return false
 		}
 		shards[masterPod]++
@@ -181,6 +122,7 @@ func observedNodesMatchSpec(nodes []plan.ObservedNode, spec plan.ClusterSpec) bo
 	return true
 }
 
+// status 中的 observed nodes 是上一轮快照；转换后复用 live-state 匹配逻辑。
 func observedStatusNodesMatchSpec(nodes []v1alpha1.ObservedNode, spec plan.ClusterSpec) bool {
 	if len(nodes) == 0 {
 		return false
@@ -196,6 +138,7 @@ func observedStatusNodesMatchSpec(nodes []v1alpha1.ObservedNode, spec plan.Clust
 	return observedNodesMatchSpec(out, spec)
 }
 
+// 稳定性只比较有意义的字段，忽略列表顺序和 flags 顺序。
 func observedStatusNodesEqual(a, b []v1alpha1.ObservedNode) bool {
 	a = normalizedObservedStatusNodes(a)
 	b = normalizedObservedStatusNodes(b)
@@ -227,6 +170,7 @@ func normalizedObservedStatusNodes(nodes []v1alpha1.ObservedNode) []v1alpha1.Obs
 	return out
 }
 
+// 返回非空原因时，planner 前必须等待；超时后才把这个坏状态交给 repair plan。
 func planningInstabilityReason(nodes []plan.ObservedNode, spec plan.ClusterSpec) string {
 	if waitingForRedisFailover(nodes, spec) {
 		return "waiting for Redis native failover to promote a replica"
@@ -235,10 +179,26 @@ func planningInstabilityReason(nodes []plan.ObservedNode, spec plan.ClusterSpec)
 		if n.RedisSeen && n.Role == "master" && strings.ContainsAny(n.Slots, "[]") {
 			return "waiting for Redis slot migration/importing state to settle"
 		}
+		if n.PodExists && n.Deleting {
+			return "waiting for deleting pods to settle"
+		}
+		if n.PodExists && !n.Ready {
+			return "waiting for pods to become ready"
+		}
+		if n.PodExists && !n.RedisSeen {
+			return "waiting for Redis nodes to join cluster"
+		}
+		if n.RedisSeen && n.Role == "unknown" {
+			return "waiting for Redis node roles to settle"
+		}
+		if n.RedisSeen && !observor.ObservedNodeHealthy(n) {
+			return "waiting for Redis nodes to become healthy"
+		}
 	}
 	return ""
 }
 
+// 等待窗口从 WaitingForClusterStable condition 的 transition time 开始计时。
 func clusterStableWaitTimedOut(c *v1alpha1.RedisCluster) bool {
 	for _, cond := range c.Status.Conditions {
 		if cond.Type == ConditionPlanned && cond.Reason == "WaitingForClusterStable" {
@@ -248,6 +208,7 @@ func clusterStableWaitTimedOut(c *v1alpha1.RedisCluster) bool {
 	return false
 }
 
+// 空观测需要特殊处理：第一次空观测先等，第二次仍为空才认为“稳定为空”。
 func clusterStableWaitStarted(c *v1alpha1.RedisCluster) bool {
 	for _, cond := range c.Status.Conditions {
 		if cond.Type == ConditionPlanned && cond.Reason == "WaitingForClusterStable" {
@@ -257,6 +218,7 @@ func clusterStableWaitStarted(c *v1alpha1.RedisCluster) bool {
 	return false
 }
 
+// 少一个健康 master 且旧 slot master 已 fail/deleting 时，优先等 Redis 自己 failover。
 func waitingForRedisFailover(nodes []plan.ObservedNode, spec plan.ClusterSpec) bool {
 	healthyMasters := 0
 	failedSlotMaster := false

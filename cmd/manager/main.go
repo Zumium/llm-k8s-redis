@@ -19,11 +19,12 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	api "github.com/Zumium/llm-k8s-redis/api/v1alpha1"
+	"github.com/Zumium/llm-k8s-redis/internal/action"
 	"github.com/Zumium/llm-k8s-redis/internal/controller"
-	"github.com/Zumium/llm-k8s-redis/internal/plan"
 	"github.com/Zumium/llm-k8s-redis/internal/planner"
 	"github.com/Zumium/llm-k8s-redis/internal/rag"
 	"github.com/Zumium/llm-k8s-redis/internal/redis"
+	"github.com/Zumium/llm-k8s-redis/internal/validator"
 )
 
 var (
@@ -38,15 +39,13 @@ func init() {
 
 func main() {
 	var (
-		zapOpts                 zap.Options
-		metricsAddr             string
-		probeAddr               string
-		enableLeaderElec        bool
-		llmConfigMapName        string
-		llmConfigMapNS          string
-		disableLLMPlanner       bool
-		topologyRefreshInterval time.Duration
-		topologyStaleThreshold  time.Duration
+		zapOpts           zap.Options
+		metricsAddr       string
+		probeAddr         string
+		enableLeaderElec  bool
+		llmConfigMapName  string
+		llmConfigMapNS    string
+		disableLLMPlanner bool
 	)
 	zapOpts.Development = true
 	zapOpts.BindFlags(flag.CommandLine)
@@ -56,8 +55,6 @@ func main() {
 	flag.StringVar(&llmConfigMapName, "llm-configmap-name", "llm-config", "Name of the ConfigMap holding LLM connection config.")
 	flag.StringVar(&llmConfigMapNS, "llm-configmap-namespace", "redis-cluster-system", "Namespace of the LLM ConfigMap.")
 	flag.BoolVar(&disableLLMPlanner, "disable-llm-planner", false, "Use NoopPlanner instead of the ConfigMap-driven LLM planner (for testing).")
-	flag.DurationVar(&topologyRefreshInterval, "topology-refresh-interval", 60*time.Second, "Interval between lazy topology refreshes for idle clusters.")
-	flag.DurationVar(&topologyStaleThreshold, "topology-stale-threshold", 10*time.Second, "Minimum time between observeTopology calls to avoid Redis load spikes during Pod storms.")
 	flag.Parse()
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&zapOpts)))
 
@@ -74,7 +71,6 @@ func main() {
 	}
 
 	var p planner.Planner
-	planValidationRetries := 0
 	if !disableLLMPlanner {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
@@ -84,7 +80,6 @@ func main() {
 			os.Exit(1)
 		}
 		p = plannerForMode(false, llmPlanner)
-		planValidationRetries = config.PlanValidationRetries
 		setupLog.Info("using go planner with llm fallback backed by configmap", "name", llmConfigMapName, "namespace", llmConfigMapNS, "model", config.Model)
 
 		if config.HasEmbeddingConfig() {
@@ -101,18 +96,14 @@ func main() {
 		setupLog.Info("llm planner disabled; using go planner with NoopPlanner fallback")
 	}
 
-	executor := &controller.ActionExecutor{Client: mgr.GetClient(), Scheme: scheme, RedisFactory: redis.DefaultFactory}
+	executor := &action.ActionExecutor{Client: mgr.GetClient(), Scheme: scheme, RedisFactory: redis.DefaultFactory}
 	if err = (&controller.RedisClusterReconciler{
-		Client:                  mgr.GetClient(),
-		APIReader:               mgr.GetAPIReader(),
-		Scheme:                  scheme,
-		Planner:                 p,
-		Driver:                  executor,
-		ValidatePlan:            plan.NewValidator().Validate,
-		Recorder:                mgr.GetEventRecorder("rediscluster-controller"),
-		TopologyRefreshInterval: topologyRefreshInterval,
-		TopologyStaleThreshold:  topologyStaleThreshold,
-		PlanValidationRetries:   planValidationRetries,
+		Client:       mgr.GetClient(),
+		Scheme:       scheme,
+		Planner:      p,
+		Driver:       executor,
+		ValidatePlan: validator.Validate,
+		Recorder:     mgr.GetEventRecorder("rediscluster-controller"),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "RedisCluster")
 		os.Exit(1)

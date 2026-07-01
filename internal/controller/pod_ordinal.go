@@ -106,3 +106,15 @@ func controllerRedisPodOrdinal(pod string) (int, bool) {
 	}
 	return n, true
 }
+
+func paramString(params map[string]any, key string) (string, bool) {
+	if params == nil {
+		return "", false
+	}
+	v, ok := params[key]
+	if !ok || v == nil {
+		return "", false
+	}
+	s, ok := v.(string)
+	return s, ok
+}

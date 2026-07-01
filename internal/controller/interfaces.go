@@ -11,7 +11,6 @@ import (
 
 type Driver interface {
 	ExecuteStep(ctx context.Context, cluster *v1alpha1.RedisCluster, p *plan.Plan, stepIndex int) (StepOutcome, error)
-	ObserveTopology(ctx context.Context, cluster *v1alpha1.RedisCluster) error
 	CollectObservedNodes(ctx context.Context, cluster *v1alpha1.RedisCluster) ([]plan.ObservedNode, error)
 }
 
