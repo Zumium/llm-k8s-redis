@@ -242,37 +242,39 @@ func buildImageDriftPlan(req Request, t observedTopology) *plan.Plan {
 	if !ok || replicas != int(spec.ReplicasPerShard) {
 		return nil
 	}
-	owners, ok := slotOwners(t)
-	if !ok || !topologyImageDrift(t, spec.Image) {
+	if _, ok := slotOwners(t); !ok || !topologyImageDrift(t, spec.Image) {
 		return nil
 	}
 	next := req.ObservedState.NextPodOrdinal
-	newPods := redisPods(next, int(spec.Shards)*(1+replicas))
-	newMasters := []string{}
-	newReplicas := []replicaProvision{}
-	for i, pod := range newPods {
-		if i%(1+replicas) == 0 {
-			newMasters = append(newMasters, pod)
-			continue
-		}
-		newReplicas = append(newReplicas, replicaProvision{master: newMasters[len(newMasters)-1], replica: pod})
-	}
 	steps := []plan.Step{}
-	steps = append(steps, ensureSteps(spec, newPods)...)
-	steps = append(steps, waitSteps(spec, newPods)...)
-	steps = append(steps, meetSteps(spec, t.masters[0].pod, newMasters)...)
-	for _, r := range newReplicas {
-		steps = append(steps, meetStep(spec, t.masters[0].pod, r.replica))
-	}
-	for _, r := range newReplicas {
-		steps = append(steps, replicateStep(spec, r.master, r.replica))
-	}
-	steps = append(steps, migrationSteps(spec, owners, newMasters, false)...)
-	for _, old := range topologyReplicas(t) {
+	seed := t.masters[0].pod
+	for _, old := range t.masters {
+		master := redisPod(next)
+		next++
+		pods := []string{master}
+		newReplicas := []replicaProvision{}
+		for i := 0; i < replicas; i++ {
+			replica := redisPod(next)
+			next++
+			pods = append(pods, replica)
+			newReplicas = append(newReplicas, replicaProvision{master: master, replica: replica})
+		}
+		steps = append(steps, ensureSteps(spec, pods)...)
+		steps = append(steps, waitSteps(spec, pods)...)
+		steps = append(steps, meetSteps(spec, seed, pods)...)
+		for _, r := range newReplicas {
+			steps = append(steps, replicateStep(spec, r.master, r.replica))
+		}
+		steps = append(steps, step("migrate-"+old.pod+"-"+master, plan.ActionMigrateSlots, map[string]any{
+			"namespace": spec.Name, "sourcePod": old.pod, "targetPod": master, "slots": old.slots,
+		}))
+		for _, r := range old.replicas {
+			steps = append(steps, forgetDeleteSteps(spec, r.pod, r.nodeID)...)
+		}
 		steps = append(steps, forgetDeleteSteps(spec, old.pod, old.nodeID)...)
-	}
-	for _, old := range topologyMasters(t) {
-		steps = append(steps, forgetDeleteSteps(spec, old.pod, old.nodeID)...)
+		if seed == old.pod {
+			seed = master
+		}
 	}
 	return newGoPlan(spec, "go-image-drift", "Replace Redis nodes for image change", append(steps, verifyStep(spec)))
 }

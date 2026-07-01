@@ -77,6 +77,7 @@ type fakeRedisClient struct {
 	clusterNodes     func() (string, error)
 	clusterNodesAddr func(addr string) (string, error)
 	clusterInfo      func() (string, error)
+	clusterInfoAddr  func(addr string) (string, error)
 	clusterMeet      func(host string, port int) error
 	clusterReplicate func(masterNodeID string) error
 	clusterForget    func(nodeID string) error
@@ -250,6 +251,13 @@ func (f *addrFakeRedisClient) ClusterNodes(ctx context.Context) (string, error) 
 		return f.clusterNodesAddr(f.addr)
 	}
 	return f.fakeRedisClient.ClusterNodes(ctx)
+}
+
+func (f *addrFakeRedisClient) ClusterInfo(ctx context.Context) (string, error) {
+	if f.clusterInfoAddr != nil {
+		return f.clusterInfoAddr(f.addr)
+	}
+	return f.fakeRedisClient.ClusterInfo(ctx)
 }
 
 func fakeFactory(fc *fakeRedisClient) redis.Factory {

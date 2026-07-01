@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -349,6 +350,35 @@ func TestMigrateSlots_UnownedSlotAddsToTarget(t *testing.T) {
 	}
 }
 
+func TestMigrateSlots_UnownedSlotWaitsForTargetClusterStateOK(t *testing.T) {
+	ctx := context.Background()
+	cluster := testCluster()
+	migrateTopology(cluster)
+	fc := &fakeRedisClient{
+		clusterNodes: func() (string, error) {
+			return migrateClusterNodes("1-8191", "8192-16383"), nil
+		},
+		clusterInfoAddr: func(addr string) (string, error) {
+			if addr == "10.0.0.3:6379" {
+				return "cluster_state:fail\r\n", nil
+			}
+			return "cluster_state:ok\r\n", nil
+		},
+	}
+	exec := migrateExec(t, cluster, fc)
+
+	outcome, err := exec.ExecuteStep(ctx, cluster, migratePlan(), 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if outcome.Status != plan.StepStateRunning {
+		t.Fatalf("expected Running, got %q: %s", outcome.Status, outcome.Message)
+	}
+	if len(fc.addSlotsCalls) != 0 || len(fc.setSlotCalls) != 0 || len(fc.migrateCalls) != 0 {
+		t.Fatalf("expected no redis mutations, got addslots=%v setslot=%v migrate=%v", fc.addSlotsCalls, fc.setSlotCalls, fc.migrateCalls)
+	}
+}
+
 func TestMigrateSlots_DoesNotSetSlotNodeOnStaleMaster(t *testing.T) {
 	ctx := context.Background()
 	cluster := testCluster()
@@ -422,6 +452,130 @@ func TestMigrateSlots_MigratesKeysAndReturnsRunning(t *testing.T) {
 	call := fc.migrateCalls[0]
 	if call.host != "10.0.0.3" || call.port != 6379 || len(call.keys) != 1 || call.keys[0] != "key-a" {
 		t.Fatalf("unexpected migrate call: %+v", call)
+	}
+}
+
+func TestMigrateSlots_WaitsForTargetClusterStateOK(t *testing.T) {
+	ctx := context.Background()
+	cluster := testCluster()
+	migrateTopology(cluster)
+	fc := &fakeRedisClient{
+		clusterNodes: func() (string, error) {
+			return migrateClusterNodes("0-8191", "8192-16383"), nil
+		},
+		clusterInfoAddr: func(addr string) (string, error) {
+			if addr == "10.0.0.3:6379" {
+				return "cluster_state:fail\r\n", nil
+			}
+			return "cluster_state:ok\r\n", nil
+		},
+	}
+	exec := migrateExec(t, cluster, fc)
+
+	outcome, err := exec.ExecuteStep(ctx, cluster, migratePlan(), 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if outcome.Status != plan.StepStateRunning {
+		t.Fatalf("expected Running, got %q: %s", outcome.Status, outcome.Message)
+	}
+	if len(fc.setSlotCalls) != 0 || len(fc.migrateCalls) != 0 {
+		t.Fatalf("expected no redis mutations, got setslot=%v migrate=%v", fc.setSlotCalls, fc.migrateCalls)
+	}
+}
+
+func TestMigrateSlots_WaitsForSourceClusterStateOK(t *testing.T) {
+	ctx := context.Background()
+	cluster := testCluster()
+	migrateTopology(cluster)
+	fc := &fakeRedisClient{
+		clusterNodes: func() (string, error) {
+			return migrateClusterNodes("0-8191", "8192-16383"), nil
+		},
+		clusterInfoAddr: func(addr string) (string, error) {
+			if addr == "10.0.0.1:6379" {
+				return "cluster_state:fail\r\n", nil
+			}
+			return "cluster_state:ok\r\n", nil
+		},
+	}
+	exec := migrateExec(t, cluster, fc)
+
+	outcome, err := exec.ExecuteStep(ctx, cluster, migratePlan(), 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if outcome.Status != plan.StepStateRunning {
+		t.Fatalf("expected Running, got %q: %s", outcome.Status, outcome.Message)
+	}
+	if len(fc.setSlotCalls) != 0 || len(fc.migrateCalls) != 0 {
+		t.Fatalf("expected no redis mutations, got setslot=%v migrate=%v", fc.setSlotCalls, fc.migrateCalls)
+	}
+}
+
+func TestMigrateSlots_WaitsForPeerClusterStateOK(t *testing.T) {
+	ctx := context.Background()
+	cluster := testCluster()
+	migrateTopology(cluster)
+	third := "third333 10.0.0.5:6379@16379 master - 0 0 5 connected\n"
+	fc := &fakeRedisClient{
+		clusterNodes: func() (string, error) {
+			return migrateClusterNodes("0-8191", "8192-16383") + third, nil
+		},
+		clusterInfoAddr: func(addr string) (string, error) {
+			if addr == "10.0.0.5:6379" {
+				return "cluster_state:fail\r\n", nil
+			}
+			return "cluster_state:ok\r\n", nil
+		},
+	}
+	exec := migrateExec(t, cluster, fc)
+	thirdPod := readyPodWithIP(cluster, "redis-4", "10.0.0.5")
+	if err := ctrl.SetControllerReference(cluster, thirdPod, exec.Scheme); err != nil {
+		t.Fatalf("set owner ref: %v", err)
+	}
+	if err := exec.Create(ctx, thirdPod); err != nil {
+		t.Fatalf("create third pod: %v", err)
+	}
+
+	outcome, err := exec.ExecuteStep(ctx, cluster, migratePlan(), 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if outcome.Status != plan.StepStateRunning {
+		t.Fatalf("expected Running, got %q: %s", outcome.Status, outcome.Message)
+	}
+	if len(fc.setSlotCalls) != 0 || len(fc.migrateCalls) != 0 {
+		t.Fatalf("expected no redis mutations, got setslot=%v migrate=%v", fc.setSlotCalls, fc.migrateCalls)
+	}
+}
+
+func TestMigrateSlots_ClusterDownDuringMigrateReturnsRunning(t *testing.T) {
+	ctx := context.Background()
+	cluster := testCluster()
+	migrateTopology(cluster)
+	fc := &fakeRedisClient{
+		clusterNodes: func() (string, error) {
+			return migrateClusterNodes("0-8191", "8192-16383"), nil
+		},
+		getKeysInSlot: func(slot, count int) ([]string, error) {
+			return []string{"key-a"}, nil
+		},
+		migrateKeys: func(host string, port int, keys []string, timeout time.Duration) error {
+			return errors.New("CLUSTERDOWN The cluster is down")
+		},
+	}
+	exec := migrateExec(t, cluster, fc)
+
+	outcome, err := exec.ExecuteStep(ctx, cluster, migratePlan(), 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if outcome.Status != plan.StepStateRunning {
+		t.Fatalf("expected Running, got %q: %s", outcome.Status, outcome.Message)
+	}
+	if len(fc.migrateCalls) != 1 {
+		t.Fatalf("expected one migrate attempt, got %v", fc.migrateCalls)
 	}
 }
 

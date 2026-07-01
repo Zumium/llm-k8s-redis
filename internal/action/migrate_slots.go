@@ -213,9 +213,15 @@ func (e *ActionExecutor) migrateSlots(ctx context.Context, cluster *v1alpha1.Red
 			}
 		}
 		if len(toAdd) > 0 {
+			if outcome, ok := waitForMigrationClusterStateOK(ctx, podRedisAddr(targetPod), targetRC, nil, nil); !ok {
+				return outcome, nil
+			}
 			logger.Info("repairing unowned slots before migrate", "targetPod", targetPodName, "targetID", target.ID, "slotCount", len(toAdd))
 			if err := targetRC.ClusterAddSlots(ctx, toAdd); err != nil {
 				logger.Error(err, "cluster addslots for unowned migrate slots failed", "targetPod", targetPodName, "slotCount", len(toAdd))
+				if transientRedisPropagationError(err) {
+					return running("CLUSTER ADDSLOTS missing migrate slots waiting for Redis cluster state: %v", err), nil
+				}
 				return StepOutcome{Status: plan.StepStateFailed, Message: fmt.Sprintf("CLUSTER ADDSLOTS missing migrate slots: %v", err)}, err
 			}
 			for _, slot := range toAdd {
@@ -285,6 +291,9 @@ func (e *ActionExecutor) migrateSlots(ctx context.Context, cluster *v1alpha1.Red
 			return StepOutcome{Status: plan.StepStateFailed, Message: fmt.Sprintf("build redis client for slot owner propagation %s: %v", addr, err)}, err
 		}
 		extraNodeClients[addr] = rc
+	}
+	if outcome, ok := waitForMigrationClusterStateOK(ctx, targetAddr, targetRC, sourceClients, extraNodeClients); !ok {
+		return outcome, nil
 	}
 
 	slotCtx, cancel := context.WithCancel(ctx)
@@ -487,6 +496,9 @@ func (e *ActionExecutor) migrateSlot(ctx context.Context, sourceRC, targetRC red
 		logger.Info("migrating keys started", "slot", slot, "keys", len(keys), "host", host, "port", port)
 		if err := sourceRC.MigrateKeys(ctx, host, port, keys, migrateKeyTimeout); err != nil {
 			logger.Error(err, "migrate keys failed", "slot", slot, "keys", len(keys), "duration", time.Since(migrateStart))
+			if transientRedisPropagationError(err) {
+				return migrateSlotResult{outcome: running("MIGRATE slot %d waiting for Redis cluster state: %v", slot, err), wait: true}
+			}
 			return migrateSlotResult{outcome: StepOutcome{Status: plan.StepStateFailed, Message: fmt.Sprintf("MIGRATE slot %d keys: %v", slot, err)}, err: err}
 		}
 		logger.Info("migrating keys finished", "slot", slot, "keys", len(keys), "duration", time.Since(migrateStart))
@@ -525,6 +537,32 @@ func (e *ActionExecutor) migrateSlot(ctx context.Context, sourceRC, targetRC red
 	return migrateSlotResult{}
 }
 
+func waitForMigrationClusterStateOK(ctx context.Context, targetAddr string, targetRC redis.Client, sourceClients, extraNodeClients map[string]redis.Client) (StepOutcome, bool) {
+	clients := map[string]redis.Client{targetAddr: targetRC}
+	for addr, rc := range sourceClients {
+		clients[addr] = rc
+	}
+	for addr, rc := range extraNodeClients {
+		clients[addr] = rc
+	}
+	addrs := make([]string, 0, len(clients))
+	for addr := range clients {
+		addrs = append(addrs, addr)
+	}
+	sort.Strings(addrs)
+	for _, addr := range addrs {
+		raw, err := clients[addr].ClusterInfo(ctx)
+		if err != nil {
+			return running("redis %s CLUSTER INFO before migration failed: %v", addr, err), false
+		}
+		info := rediscluster.ParseInfo(raw)
+		if !rediscluster.StateOK(info) {
+			return running("redis %s cluster_state is %q before migration", addr, info["cluster_state"]), false
+		}
+	}
+	return StepOutcome{}, true
+}
+
 func transientRedisPropagationError(err error) bool {
 	if err == nil {
 		return false
@@ -533,7 +571,8 @@ func transientRedisPropagationError(err error) bool {
 	return strings.Contains(msg, "please use setslot only with masters") ||
 		strings.Contains(msg, "unknown node") ||
 		strings.Contains(msg, "not known") ||
-		strings.Contains(msg, "no such node")
+		strings.Contains(msg, "no such node") ||
+		strings.Contains(msg, "clusterdown")
 }
 
 func (e *ActionExecutor) getPod(ctx context.Context, ns, podName string) (*corev1.Pod, StepOutcome, error, bool) {

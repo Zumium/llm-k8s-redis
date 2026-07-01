@@ -154,8 +154,8 @@ func TestGoPlannerReplacesImageDrift(t *testing.T) {
 	if got.PlanID != "go-image-drift-3" {
 		t.Fatalf("planID = %q", got.PlanID)
 	}
-	if got.Steps[0].ID != "ensure-redis-4" || got.Steps[3].ID != "ensure-redis-7" {
-		t.Fatalf("new pods = %#v", got.Steps[:4])
+	if got.Steps[0].ID != "ensure-redis-4" || got.Steps[1].ID != "ensure-redis-5" {
+		t.Fatalf("first shard new pods = %#v", got.Steps[:2])
 	}
 	if got.Steps[0].Params["image"] != spec.Image {
 		t.Fatalf("ensure image = %#v", got.Steps[0].Params)
@@ -163,8 +163,11 @@ func TestGoPlannerReplacesImageDrift(t *testing.T) {
 	if !hasMigration(got, "redis-0", "redis-4", "0-8191") || !hasMigration(got, "redis-2", "redis-6", "8192-16383") {
 		t.Fatalf("migrations = %#v", migrationStepsOf(got))
 	}
-	if got.Steps[len(got.Steps)-6].ID != "delete-redis-3" || got.Steps[len(got.Steps)-4].ID != "delete-redis-0" {
-		t.Fatalf("old nodes not removed replicas first: %#v", got.Steps[len(got.Steps)-9:])
+	if got.Steps[8].ID != "forget-redis-1" || got.Steps[10].ID != "forget-redis-0" || got.Steps[12].ID != "ensure-redis-6" {
+		t.Fatalf("first shard was not completed before second shard: %#v", got.Steps[6:14])
+	}
+	if got.Steps[16].Params["sourcePod"] != "redis-4" || got.Steps[16].Params["targetPod"] != "redis-6" {
+		t.Fatalf("second shard meet should use live seed: %#v", got.Steps[16])
 	}
 	if err := validatePlan(got, nodes); err != nil {
 		t.Fatalf("generated plan did not validate: %v", err)
