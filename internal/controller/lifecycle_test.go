@@ -99,7 +99,7 @@ func TestReconcile_DeletesNamespaceOnDeletion(t *testing.T) {
 	}
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(cluster, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "example"}}).
+		WithObjects(cluster, managedTestNamespace()).
 		WithStatusSubresource(&api.RedisCluster{}).
 		Build()
 	r := &RedisClusterReconciler{Client: cl, Scheme: scheme, ValidatePlan: validator.Validate}
@@ -123,6 +123,55 @@ func TestReconcile_DeletesNamespaceOnDeletion(t *testing.T) {
 	err = cl.Get(ctx, client.ObjectKey{Name: "example"}, &api.RedisCluster{})
 	if !apierrors.IsNotFound(err) {
 		t.Fatalf("expected cluster to be deleted after finalizer removal, got err=%v", err)
+	}
+}
+
+func TestReconcile_RejectsUnmanagedExistingNamespace(t *testing.T) {
+	ctx := context.Background()
+	scheme := newScheme(t)
+	cluster := testCluster()
+	cluster.Finalizers = []string{finalizer}
+	fp := &recordingPlanner{}
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "example"}}).
+		WithStatusSubresource(&api.RedisCluster{}).
+		Build()
+	r := &RedisClusterReconciler{Client: cl, Scheme: scheme, Planner: fp, Driver: &recordingObserver{}, ValidatePlan: validator.Validate}
+
+	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "example"}}); err == nil {
+		t.Fatal("expected unmanaged namespace collision error")
+	}
+	if fp.called != 0 {
+		t.Fatalf("expected no planner call, got %d", fp.called)
+	}
+}
+
+func TestReconcile_DeleteLeavesUnmanagedNamespace(t *testing.T) {
+	ctx := context.Background()
+	scheme := newScheme(t)
+	now := metav1.Now()
+	cluster := &api.RedisCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "example",
+			Generation:        1,
+			DeletionTimestamp: &now,
+			Finalizers:        []string{finalizer},
+		},
+		Spec: api.RedisClusterSpec{Shards: 1, ReplicasPerShard: 1, Image: "redis:7.2", MemorySize: "1Gi"},
+	}
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cluster, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "example"}}).
+		WithStatusSubresource(&api.RedisCluster{}).
+		Build()
+	r := &RedisClusterReconciler{Client: cl, Scheme: scheme, ValidatePlan: validator.Validate}
+
+	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "example"}}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if err := cl.Get(ctx, client.ObjectKey{Name: "example"}, &corev1.Namespace{}); err != nil {
+		t.Fatalf("expected unmanaged namespace to remain: %v", err)
 	}
 }
 

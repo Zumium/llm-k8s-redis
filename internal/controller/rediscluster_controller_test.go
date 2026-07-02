@@ -107,7 +107,7 @@ func TestReconcile_PassesObservedNodesToPlanner(t *testing.T) {
 	cluster.Status.ObservedNodes = apiObservedNodes(observed)
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(cluster, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "example"}}).
+		WithObjects(cluster, managedTestNamespace()).
 		WithStatusSubresource(&api.RedisCluster{}).
 		Build()
 	r := &RedisClusterReconciler{
@@ -150,7 +150,7 @@ func TestReconcile_WaitsForStableObservedNodesBeforePlanning(t *testing.T) {
 	}
 	cluster.Status.ObservedNodes = apiObservedNodes(previous)
 	fp := &recordingPlanner{err: errors.New("unexpected planner call")}
-	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "example"}}).WithStatusSubresource(&api.RedisCluster{}).Build()
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, managedTestNamespace()).WithStatusSubresource(&api.RedisCluster{}).Build()
 	r := &RedisClusterReconciler{
 		Client: cl, Scheme: scheme, Planner: fp, Driver: &recordingObserver{nodes: nodes},
 		ValidatePlan: validator.Validate,
@@ -178,6 +178,36 @@ func TestReconcile_WaitsForStableObservedNodesBeforePlanning(t *testing.T) {
 	}
 }
 
+func TestReconcile_StableWaitIgnoresOlderPlannedFalseTimestamp(t *testing.T) {
+	ctx := context.Background()
+	scheme := newScheme(t)
+	cluster := testCluster()
+	cluster.Finalizers = []string{finalizer}
+	cluster.Status.Conditions = []metav1.Condition{{
+		Type:               ConditionPlanned,
+		Status:             metav1.ConditionFalse,
+		Reason:             "PlanRejected",
+		LastTransitionTime: metav1.NewTime(time.Now().Add(-verifyStableTimeout - time.Minute)),
+		ObservedGeneration: cluster.Generation,
+	}}
+	nodes := []plan.ObservedNode{{Pod: "redis-0", PodExists: true, Image: "redis:7.2", Ready: false}}
+	fp := &recordingPlanner{err: errors.New("unexpected planner call")}
+	driver := &recordingObserver{nodeSets: [][]plan.ObservedNode{nodes, nodes}}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, managedTestNamespace()).WithStatusSubresource(&api.RedisCluster{}).Build()
+	r := &RedisClusterReconciler{Client: cl, Scheme: scheme, Planner: fp, Driver: driver, ValidatePlan: validator.Validate}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "example"}}
+
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("reconcile 1: %v", err)
+	}
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("reconcile 2: %v", err)
+	}
+	if fp.called != 0 {
+		t.Fatalf("expected no planner call before fresh stable wait timeout, got %d", fp.called)
+	}
+}
+
 func TestReconcile_PlansAfterStableObservedNodes(t *testing.T) {
 	ctx := context.Background()
 	scheme := newScheme(t)
@@ -190,7 +220,7 @@ func TestReconcile_PlansAfterStableObservedNodes(t *testing.T) {
 	}
 	cluster.Status.ObservedNodes = apiObservedNodes(nodes)
 	fp := &recordingPlanner{}
-	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "example"}}).WithStatusSubresource(&api.RedisCluster{}).Build()
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, managedTestNamespace()).WithStatusSubresource(&api.RedisCluster{}).Build()
 	r := &RedisClusterReconciler{
 		Client: cl, Scheme: scheme, Planner: fp, Driver: &recordingObserver{nodes: nodes},
 		ValidatePlan: validator.Validate,
@@ -213,7 +243,7 @@ func TestReconcile_PlanRejectedOnce(t *testing.T) {
 	fp := &recordingPlanner{plan: &plan.Plan{DSLVersion: plan.DSLVersion, PlanID: "bad", TargetGeneration: 1, Steps: []plan.Step{{ID: "bad", Action: plan.ActionVerifyCluster}}}}
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(cluster, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "example"}}).
+		WithObjects(cluster, managedTestNamespace()).
 		WithStatusSubresource(&api.RedisCluster{}).
 		Build()
 	r := &RedisClusterReconciler{
@@ -259,7 +289,7 @@ func TestReconcile_CompletedPlanClearsAndRequeues(t *testing.T) {
 			ActivePlan: completedPlan(),
 		},
 	}
-	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "example"}}).WithStatusSubresource(&api.RedisCluster{}).Build()
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, managedTestNamespace()).WithStatusSubresource(&api.RedisCluster{}).Build()
 	r := &RedisClusterReconciler{
 		Client: cl, Scheme: scheme, Planner: planner.NoopPlanner{}, Driver: &recordingObserver{},
 		ValidatePlan: validator.Validate,
@@ -297,7 +327,7 @@ func TestReconcile_FailedPlanRetainedWithoutRequeue(t *testing.T) {
 			ActivePlan: failedPlan(),
 		},
 	}
-	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "example"}}).WithStatusSubresource(&api.RedisCluster{}).Build()
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, managedTestNamespace()).WithStatusSubresource(&api.RedisCluster{}).Build()
 	r := &RedisClusterReconciler{
 		Client: cl, Scheme: scheme, Planner: planner.NoopPlanner{}, Driver: &recordingObserver{},
 		ValidatePlan: validator.Validate,
@@ -338,7 +368,7 @@ func TestReconcile_FailedPlanRetainedWhenTopologyMatchesSpec(t *testing.T) {
 	}
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
 		cluster,
-		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "example"}},
+		managedTestNamespace(),
 		vcPod("redis-0", "10.0.0.1", true),
 		vcPod("redis-1", "10.0.0.2", true),
 		vcPod("redis-2", "10.0.0.3", true),
@@ -384,7 +414,7 @@ func TestReconcile_StaleCompletedPlanIsSuperseded(t *testing.T) {
 	cluster.Status.ObservedGeneration = 1
 	cluster.Status.ActivePlan = completedPlan()
 	cluster.Status.TopologyObservedAt = metav1.Now()
-	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "example"}}).WithStatusSubresource(&api.RedisCluster{}).Build()
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, managedTestNamespace()).WithStatusSubresource(&api.RedisCluster{}).Build()
 	r := &RedisClusterReconciler{
 		Client: cl, Scheme: scheme, Planner: planner.NoopPlanner{}, Driver: &recordingObserver{},
 		ValidatePlan: validator.Validate,
@@ -424,7 +454,7 @@ func TestReconcile_StaleRunningPlanIsSupersededBeforeExecute(t *testing.T) {
 	cluster.Status.ActivePlan = runningPlan()
 	cluster.Status.TopologyObservedAt = metav1.Now()
 	exec := &recordingExecutor{}
-	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "example"}}).WithStatusSubresource(&api.RedisCluster{}).Build()
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, managedTestNamespace()).WithStatusSubresource(&api.RedisCluster{}).Build()
 	r := &RedisClusterReconciler{
 		Client: cl, Scheme: scheme, Planner: planner.NoopPlanner{}, Driver: exec,
 		ValidatePlan: validator.Validate,
@@ -484,7 +514,7 @@ func TestReconcile_ReplansAfterStalePlanCleared(t *testing.T) {
 		},
 	}
 	fp := &recordingPlanner{plan: p}
-	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "example"}}).WithStatusSubresource(&api.RedisCluster{}).Build()
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, managedTestNamespace()).WithStatusSubresource(&api.RedisCluster{}).Build()
 	r := &RedisClusterReconciler{
 		Client: cl, Scheme: scheme, Planner: fp, Driver: &recordingObserver{nodes: observedFromAPITopology(cluster.Status.Topology)},
 		ValidatePlan: validator.Validate,
@@ -534,7 +564,7 @@ func TestReconcile_LiveObservedTopologyWithExtraNoSlotNodeCallsPlanner(t *testin
 	}
 	cluster.Status.ObservedNodes = apiObservedNodes(nodes)
 	fp := &recordingPlanner{}
-	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "example"}}).WithStatusSubresource(&api.RedisCluster{}).Build()
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, managedTestNamespace()).WithStatusSubresource(&api.RedisCluster{}).Build()
 	r := &RedisClusterReconciler{
 		Client: cl, Scheme: scheme, Planner: fp, Driver: &recordingObserver{nodes: nodes},
 		ValidatePlan: validator.Validate,
@@ -573,7 +603,7 @@ func TestReconcile_LiveObservedTopologyMismatchCallsPlanner(t *testing.T) {
 	}
 	cluster.Status.ObservedNodes = apiObservedNodes(nodes)
 	fp := &recordingPlanner{}
-	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "example"}}).WithStatusSubresource(&api.RedisCluster{}).Build()
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, managedTestNamespace()).WithStatusSubresource(&api.RedisCluster{}).Build()
 	r := &RedisClusterReconciler{
 		Client: cl, Scheme: scheme, Planner: fp, Driver: &recordingObserver{nodes: nodes},
 		ValidatePlan: validator.Validate,
@@ -604,7 +634,7 @@ func TestReconcile_LiveObservedTopologySamePodCountButWrongShapeCallsPlanner(t *
 	}
 	cluster.Status.ObservedNodes = apiObservedNodes(nodes)
 	fp := &recordingPlanner{}
-	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "example"}}).WithStatusSubresource(&api.RedisCluster{}).Build()
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, managedTestNamespace()).WithStatusSubresource(&api.RedisCluster{}).Build()
 	r := &RedisClusterReconciler{
 		Client: cl, Scheme: scheme, Planner: fp, Driver: &recordingObserver{nodes: nodes},
 		ValidatePlan: validator.Validate,
@@ -645,7 +675,7 @@ func TestReconcile_MissingReplicaWaitsBeforeDriftPlan(t *testing.T) {
 	fp := &recordingPlanner{plan: driftPlan}
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
 		cluster,
-		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "example"}},
+		managedTestNamespace(),
 		vcPod("redis-0", "10.0.0.1", true),
 		vcPod("redis-2", "10.0.0.2", true),
 		vcPod("redis-3", "10.0.0.3", true),
@@ -683,7 +713,7 @@ func TestReconcile_MissingMasterWaitsForRedisFailover(t *testing.T) {
 	fp := &recordingPlanner{err: errors.New("unexpected planner call")}
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
 		cluster,
-		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "example"}},
+		managedTestNamespace(),
 		vcPod("redis-0", "10.0.0.1", true),
 		vcPod("redis-1", "10.0.0.2", true),
 		vcPod("redis-3", "10.0.0.3", true),
@@ -732,7 +762,7 @@ func TestReconcile_MissingMasterPlansAfterStableWaitTimeout(t *testing.T) {
 	fp := &recordingPlanner{err: errors.New("planner called")}
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
 		cluster,
-		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "example"}},
+		managedTestNamespace(),
 		vcPod("redis-0", "10.0.0.1", true),
 		vcPod("redis-1", "10.0.0.2", true),
 		vcPod("redis-3", "10.0.0.3", true),
@@ -763,7 +793,7 @@ func TestReconcile_MigratingSlotsWaitsForClusterStable(t *testing.T) {
 	fp := &recordingPlanner{err: errors.New("unexpected planner call")}
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
 		cluster,
-		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "example"}},
+		managedTestNamespace(),
 		vcPod("redis-0", "10.0.0.1", true),
 		vcPod("redis-1", "10.0.0.2", true),
 		vcPod("redis-2", "10.0.0.3", true),
@@ -803,7 +833,7 @@ func TestReconcile_ActiveDriftPlanExecutesWhenDriftStillObserved(t *testing.T) {
 	exec := &recordingExecutor{}
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
 		cluster,
-		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "example"}},
+		managedTestNamespace(),
 		vcPod("redis-0", "10.0.0.1", true),
 		vcPod("redis-2", "10.0.0.2", true),
 		vcPod("redis-3", "10.0.0.3", true),
@@ -857,7 +887,7 @@ func TestReconcile_InvalidActiveDriftPlanStillExecutesWhenRunning(t *testing.T) 
 	exec := &recordingExecutor{}
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
 		cluster,
-		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "example"}},
+		managedTestNamespace(),
 		vcPod("redis-0", "10.0.0.1", true),
 		vcPod("redis-2", "10.0.0.2", true),
 		vcPod("redis-3", "10.0.0.3", true),
@@ -902,7 +932,7 @@ func TestReconcile_CompletedPlan_TopologyMismatchTriggersReplan(t *testing.T) {
 	cluster.Status.ObservedNodes = apiObservedNodes(nil)
 	cluster.Status.ActivePlan = completedPlan()
 	fp := &recordingPlanner{err: errors.New("expected planner call")}
-	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "example"}}).WithStatusSubresource(&api.RedisCluster{}).Build()
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, managedTestNamespace()).WithStatusSubresource(&api.RedisCluster{}).Build()
 	r := &RedisClusterReconciler{
 		Client: cl, Scheme: scheme, Planner: fp, Driver: &recordingObserver{},
 		ValidatePlan: validator.Validate,
@@ -970,7 +1000,7 @@ func TestReconcile_FailedPlan_TopologyMismatchTriggersReplan(t *testing.T) {
 		},
 	}
 	fp := &recordingPlanner{err: errors.New("expected planner call")}
-	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "example"}}).WithStatusSubresource(&api.RedisCluster{}).Build()
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, managedTestNamespace()).WithStatusSubresource(&api.RedisCluster{}).Build()
 	r := &RedisClusterReconciler{
 		Client: cl, Scheme: scheme, Planner: fp, Driver: &recordingObserver{},
 		ValidatePlan: validator.Validate,
@@ -1012,7 +1042,7 @@ func TestReconcile_RetainedFailedPlanDoesNotRepeatPlanFailedEvent(t *testing.T) 
 	cluster.Finalizers = []string{finalizer}
 	cluster.Status.ActivePlan = failedPlan()
 	rec := events.NewFakeRecorder(10)
-	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "example"}}).WithStatusSubresource(&api.RedisCluster{}).Build()
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster, managedTestNamespace()).WithStatusSubresource(&api.RedisCluster{}).Build()
 	r := &RedisClusterReconciler{
 		Client: cl, Scheme: scheme, Planner: planner.NoopPlanner{}, Driver: &recordingObserver{},
 		Recorder:     rec,

@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -101,8 +102,12 @@ func planningWaitReason(cluster *v1alpha1.RedisCluster, previousObserved, observ
 }
 
 func markWaitingForStableCluster(cluster *v1alpha1.RedisCluster, reason string) {
+	old := meta.FindStatusCondition(cluster.Status.Conditions, ConditionPlanned)
 	setCondition(cluster, ConditionReady, metav1.ConditionFalse, "WaitingForClusterStable", reason)
 	setCondition(cluster, ConditionPlanned, metav1.ConditionFalse, "WaitingForClusterStable", reason)
+	if old != nil && old.Reason != "WaitingForClusterStable" {
+		meta.FindStatusCondition(cluster.Status.Conditions, ConditionPlanned).LastTransitionTime = metav1.Now()
+	}
 	cluster.Status.ObservedGeneration = cluster.Generation
 }
 

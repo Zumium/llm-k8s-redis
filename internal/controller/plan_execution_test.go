@@ -66,6 +66,36 @@ func TestExecuteNextStep_NeedsRepairSupersedesPlan(t *testing.T) {
 	}
 }
 
+func TestExecuteNextStep_AdvancesCurrentStep(t *testing.T) {
+	ctx := context.Background()
+	scheme := newScheme(t)
+	cluster := testCluster()
+	p := &plan.Plan{PlanID: "p", TargetGeneration: 1, Steps: []plan.Step{
+		{ID: "s0", Action: plan.ActionEnsureNode, Params: map[string]any{}},
+		{ID: "s1", Action: plan.ActionVerifyCluster, Params: map[string]any{}},
+	}}
+	active, err := planToStatus(p)
+	if err != nil {
+		t.Fatalf("planToStatus: %v", err)
+	}
+	cluster.Status.ActivePlan = active
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster).WithStatusSubresource(&api.RedisCluster{}).Build()
+	r := &RedisClusterReconciler{Client: cl, Scheme: scheme, Driver: &recordingExecutor{}}
+
+	if _, err := r.executeNextStep(ctx, cluster, active); err != nil {
+		t.Fatalf("executeNextStep 1: %v", err)
+	}
+	if active.CurrentStep != "s1" {
+		t.Fatalf("expected current step s1, got %q", active.CurrentStep)
+	}
+	if _, err := r.executeNextStep(ctx, cluster, active); err != nil {
+		t.Fatalf("executeNextStep 2: %v", err)
+	}
+	if active.CurrentStep != "" {
+		t.Fatalf("expected current step cleared, got %q", active.CurrentStep)
+	}
+}
+
 func TestHandleActivePlan_ClearsSupersededPlanPreservingMessages(t *testing.T) {
 	ctx := context.Background()
 	scheme := newScheme(t)

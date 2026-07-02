@@ -79,7 +79,7 @@ func (r *RedisClusterReconciler) executeNextStep(ctx context.Context, cluster *v
 	if err != nil {
 		logger.Error(err, "active plan restore failed", "duration", time.Since(restoreStart))
 		setStep(active, idx, string(plan.StepStateFailed), err.Error())
-		active.CurrentStep = step.ID
+		setCurrentStep(active)
 		setCondition(cluster, ConditionReady, metav1.ConditionFalse, "PlanRestoreFailed", err.Error())
 		return r.finish(ctx, cluster, ctrl.Result{}, nil)
 	}
@@ -93,7 +93,7 @@ func (r *RedisClusterReconciler) executeNextStep(ctx context.Context, cluster *v
 	}
 
 	failed := r.applyStepOutcome(ctx, cluster, active, planModel, idx, outcome, err)
-	active.CurrentStep = step.ID
+	setCurrentStep(active)
 	if failed {
 		active.Status = string(plan.PlanStateFailed)
 		setCondition(cluster, ConditionReady, metav1.ConditionFalse, "StepFailed", active.Steps[idx].Message)
@@ -157,4 +157,12 @@ func persistStepParams(active *v1alpha1.PlanStatus, planModel *plan.Plan, idx in
 	}
 	active.Steps[idx].Params = converted.Steps[idx].Params
 	return nil
+}
+
+func setCurrentStep(active *v1alpha1.PlanStatus) {
+	if idx := nextPendingStep(active); idx >= 0 {
+		active.CurrentStep = active.Steps[idx].ID
+		return
+	}
+	active.CurrentStep = ""
 }

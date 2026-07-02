@@ -111,6 +111,16 @@ func hasCondition(conditions []metav1.Condition, typ string, status metav1.Condi
 	return false
 }
 
+func managedTestNamespace() *corev1.Namespace {
+	return &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{
+		Name: "example",
+		Labels: map[string]string{
+			managedByLabel: "redis-cluster-controller",
+			clusterLabel:   "example",
+		},
+	}}
+}
+
 type recordingObserver struct {
 	called   int
 	nodes    []plan.ObservedNode

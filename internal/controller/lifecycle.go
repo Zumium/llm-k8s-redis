@@ -16,11 +16,19 @@ import (
 	v1alpha1 "github.com/Zumium/llm-k8s-redis/api/v1alpha1"
 )
 
+const (
+	managedByLabel = "app.kubernetes.io/managed-by"
+	clusterLabel   = "redis.example.com/cluster"
+)
+
 func (r *RedisClusterReconciler) ensureNamespace(ctx context.Context, cluster *v1alpha1.RedisCluster) error {
 	logger := log.FromContext(ctx).WithValues("namespace", cluster.Name)
 	var ns corev1.Namespace
 	err := r.Get(ctx, client.ObjectKey{Name: cluster.Name}, &ns)
 	if err == nil {
+		if !managedNamespace(&ns, cluster) {
+			return fmt.Errorf("namespace %q already exists and is not managed by this RedisCluster", cluster.Name)
+		}
 		logger.Info("namespace already exists")
 		return nil
 	}
@@ -34,8 +42,8 @@ func (r *RedisClusterReconciler) ensureNamespace(ctx context.Context, cluster *v
 		ObjectMeta: metav1.ObjectMeta{
 			Name: cluster.Name,
 			Labels: map[string]string{
-				"app.kubernetes.io/managed-by": "redis-cluster-controller",
-				"redis.example.com/cluster":    cluster.Name,
+				managedByLabel: "redis-cluster-controller",
+				clusterLabel:   cluster.Name,
 			},
 		},
 	}
@@ -61,6 +69,10 @@ func (r *RedisClusterReconciler) reconcileDelete(ctx context.Context, cluster *v
 	var ns corev1.Namespace
 	err := r.Get(ctx, client.ObjectKey{Name: cluster.Name}, &ns)
 	if err == nil {
+		if !managedNamespace(&ns, cluster) {
+			logger.Info("namespace is not managed by this cluster, removing finalizer", "namespace", cluster.Name)
+			return r.removeFinalizer(ctx, cluster)
+		}
 		if ns.DeletionTimestamp.IsZero() {
 			logger.Info("deleting owned namespace", "namespace", cluster.Name)
 			if derr := r.Delete(ctx, &ns); derr != nil && !apierrors.IsNotFound(derr) {
@@ -77,6 +89,23 @@ func (r *RedisClusterReconciler) reconcileDelete(ctx context.Context, cluster *v
 	}
 
 	logger.Info("owned namespace gone, removing finalizer", "namespace", cluster.Name)
+	return r.removeFinalizer(ctx, cluster)
+}
+
+func managedNamespace(ns *corev1.Namespace, cluster *v1alpha1.RedisCluster) bool {
+	if ns.Labels[managedByLabel] == "redis-cluster-controller" && ns.Labels[clusterLabel] == cluster.Name {
+		return true
+	}
+	ref := metav1.GetControllerOf(ns)
+	return ref != nil &&
+		ref.APIVersion == v1alpha1.GroupVersion.String() &&
+		ref.Kind == "RedisCluster" &&
+		ref.Name == cluster.Name &&
+		(cluster.UID == "" || ref.UID == cluster.UID)
+}
+
+func (r *RedisClusterReconciler) removeFinalizer(ctx context.Context, cluster *v1alpha1.RedisCluster) (ctrl.Result, error) {
+	logger := log.FromContext(ctx).WithValues("rediscluster", cluster.Name)
 	controllerutil.RemoveFinalizer(cluster, finalizer)
 	if err := r.Update(ctx, cluster); err != nil {
 		logger.Error(err, "remove finalizer failed")
