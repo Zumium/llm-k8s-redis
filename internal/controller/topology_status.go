@@ -14,33 +14,6 @@ import (
 
 const verifyStableTimeout = 2 * time.Minute
 
-func topologyMatchesSpec(topology *v1alpha1.ClusterTopology, spec plan.ClusterSpec) bool {
-	if topology == nil || len(topology.Shards) == 0 {
-		return false
-	}
-	if len(topology.Shards) != int(spec.Shards) {
-		return false
-	}
-	for _, sh := range topology.Shards {
-		if len(sh.Replicas) != int(spec.ReplicasPerShard) {
-			return false
-		}
-		if sh.Master.Slots == "" {
-			return false
-		}
-		if !sh.Master.Ready {
-			return false
-		}
-		for _, r := range sh.Replicas {
-			if !r.Ready {
-				return false
-			}
-		}
-	}
-	return true
-}
-
-// 严格判断 live Redis 视角是否已经满足 spec；true 表示 planner 不应再生成 plan。
 func observedNodesMatchSpec(nodes []plan.ObservedNode, spec plan.ClusterSpec) bool {
 	if len(nodes) == 0 || spec.Shards <= 0 || spec.ReplicasPerShard < 0 {
 		return false
@@ -125,23 +98,6 @@ func observedNodesMatchSpec(nodes []plan.ObservedNode, spec plan.ClusterSpec) bo
 	return true
 }
 
-// status 中的 observed nodes 是上一轮快照；转换后复用 live-state 匹配逻辑。
-func observedStatusNodesMatchSpec(nodes []v1alpha1.ObservedNode, spec plan.ClusterSpec) bool {
-	if len(nodes) == 0 {
-		return false
-	}
-	out := make([]plan.ObservedNode, len(nodes))
-	for i, n := range nodes {
-		out[i] = plan.ObservedNode{
-			Pod: n.Pod, PodExists: n.PodExists, Image: n.Image, RedisSeen: n.RedisSeen, NodeID: n.NodeID, Role: n.Role,
-			Slots: n.Slots, MasterID: n.MasterID, MasterPod: n.MasterPod, Ready: n.Ready, Deleting: n.Deleting,
-			Flags: append([]string{}, n.Flags...), LinkState: n.LinkState,
-		}
-	}
-	return observedNodesMatchSpec(out, spec)
-}
-
-// 稳定性只比较有意义的字段，忽略列表顺序和 flags 顺序。
 func observedStatusNodesEqual(a, b []v1alpha1.ObservedNode) bool {
 	a = normalizedObservedStatusNodes(a)
 	b = normalizedObservedStatusNodes(b)
@@ -173,7 +129,6 @@ func normalizedObservedStatusNodes(nodes []v1alpha1.ObservedNode) []v1alpha1.Obs
 	return out
 }
 
-// 返回非空原因时，planner 前必须等待；超时后才把这个坏状态交给 repair plan。
 func planningInstabilityReason(nodes []plan.ObservedNode, spec plan.ClusterSpec) string {
 	if waitingForRedisFailover(nodes, spec) {
 		return "waiting for Redis native failover to promote a replica"
@@ -201,7 +156,6 @@ func planningInstabilityReason(nodes []plan.ObservedNode, spec plan.ClusterSpec)
 	return ""
 }
 
-// 等待窗口从 WaitingForClusterStable condition 的 transition time 开始计时。
 func clusterStableWaitTimedOut(c *v1alpha1.RedisCluster) bool {
 	for _, cond := range c.Status.Conditions {
 		if cond.Type == ConditionPlanned && cond.Reason == "WaitingForClusterStable" {
@@ -211,7 +165,6 @@ func clusterStableWaitTimedOut(c *v1alpha1.RedisCluster) bool {
 	return false
 }
 
-// 空观测需要特殊处理：第一次空观测先等，第二次仍为空才认为“稳定为空”。
 func clusterStableWaitStarted(c *v1alpha1.RedisCluster) bool {
 	for _, cond := range c.Status.Conditions {
 		if cond.Type == ConditionPlanned && cond.Reason == "WaitingForClusterStable" {
@@ -221,7 +174,6 @@ func clusterStableWaitStarted(c *v1alpha1.RedisCluster) bool {
 	return false
 }
 
-// 少一个健康 master 且旧 slot master 已 fail/deleting 时，优先等 Redis 自己 failover。
 func waitingForRedisFailover(nodes []plan.ObservedNode, spec plan.ClusterSpec) bool {
 	healthyMasters := 0
 	failedSlotMaster := false

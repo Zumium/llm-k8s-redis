@@ -109,10 +109,7 @@ func (e *ActionExecutor) forgetNode(ctx context.Context, cluster *v1alpha1.Redis
 }
 
 func isUnknownNodeErr(err error) bool {
-	if err == nil {
-		return false
-	}
-	return strings.Contains(strings.ToLower(err.Error()), "unknown node")
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), "unknown node")
 }
 
 func (e *ActionExecutor) forgetTargetNodeID(step plan.Step, podName string, pods []corev1.Pod, entries []rediscluster.Entry) (string, StepOutcome, error, bool) {

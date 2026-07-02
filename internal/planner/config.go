@@ -110,18 +110,18 @@ func validateEmbeddingConfig(c Config) error {
 	hasModel := c.EmbeddingModel != ""
 	hasBaseURL := c.EmbeddingBaseURL != ""
 	hasAPIKey := c.EmbeddingAPIKey != ""
-	if hasModel || hasBaseURL || hasAPIKey {
-		if !hasModel {
-			return errors.New("llm config: embeddingModel is required when other embedding fields are set")
-		}
-		if !hasBaseURL {
-			return errors.New("llm config: embeddingBaseUrl is required when other embedding fields are set")
-		}
-		if !hasAPIKey {
-			return errors.New("llm config: embeddingApiKey is required when other embedding fields are set")
-		}
+	switch {
+	case !hasModel && !hasBaseURL && !hasAPIKey:
+		return nil
+	case !hasModel:
+		return errors.New("llm config: embeddingModel is required when other embedding fields are set")
+	case !hasBaseURL:
+		return errors.New("llm config: embeddingBaseUrl is required when other embedding fields are set")
+	case !hasAPIKey:
+		return errors.New("llm config: embeddingApiKey is required when other embedding fields are set")
+	default:
+		return nil
 	}
-	return nil
 }
 
 func validReasoningEffort(v string) bool {

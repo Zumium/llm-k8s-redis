@@ -78,7 +78,7 @@ func (s *planSimulator) addObservedNodes(nodes []plan.ObservedNode) {
 				sn.replicaOf = n.MasterID
 			}
 		}
-		if slots, err := parseSlots(n.Slots); err == nil {
+		if slots, err := slotsSet(n.Slots); err == nil {
 			for slot := range slots {
 				sn.slots[slot] = struct{}{}
 				s.slotOwners[slot] = key
@@ -133,7 +133,7 @@ func reqSlots(params map[string]any, action string) (map[int]struct{}, error) {
 	if err != nil {
 		return nil, err
 	}
-	return parseSlots(s)
+	return slotsSet(s)
 }
 
 func (s *planSimulator) readyMaster(pod, hint string) (*simulatedNode, error) {
@@ -338,10 +338,13 @@ func (s *planSimulator) deleteNode(step plan.Step, p *plan.Plan, idx int) error 
 	}
 	n := s.nodes[pod]
 	if n == nil {
-		if !precededAction(p, idx, plan.ActionForgetNode, "pod", pod) {
-			return fmt.Errorf("pod %q is unknown", pod)
+		for i := 0; i < idx; i++ {
+			forgottenPod, _ := paramString(p.Steps[i].Params, "pod")
+			if p.Steps[i].Action == plan.ActionForgetNode && forgottenPod == pod {
+				return nil
+			}
 		}
-		return nil
+		return fmt.Errorf("pod %q is unknown", pod)
 	}
 	if n.clusterMember {
 		return fmt.Errorf("pod %q is still an active cluster member", pod)

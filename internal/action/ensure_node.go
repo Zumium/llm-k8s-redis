@@ -153,11 +153,9 @@ func (e *ActionExecutor) reconcileExistingPod(ctx context.Context, cluster *v1al
 }
 
 func canRecreateDriftedPod(cluster *v1alpha1.RedisCluster, pod *corev1.Pod) bool {
-	if pod.Status.PodIP != "" || podInTopology(cluster, pod.Name) {
-		return false
-	}
-	return metav1.IsControlledBy(pod, cluster) ||
-		pod.Labels[labelCluster] == cluster.Name && pod.Labels[labelManagedBy] == "redis-cluster-controller"
+	return pod.Status.PodIP == "" && !podInTopology(cluster, pod.Name) &&
+		(metav1.IsControlledBy(pod, cluster) ||
+			pod.Labels[labelCluster] == cluster.Name && pod.Labels[labelManagedBy] == "redis-cluster-controller")
 }
 
 func (e *ActionExecutor) ensureMaxmemory(ctx context.Context, pod *corev1.Pod, wantBytes int64) (StepOutcome, error) {

@@ -122,14 +122,8 @@ func managedTestNamespace() *corev1.Namespace {
 }
 
 type recordingObserver struct {
-	called   int
 	nodes    []plan.ObservedNode
 	nodeSets [][]plan.ObservedNode
-}
-
-func (o *recordingObserver) ObserveTopology(_ context.Context, _ *api.RedisCluster) error {
-	o.called++
-	return nil
 }
 
 func (o *recordingObserver) CollectObservedNodes(_ context.Context, _ *api.RedisCluster) ([]plan.ObservedNode, error) {
@@ -209,10 +203,6 @@ func (e *recordingExecutor) ExecuteStep(_ context.Context, _ *api.RedisCluster, 
 		return defaultOutcome, nil
 	}
 	return StepOutcome{Status: plan.StepStateCompleted, Message: "done"}, nil
-}
-
-func (e *recordingExecutor) ObserveTopology(_ context.Context, _ *api.RedisCluster) error {
-	return nil
 }
 
 func (e *recordingExecutor) CollectObservedNodes(_ context.Context, _ *api.RedisCluster) ([]plan.ObservedNode, error) {

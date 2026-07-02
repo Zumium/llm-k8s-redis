@@ -2,6 +2,7 @@ package action
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -68,7 +69,7 @@ func (e *ActionExecutor) ExecuteStep(ctx context.Context, cluster *v1alpha1.Redi
 
 func paramErr(format string, args ...any) (StepOutcome, error) {
 	msg := fmt.Sprintf(format, args...)
-	return StepOutcome{Status: plan.StepStateFailed, Message: msg}, fmt.Errorf("%s", msg)
+	return StepOutcome{Status: plan.StepStateFailed, Message: msg}, errors.New(msg)
 }
 
 func running(format string, args ...any) StepOutcome {

@@ -185,7 +185,8 @@ func precedingAddSlotsOverlap(p *plan.Plan, stepIndex int, ns string, _ string, 
 		if !ok1 || ens != ns {
 			continue
 		}
-		prev, err := rediscluster.ParseSlotSpec(stringOrEmpty(s.Params, "slots"))
+		slots, _ := paramString(s.Params, "slots")
+		prev, err := rediscluster.ParseSlotSpec(slots)
 		if err != nil {
 			continue
 		}
@@ -199,12 +200,4 @@ func precedingAddSlotsOverlap(p *plan.Plan, stepIndex int, ns string, _ string, 
 		}
 	}
 	return -1
-}
-
-func stringOrEmpty(params map[string]any, key string) string {
-	v, ok := paramString(params, key)
-	if !ok {
-		return ""
-	}
-	return v
 }

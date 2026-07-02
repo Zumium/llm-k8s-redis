@@ -1,7 +1,6 @@
 package planner
 
 import (
-	"bytes"
 	"embed"
 	"fmt"
 	"strings"
@@ -19,7 +18,7 @@ var (
 )
 
 func buildSystemPrompt() string {
-	var buf bytes.Buffer
+	var buf strings.Builder
 	err := systemTmpl.Execute(&buf, map[string]any{
 		"DSLVersion": plan.DSLVersion,
 		"Actions":    actionReference(),
@@ -33,12 +32,11 @@ func buildSystemPrompt() string {
 
 func actionReference() string {
 	var b strings.Builder
-	type actionPromptLine struct {
+	lines := []struct {
 		name        plan.ActionType
 		description string
 		params      string
-	}
-	lines := []actionPromptLine{
+	}{
 		{plan.ActionEnsureNode, "Ensure the Redis Pod exists with the desired image and memory; does not meet nodes, set replicas, or assign slots.", `{"namespace":"<cluster>","pod":"<name>","image":"<image>","memorySize":"<size>"}`},
 		{plan.ActionWaitNodeReady, "Wait until the Pod is Ready and Redis is reachable.", `{"namespace":"<cluster>","pod":"<name>"}`},
 		{plan.ActionMeetNode, "Join targetPod to the Redis Cluster gossip network that sourcePod belongs to.", `{"namespace":"<cluster>","sourcePod":"<name>","targetPod":"<name>"}`},
@@ -104,7 +102,7 @@ Return only JSON:
 }
 
 func buildClusterContextPrompt(req Request) string {
-	var buf bytes.Buffer
+	var buf strings.Builder
 	var tableBuf strings.Builder
 	writeObservedNodesTable(&tableBuf, req.ObservedState.Nodes)
 	err := userTmpl.Execute(&buf, map[string]any{

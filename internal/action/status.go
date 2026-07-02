@@ -58,10 +58,11 @@ func bumpNextPodOrdinalFromObserved(c *v1alpha1.RedisCluster, nodes []plan.Obser
 }
 
 func controllerRedisPodOrdinal(pod string) (int, bool) {
-	if !strings.HasPrefix(pod, "redis-") {
+	s, ok := strings.CutPrefix(pod, "redis-")
+	if !ok {
 		return 0, false
 	}
-	n, err := strconv.Atoi(strings.TrimPrefix(pod, "redis-"))
+	n, err := strconv.Atoi(s)
 	if err != nil || n < 0 {
 		return 0, false
 	}

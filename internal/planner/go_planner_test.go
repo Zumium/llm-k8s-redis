@@ -3,6 +3,7 @@ package planner
 import (
 	"context"
 	"errors"
+	"slices"
 	"testing"
 
 	"github.com/Zumium/llm-k8s-redis/internal/plan"
@@ -69,7 +70,7 @@ func TestGoPlannerCreateVariants(t *testing.T) {
 				t.Fatalf("first step = %#v", got.Steps[0])
 			}
 			gotRanges := addSlotRanges(got)
-			if !sameStrings(gotRanges, tc.wantRanges) {
+			if !slices.Equal(gotRanges, tc.wantRanges) {
 				t.Fatalf("slot ranges = %#v, want %#v", gotRanges, tc.wantRanges)
 			}
 			if err := validatePlan(got, nil); err != nil {
@@ -624,18 +625,6 @@ func addSlotRanges(p *plan.Plan) []string {
 		}
 	}
 	return out
-}
-
-func sameStrings(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
 }
 
 func firstAction(p *plan.Plan, action plan.ActionType) plan.Step {

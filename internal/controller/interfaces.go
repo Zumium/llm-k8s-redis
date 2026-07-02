@@ -6,7 +6,6 @@ import (
 	v1alpha1 "github.com/Zumium/llm-k8s-redis/api/v1alpha1"
 	"github.com/Zumium/llm-k8s-redis/internal/action"
 	"github.com/Zumium/llm-k8s-redis/internal/plan"
-	"github.com/Zumium/llm-k8s-redis/internal/planner"
 )
 
 type Driver interface {
@@ -15,5 +14,3 @@ type Driver interface {
 }
 
 type StepOutcome = action.StepOutcome
-
-var _ planner.Planner = planner.NoopPlanner{}

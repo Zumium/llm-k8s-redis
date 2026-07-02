@@ -567,24 +567,6 @@ func topologyNodes(t observedTopology) []topologyNode {
 	return out
 }
 
-func topologyMasters(t observedTopology) []topologyNode {
-	out := make([]topologyNode, 0, len(t.masters))
-	for _, m := range t.masters {
-		out = append(out, topologyNode{pod: m.pod, nodeID: m.nodeID})
-	}
-	return out
-}
-
-func topologyReplicas(t observedTopology) []topologyNode {
-	out := []topologyNode{}
-	for _, m := range t.masters {
-		for _, r := range m.replicas {
-			out = append(out, topologyNode{pod: r.pod, nodeID: r.nodeID})
-		}
-	}
-	return out
-}
-
 func topologyImageDrift(t observedTopology, image string) bool {
 	for _, m := range t.masters {
 		if m.image != "" && m.image != image {

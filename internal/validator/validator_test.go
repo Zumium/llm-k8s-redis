@@ -380,7 +380,7 @@ func TestObservedNodeForgettableGhost(t *testing.T) {
 	}
 }
 
-func TestParseSlots(t *testing.T) {
+func TestSlotsSet(t *testing.T) {
 	cases := []struct {
 		in   string
 		want int
@@ -391,15 +391,15 @@ func TestParseSlots(t *testing.T) {
 		{"5", 1},
 	}
 	for _, c := range cases {
-		got, err := parseSlots(c.in)
+		got, err := slotsSet(c.in)
 		if err != nil {
-			t.Fatalf("parseSlots(%q) error: %v", c.in, err)
+			t.Fatalf("slotsSet(%q) error: %v", c.in, err)
 		}
 		if len(got) != c.want {
-			t.Fatalf("parseSlots(%q) = %d slots, want %d", c.in, len(got), c.want)
+			t.Fatalf("slotsSet(%q) = %d slots, want %d", c.in, len(got), c.want)
 		}
 	}
-	if _, err := parseSlots("0-99999"); err == nil {
+	if _, err := slotsSet("0-99999"); err == nil {
 		t.Fatal("expected error for out-of-bounds slot")
 	}
 }

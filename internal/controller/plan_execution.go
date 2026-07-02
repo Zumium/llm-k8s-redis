@@ -21,7 +21,11 @@ func (r *RedisClusterReconciler) handleActivePlan(ctx context.Context, cluster *
 	state := planState(active)
 	if active.TargetGeneration != cluster.Generation {
 		logger.Info("active plan cleared by generation", "planID", active.ID, "targetGeneration", active.TargetGeneration, "generation", cluster.Generation)
-		return r.clearActivePlanAndRequeue(ctx, cluster, "active plan targets an older generation", "active plan targets an older generation")
+		cluster.Status.ActivePlan = nil
+		setCondition(cluster, ConditionReady, metav1.ConditionFalse, "Replanning", "active plan targets an older generation")
+		setCondition(cluster, ConditionPlanned, metav1.ConditionFalse, "PlanSuperseded", "active plan targets an older generation")
+		res, err := r.finish(ctx, cluster, ctrl.Result{Requeue: true}, nil)
+		return res, err, true
 	}
 	if state == plan.PlanStateRunning {
 		logger.Info("running active plan found", "planID", active.ID, "steps", len(active.Steps), "currentStep", active.CurrentStep)
@@ -51,14 +55,6 @@ func (r *RedisClusterReconciler) handleActivePlan(ctx context.Context, cluster *
 		res, err := r.finish(ctx, cluster, ctrl.Result{}, nil)
 		return res, err, true
 	}
-}
-
-func (r *RedisClusterReconciler) clearActivePlanAndRequeue(ctx context.Context, cluster *v1alpha1.RedisCluster, readyMessage, plannedMessage string) (ctrl.Result, error, bool) {
-	cluster.Status.ActivePlan = nil
-	setCondition(cluster, ConditionReady, metav1.ConditionFalse, "Replanning", readyMessage)
-	setCondition(cluster, ConditionPlanned, metav1.ConditionFalse, "PlanSuperseded", plannedMessage)
-	res, err := r.finish(ctx, cluster, ctrl.Result{Requeue: true}, nil)
-	return res, err, true
 }
 
 func (r *RedisClusterReconciler) executeNextStep(ctx context.Context, cluster *v1alpha1.RedisCluster, active *v1alpha1.PlanStatus) (ctrl.Result, error) {

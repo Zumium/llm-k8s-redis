@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/Zumium/llm-k8s-redis/internal/plan"
+	"github.com/Zumium/llm-k8s-redis/internal/rediscluster"
 )
 
 type validationError struct {
@@ -34,11 +35,7 @@ func Validate(spec plan.ClusterSpec, nodes []plan.ObservedNode, p *plan.Plan) er
 	if err := isPlanValid(p); err != nil {
 		return err
 	}
-
-	if err := simulatePlan(spec, nodes, p); err != nil {
-		return err
-	}
-	return nil
+	return simulatePlan(spec, nodes, p)
 }
 
 func isPlanValid(p *plan.Plan) error {
@@ -180,7 +177,7 @@ func requireIntParams(params map[string]any, keys ...string) error {
 
 func requireSlotsParam(params map[string]any, key string) error {
 	slots, _ := paramString(params, key)
-	if _, err := parseSlots(slots); err != nil {
+	if _, err := slotsSet(slots); err != nil {
 		return fmt.Errorf("%s is invalid: %w", key, err)
 	}
 	return nil
@@ -188,9 +185,6 @@ func requireSlotsParam(params map[string]any, key string) error {
 
 func requireTrueBoolParams(params map[string]any, keys ...string) error {
 	for _, key := range keys {
-		if params == nil {
-			return fmt.Errorf("%s must be true", key)
-		}
 		value, ok := params[key]
 		if !ok {
 			return fmt.Errorf("%s must be true", key)
@@ -218,20 +212,6 @@ func redisPodOrdinal(pod string) (int, bool) {
 	return n, true
 }
 
-func precededAction(p *plan.Plan, stepIndex int, action plan.ActionType, paramKey, paramValue string) bool {
-	for i := 0; i < stepIndex; i++ {
-		s := p.Steps[i]
-		if s.Action != action {
-			continue
-		}
-		value, ok := paramString(s.Params, paramKey)
-		if ok && value == paramValue {
-			return true
-		}
-	}
-	return false
-}
-
 func paramString(params map[string]any, key string) (string, bool) {
 	if params == nil {
 		return "", false
@@ -244,39 +224,14 @@ func paramString(params map[string]any, key string) (string, bool) {
 	return s, ok
 }
 
-func parseSlots(s string) (map[int]struct{}, error) {
+func slotsSet(s string) (map[int]struct{}, error) {
+	slots, err := rediscluster.ParseSlotSpec(s)
+	if err != nil {
+		return nil, err
+	}
 	out := map[int]struct{}{}
-	for _, part := range strings.Split(s, ",") {
-		part = strings.TrimSpace(part)
-		if part == "" {
-			continue
-		}
-		if strings.Contains(part, "-") {
-			rg := strings.SplitN(part, "-", 2)
-			start, err := strconv.Atoi(strings.TrimSpace(rg[0]))
-			if err != nil {
-				return nil, fmt.Errorf("invalid slot range %q: %w", part, err)
-			}
-			end, err := strconv.Atoi(strings.TrimSpace(rg[1]))
-			if err != nil {
-				return nil, fmt.Errorf("invalid slot range %q: %w", part, err)
-			}
-			if start < 0 || end > 16383 || start > end {
-				return nil, fmt.Errorf("slot range %q out of bounds [0,16383]", part)
-			}
-			for i := start; i <= end; i++ {
-				out[i] = struct{}{}
-			}
-			continue
-		}
-		n, err := strconv.Atoi(part)
-		if err != nil {
-			return nil, fmt.Errorf("invalid slot %q: %w", part, err)
-		}
-		if n < 0 || n > 16383 {
-			return nil, fmt.Errorf("slot %d out of bounds [0,16383]", n)
-		}
-		out[n] = struct{}{}
+	for _, slot := range slots {
+		out[slot] = struct{}{}
 	}
 	return out, nil
 }
