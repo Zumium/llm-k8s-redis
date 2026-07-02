@@ -82,6 +82,19 @@ go test ./...
 go vet ./...
 ```
 
+## Work Methodology
+
+### First Principles
+- Before taking action, return to the fundamentals: what exact problem is this task trying to solve? Don't just blindly follow "conventions" or "the way everyone else does it." 
+Break the problem down into the smallest, verifiable units and tackle them one by one.
+- Be able to articulate the "why" behind every decision, not just the "how."
+
+### Adversarial Review (Mandatory before delivery)
+- Upon completion, switch into the role of the harshest critic. Attack your own work from angles such as logical flaws, factual accuracy, and whether there is a simpler approach.
+Proactively list the 3 to 5 most likely points of failure, fix them, and only then submit your work.
+- Never accept "it looks fine"—you must provide verified evidence.
+
+
 ## Note
 
 DO NOT send optional commentary
